@@ -1008,8 +1008,6 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             choices = data.get("choices", [])
             for choice in choices:
                 msg = choice.get("message", {})
-                if "reasoning_content" in msg:
-                    del msg["reasoning_content"]
                 if msg.get("tool_calls"):
                     cleaned, stripped = sanitize_tool_calls(msg)
                     if stripped:
