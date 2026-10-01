@@ -268,7 +268,7 @@ local-llm-ctxgate-proxy/
 | Proxy add. latency | < 5 ms (token count + PG lookup) |
 | 4B memory extraction | ~200 ms per job (async, non-blocking) |
 | Token counting | Exact (Qwen tokenizer, not estimation) |
-| Context window | 130k tokens (vLLM) / 64k input cap |
+| Context window | 84k tokens (vLLM) / 64k input cap |
 | Concurrent sessions | Unlimited (per-session isolation) |
 
 ---

@@ -128,7 +128,7 @@ Goose Agent
                    |
                    |  http://127.0.0.1:29000/v1
                    v
-              vLLM (Qwen3.8-27B, 130k window)
+              vLLM (Qwen3.8-27B, 84k window)
 
                    |  (async, separate process)
                    v
@@ -217,7 +217,7 @@ local-llm-ctxgate-proxy/
 
 | Variable | Default | Description |
 |---|---|---|
-| CTXGATE_DB_DSN | postgresql://postgres:postgres@127.0.0.1:5432/ctxproxy | PostgreSQL connection string |
+| CTXGATE_DB_DSN | postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy | PostgreSQL connection string |
 | CTXGATE_VLLM_URL | http://127.0.0.1:29000/v1 | vLLM server URL |
 | CTXGATE_VLLM_MODEL | Qwen3.8-27B | Model name served by vLLM |
 | CTXGATE_QWEN_TOKENIZER | /path/to/tokenizer.json | Qwen tokenizer for accurate counting |

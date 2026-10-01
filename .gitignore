@@ -49,3 +49,6 @@ NOTES.md
 FINAL_REPORT.md
 CODE_REVIEW.md
 injection_metrics.json
+
+# Backup files
+*.bak
