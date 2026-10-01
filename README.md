@@ -1,63 +1,89 @@
 # local-llm-ctxgate-proxy
 
-**A lightweight local context proxy for long-running AI coding agents.**
+> 🧠 **Token-aware rolling context proxy** for long-running AI coding agents.
+> Sits between your agent (Goose) and a local LLM (vLLM), adding persistent memory,
+> prefix-cache-safe injection, and async 4B memory extraction — **zero cloud dependency**.
 
-local-llm-ctxgate-proxy is a thin intelligent layer between your AI agent (e.g. [Goose](https://github.com/aaif/goose)) and a local model stack (e.g. [vLLM](https://github.com/vllm-project/vllm) + [LM Studio](https://lmstudio.ai/)). It provides token-aware rolling context, persistent PostgreSQL memory, and asynchronous small-model memory extraction — so your agent can run for hours without losing its place.
+[![CI](https://img.shields.io/github/actions/workflow/status/PawelWos1987/local-llm-ctxgate-proxy/ci.yml?branch=master&label=CI)](https://github.com/PawelWos1987/local-llm-ctxgate-proxy/actions/workflows/ci.yml)
+[![CodeQL](https://img.shields.io/github/actions/workflow/status/PawelWos1987/local-llm-ctxgate-proxy/codeql.yml?branch=master&label=CodeQL)](https://github.com/PawelWos1987/local-llm-ctxgate-proxy/actions/workflows/codeql.yml)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-14%2B-336796?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+[![License](https://img.shields.io/badge/License-MIT-green?logo=gnu)](./LICENSE)
+[![Binds](https://img.shields.io/badge/Binds-127.0.0.1-orange)](https://github.com/PawelWos1987/local-llm-ctxgate-proxy)
 
-## How it works
+---
 
+## 🏗️ Architecture
+
+```mermaid
+graph LR
+    subgraph "Your Machine"
+        G[🦢 Goose Agent] -->|HTTP :9200| P[⚡ ctxgate-proxy<br/>FastAPI]
+        P -->|HTTP :29000| V[🧠 vLLM<br/>Qwen3.8-27B]
+        P <-->|async jobs| PG[(🐘 PostgreSQL<br/>ctxproxy schema)]
+        W[🔍 4B Worker<br/>qwen3-4b-instruct] -->|LM Studio :1234| L[💾 Memory Extract]
+        W <--> PG
+    end
+
+    style G fill:#4a90d9,color:#fff
+    style P fill:#e74c3c,color:#fff
+    style V fill:#27ae60,color:#fff
+    style PG fill:#336796,color:#fff
+    style W fill:#8e44ad,color:#fff
+    style L fill:#f39c12,color:#fff
 ```
-Goose (agent)
-   |
-   |  http://127.0.0.1:9200/v1
-   v
-+---------------------------+
-|  local-llm-ctxgate-proxy (FastAPI)       |
-|  - Token-aware context    |
-|    assembly + trimming    |
-|  - Conditional memory     |
-|    injection (deduped)    |
-|  - SSE streaming proxy    |
-|  - Session isolation      |
-+------------+--------------+
-             |  http://127.0.0.1:29000/v1
-             v
-        vLLM (27B model)
 
-         +---------------------+
-         |  4B Memory Worker   |<-- polls memory_jobs (async)
-         |  (LM Studio)        |--> PostgreSQL
-         +---------------------+
+### Request Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant G as 🦢 Goose
+    participant P as ⚡ Proxy :9200
+    participant PG as 🐘 PostgreSQL
+    participant V as 🧠 vLLM 27B
+    participant W as 🔍 4B Worker
+
+    G->>P: POST /v1/chat/completions<br/>(X-Session-ID, messages)
+    P->>PG: Resolve task + enqueue<br/>memory job (dedup + filter)
+    P->>PG: Load working_memory<br/>+ relevant knowledge
+    P->>V: Forward context-augmented<br/>messages (rolling window)
+    V-->>P: SSE stream tokens
+    P-->>G: Stream response
+
+    Note over W,PG: Async (non-blocking)
+    W->>PG: Claim pending job
+    W->>W: 4B extracts memories<br/>+ updates working_memory
+    W->>PG: INSERT memories<br/>UPDATE working_memory
 ```
 
-**The three mechanisms, cleanly separated:**
+---
 
-| Layer | Responsibility |
-|-------|---------------|
-| **Goose compaction** | Short-term continuity — in-context summarization at 65% of window |
-| **local-llm-ctxgate-proxy** | Context boundary + small conditional memory supplement (deduped, relevance-gated, ≤2k tokens) |
-| **4B worker** | Async durable-memory extraction — never blocks the main model |
+## 📊 PostgreSQL Schema (6 tables)
 
-## Features
+| Table | Purpose | Key Columns |
+|-------|---------|-------------|
+| `proxy.tasks` | One row per chat window (session) | `id`, `session_id`, `created_at`, `updated_at` |
+| `proxy.events` | Ordered user/assistant messages per task | `id`, `task_id`, `seq`, `role`, `content` |
+| `proxy.memory_jobs` | Async work queue for 4B worker | `id`, `task_id`, `event_id`, `status`, `attempts` |
+| `proxy.memories` | Extracted durable facts (deduped) | `id`, `task_id`, `content`, `type`, `fingerprint` |
+| `proxy.working_memory` | Current state snapshot per task | `task_id`, `content`, `updated_at` |
+| `proxy.knowledge` | Cross-session shared knowledge | `id`, `content`, `tags`, `created_at` |
 
-- **Token-aware context assembly** — preserves system prompt, first user message, and most recent turns; trims the middle
-- **Conditional memory injection** — dedupes against current context (60% token overlap), gates on deterministic relevance, budgets ≤2k tokens total. Zero hot-path overhead when context is sufficient.
-- **Persistent PostgreSQL memory** — decisions, findings, failures, constraints, files, state. Survives compaction and session restarts.
-- **Asynchronous 4B memory worker** — Qwen3-4B (LM Studio) extracts durable memories from events. Fully async: the 27B model never waits. Outage-aware with TTL-based backoff.
-- **SSE streaming** — full streaming support with usage tokens
-- **Session isolation** — per-session task/memory scoping via `X-Session-ID`
-- **Tool call forwarding** — transparently passes `tools` and `tool_choice` with sanitization
-- **Prefix-cache safe** — memory injection at end of system prompt preserves vLLM prefix cache
-- **Health & metrics** — `/health` and `/metrics` endpoints
+---
 
-## Quick Start
+## 🚀 Quick Start
 
-### Prerequisites
+<details>
+<summary><b>Prerequisites</b></summary>
 
-- Python 3.11+
-- PostgreSQL 14+
-- vLLM or LM Studio serving a 27B model (e.g. Qwen3.8-27B)
-- (Optional) LM Studio serving a 4B model (e.g. Qwen3-4B) for the memory worker
+- Python 3.10+
+- PostgreSQL 14+ (local)
+- vLLM serving a 27B model on `127.0.0.1:29000`
+- LM Studio with a 4B model on `127.0.0.1:1234` (optional, for memory worker)
+- Qwen tokenizer.json (for accurate token counting)
+
+</details>
 
 ### 1. Install
 
@@ -71,51 +97,137 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# Edit .env with your PostgreSQL DSN and model URLs
+# Edit .env — set your DSN, model names, tokenizer path
 ```
 
-### 3. Initialize database
-
-```sql
--- Run in order:
-psql -U postgres -d local-llm-ctxgate-proxy -f schema/001_init.sql
-psql -U postgres -d local-llm-ctxgate-proxy -f schema/002_knowledge.sql
-psql -U postgres -f schema/003_memory_worker.sql
-```
-
-### 4. Start the proxy
+### 3. Initialize Database
 
 ```bash
-uvicorn proxy.app:app --host 127.0.0.1 --port 9200
+psql "$CTXGATE_DB_DSN" -f schema/001_init.sql
+psql "$CTXGATE_DB_DSN" -f schema/002_knowledge.sql
+psql "$CTXGATE_DB_DSN" -f schema/003_memory_worker.sql
 ```
 
-### 5. (Optional) Start the 4B memory worker
+### 4. Run
 
 ```bash
-python3 worker/worker.py
+# Proxy (port 9200)
+python proxy/app.py
+
+# 4B Memory Worker (separate terminal)
+python worker/worker.py
 ```
 
-### 6. Point your agent at the proxy
+### 5. Point Goose at It
 
-Configure your agent's provider to use `http://127.0.0.1:9200/v1` as the base URL.
+Set your LLM base URL to `http://127.0.0.1:9200/v1` in Goose config.
 
-## Security
+---
 
-local-llm-ctxgate-proxy is designed for **local, single-user** use. It binds to `127.0.0.1` by default. See [SECURITY.md](SECURITY.md) for the full security policy and threat model.
+## ⚙️ Configuration
 
-## Testing
+All settings via environment variables (see [**.env.example**](.env.example)):
 
-```bash
-# Architecture tests (deterministic, 11 checks)
-python3 -B tests/test_architecture.py
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CTXGATE_DB_DSN` | — | PostgreSQL connection string |
+| `CTXGATE_VLLM_URL` | `http://127.0.0.1:29000/v1` | vLLM endpoint |
+| `CTXGATE_VLLM_MODEL` | `Qwen3.8-27B` | Model name |
+| `CTXGATE_LM_MODEL` | `qwen3-4b-instruct-2507` | 4B memory model |
+| `CTXGATE_LM_URL` | `http://127.0.0.1:1234/v1/...` | LM Studio endpoint |
+| `CTXGATE_QWEN_TOKENIZER` | — | Path to tokenizer.json |
+| `CTXGATE_MEMORY_WORKER` | `1` | Set `0` to disable memory |
+| `CTXGATE_WORKER_POLL` | `2.0` | Worker poll interval (seconds) |
+| `CTXGATE_WORKER_MAX_ATTEMPTS` | `3` | Retry limit per job |
+| `CTXGATE_WORKER_OUTAGE_TTL` | `1800` | Outage backoff window (seconds) |
 
-# Performance A/B/C comparison
-python3 tests/test_perf_abc.py
+---
 
-# 8M-token long-run test
-python3 tests/test_8m_longrun.py
+## 🔌 API Endpoints
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/v1/chat/completions` | POST | Main LLM proxy (OpenAI-compatible) |
+| `/health` | GET | Liveness probe |
+| `/ready` | GET | Readiness probe (PG + tokenizer) |
+| `/metrics/prometheus` | GET | Prometheus metrics |
+| `/dashboard` | GET | Basic HTML status page |
+| `/api/sessions` | GET | List active sessions |
+| `/api/memory` | GET | Query memories for a session |
+
+---
+
+## 🔒 Security
+
+- 🔒 **Binds to 127.0.0.1 only** — never exposed to network
+- 🔒 **No cloud dependency** — all data stays local
+- 🔒 **`.env` gitignored** — secrets never committed
+- 🔒 **GitHub Ruleset** — CI + CodeQL enforced on all pushes
+- 🔒 **Single-user** — one developer, admin-only bypass
+
+<details>
+<summary><b>Ruleset: protect master</b></summary>
+
+| Rule | Status |
+|------|--------|
+| Require status checks (ci + CodeQL) | ✅ ON |
+| Do not enforce on creation | ✅ ON |
+| Code scanning (CodeQL, high+) | ✅ ON |
+| All other 11 rules | ❌ OFF |
+| Bypass | PawelWos1987 (always) |
+
+</details>
+
+---
+
+## 📁 Project Structure
+
+```
+local-llm-ctxgate-proxy/
+├── proxy/
+│   ├── app.py              # FastAPI proxy (main)
+│   └── requirements.txt
+├── worker/
+│   └── worker.py           # 4B memory worker
+├── schema/
+│   ├── 001_init.sql        # Core tables
+│   ├── 002_knowledge.sql   # Knowledge sharing
+│   └── 003_memory_worker.sql  # Memory jobs + WM
+├── tests/                  # 20+ test files
+├── benchmarks/             # Performance benchmarks
+├── .github/
+│   ├── workflows/
+│   │   ├── ci.yml         # CI pipeline
+│   │   └── codeql.yml     # Security scanning
+│   └── dependabot.yml
+├── .env.example
+├── .gitignore
+├── ARCHITECTURE.md
+├── SECURITY.md
+├── LICENSE
+└── README.md
 ```
 
-## License
+---
 
-[MIT](LICENSE)
+## 📈 Performance Characteristics
+
+| Metric | Target |
+|--------|--------|
+| Proxy add. latency | < 5 ms (token count + PG lookup) |
+| 4B memory extraction | ~200 ms per job (async, non-blocking) |
+| Token counting | Exact (Qwen tokenizer, not estimation) |
+| Context window | 130k tokens (vLLM) / 64k input cap |
+| Concurrent sessions | Unlimited (per-session isolation) |
+
+---
+
+## 📜 License
+
+[MIT](./LICENSE) — do whatever, no warranty.
+
+---
+
+<p align="center">
+  <b>local-llm-ctxgate-proxy</b> · Built for local-first AI agents · No cloud · No tracking · No telemetry
+</p>
