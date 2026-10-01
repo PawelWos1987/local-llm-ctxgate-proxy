@@ -274,6 +274,142 @@ local-llm-ctxgate-proxy/
 
 ---
 
+## 🧪 Tested Stack & Benchmark Results
+
+This project was developed and stress-tested on the local stack below. Headline result: a **single 27B model on 2× consumer 16 GB GPUs sustained an 8,000,000-token session** with zero errors and zero prefix-cache invalidations — the rolling-window proxy kept live context at ~59k tokens, far under the 84k vLLM window.
+
+### Hardware
+
+| Component | Spec |
+|-----------|------|
+| GPU | 2× NVIDIA GeForce RTX 5070 Ti (16 GB each) |
+| GPU driver | NVIDIA 615.71.09 (CUDA UMD 13.4) |
+| Arch | x86_64 |
+| OS | CachyOS Linux (rolling, Arch-based), kernel 7.2.8-1-cachyos |
+
+### Software
+
+| Component | Version | Role |
+|-----------|---------|------|
+| vLLM | 0.30.0 | Serves the 27B model (TP=2) on :29000 |
+| 27B model | Swift-1.5-Qwen3.8-27b (W4A16 AutoRound) | Main LLM, served as `Qwen3.8-27B` |
+| Speculative draft (vLLM) | incoai/Qwen3.8-27B-DFlash2 (dflash, 3 tokens) | vLLM speculative decoding |
+| LM Studio | 0.4.25 | Serves the 4B memory model on :1234 |
+| llama.cpp backend | 2.49.0 (linux-x86_64-avx2) | LM Studio inference engine |
+| 4B model | Qwen3-4B-Instruct-2507 (UD Q6_K_XL GGUF) | Async memory extractor |
+| 4B draft model | Qwen3-Coder-Instruct-DRAFT-0.75B (Q4_0 GGUF) | LM Studio speculative decoding |
+| PostgreSQL | 16 (Docker) | Memory / knowledge store |
+| Python | 3.10+ | Proxy + worker |
+| FastAPI | 0.100+ | Proxy framework |
+
+### Disk / memory footprint
+
+| Item | Size |
+|------|------|
+| 27B model (W4A16 AutoRound, on disk) | ~19 GB |
+| 4B model (Q6_K_XL GGUF, on disk) | ~3.5 GB |
+| 4B draft (Q4_0 GGUF, on disk) | ~448 MB |
+| vLLM GPU memory (2× RTX 5070 Ti) | ~15.9 GiB / GPU (≈31.8 GiB total) |
+| vLLM KV cache (FP8, reserved) | 1.88 GiB / GPU → 84,536 tokens |
+
+### vLLM run command (27B, TP=2, speculative decoding)
+
+```bash
+vllm serve /home/user/models/Swift-1.5-Qwen3.8-27b-W4A16-AutoRound \
+  --served-model-name Qwen3.8-27B \
+  --tensor-parallel-size 2 \
+  --disable-custom-all-reduce \
+  --max-model-len 84000 \
+  --max-num-batched-tokens 4992 \
+  --max-num-seqs 1 \
+  --dtype bfloat16 \
+  --kv-cache-dtype fp8 \
+  --kv-cache-memory-bytes 1970000K \
+  --mamba-ssm-cache-dtype bfloat16 \
+  --mamba-cache-mode align \
+  --enable-prefix-caching \
+  --enable-chunked-prefill \
+  --enable-prompt-tokens-details \
+  --language-model-only \
+  --quantization auto-round \
+  --attention-backend FLASHINFER \
+  --reasoning-parser qwen3 \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder \
+  --performance-mode interactivity \
+  --generation-config vllm \
+  --max-log-len 0 \
+  --mm-processor-cache-gb 0 \
+  --limit-mm-per-prompt.image 0 \
+  --limit-mm-per-prompt.video 0 \
+  --limit-mm-per-prompt.audio 0 \
+  --trust-remote-code \
+  --default-chat-template-kwargs '{"enable_thinking": true, "preserve_thinking": false, "reasoning_effort": "medium"}' \
+  --speculative-config '{"method": "dflash","model": "incoai/Qwen3.8-27B-DFlash2","num_speculative_tokens": 3}' \
+  --port 29000
+```
+
+### LM Studio run command (4B memory model, CPU, speculative decoding)
+
+Served by LM Studio 0.4.25 (llama.cpp 2.49.0). Launched on 127.0.0.1 (LM Studio exposes it at :1234):
+
+```bash
+llama-server \
+  --model /home/user/.lmstudio/models/unsloth/Qwen3-4B-Instruct-2507-GGUF/Qwen3-4B-Instruct-2507-UD-Q6_K_XL.gguf \
+  --host 127.0.0.1 \
+  --port 37575 \
+  --api-key <your-api-key> \
+  --no-webui \
+  --jinja \
+  --ctx-size 8192 \
+  --n-gpu-layers 0 \
+  --threads 16 \
+  --parallel 1 \
+  --batch-size 2048 \
+  --ubatch-size 512 \
+  --ctx-checkpoints 8 \
+  --cache-type-k q8_0 \
+  --cache-type-v q8_0 \
+  --flash-attn on \
+  --no-kv-offload \
+  --kv-unified \
+  --load-mode mmap+mlock \
+  --spec-type draft-simple \
+  --spec-draft-model /home/user/.lmstudio/models/jukofyork/Qwen3-Coder-Instruct-DRAFT-0.75B-GGUF/Qwen3-Coder-Instruct-DRAFT-0.75B-32k-Q4_0.gguf \
+  --spec-draft-n-max 3 \
+  --spec-draft-n-min 3 \
+  --spec-draft-p-min 0
+```
+
+### Throughput (measured, vLLM 27B)
+
+| Metric | Value |
+|--------|-------|
+| Generation throughput (median) | **~110–120 tokens/s** (observed range 90–136 tok/s) |
+| Prefill (prompt) throughput | 270–1300 tokens/s |
+| Speculative decoding | mean acceptance length ~2.7–3.4; draft acceptance 57–79% |
+| Prefix-cache hit rate | ~73% |
+
+### 8M-token long-run test — PASSED (2026-10-01)
+
+`tests/test_8m_longrun.py` — session `8m-longrun-001`, target 8,000,000 cumulative input tokens:
+
+| Metric | Value |
+|--------|-------|
+| Total input tokens | **8,027,779** ✅ (target 8,000,000) |
+| Total output tokens | 5,714 |
+| Total requests | 139 (build=9, rapid=121) |
+| Prefix invalidations | **0** ✅ |
+| Error requests | **0** ✅ |
+| Latency avg / min / max | 6.53s / 1.03s / 52.35s |
+| Proxy memory | 24.4 MB → 25.3 MB (+0.9 MB, stable) |
+| Final live context | ~59,043 tokens / 261 messages |
+| Peak context | 64,524 tokens (≈19.5k below the 84k vLLM window) |
+
+**Takeaway:** a 27B model on two consumer 16 GB GPUs, run through this proxy, can carry a multi-million-token working session. The rolling-window trim + prefix-cache-safe injection keeps the live window pinned near 64k while cumulative input grows without bound — no OOM, no context overflow, no dropped requests.
+
+---
+
 ## 📜 License
 
 [MIT](./LICENSE) — do whatever, no warranty.
