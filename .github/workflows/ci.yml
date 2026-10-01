@@ -27,7 +27,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v5
         with:
@@ -58,7 +58,7 @@ jobs:
   secret-scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check for hardcoded secrets
         run: |
           if grep -rn "postgresql://.*:[^C][^H].*@" --include="*.py" --include="*.sh" . 2>/dev/null | grep -v "CHANGE_ME" | grep -v ".env.example" | grep -v "postgresql://postgres:postgres@"; then
