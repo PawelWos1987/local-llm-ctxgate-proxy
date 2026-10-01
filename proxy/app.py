@@ -1162,7 +1162,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                             out_chunk = {"id": "gen", "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]}
                             yield "data: " + json.dumps(out_chunk) + "\n\n"
                             buf = ""
-                        orig_messages = current_body.get("messages", [])
+                        orig_messages = vllm_body.get("messages", [])
                         cont_messages = list(orig_messages)
                         if len(full_content) > 50:
                             cont_messages.append({"role": "assistant", "content": full_content})
@@ -1170,8 +1170,9 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                         else:
                             cont_messages.append({"role": "assistant", "content": full_content or "(in progress)"})
                             cont_messages.append({"role": "user", "content": "You were interrupted before producing your answer. Now produce your complete final answer directly. Skip thinking and just give the response."})
-                        current_body = dict(current_body)
+                        current_body = dict(vllm_body)
                         current_body["messages"] = cont_messages
+                        current_body["max_tokens"] = MAX_OUTPUT
                         continue
                     elif finish_reason == "length":
                         log.warning("Max continuations (%d) reached - stopping", MAX_CONTINUATIONS)
