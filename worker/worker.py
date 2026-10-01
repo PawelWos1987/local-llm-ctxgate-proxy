@@ -45,6 +45,8 @@ MAX_TOKENS = int(os.environ.get("CTXGATE_WORKER_MAX_TOKENS", "512"))
 # Compact payload budget (section 8: ~500-2000 input tokens)
 EVENT_EXCERPT_CHARS = 2500
 WM_EXCERPT_CHARS = 1500
+# TTL: days before a non-critical, never-reused memory is pruned
+MEMORY_TTL_DAYS = int(os.environ.get("CTXGATE_MEMORY_TTL_DAYS", "90"))
 
 # --- Section 15: LM Studio SYSTEM PROMPT (configured once; sent as system role) ---
 SYSTEM_PROMPT = (
@@ -346,6 +348,33 @@ async def update_working_memory(task_id: str, su: dict):
         task_id, content[:2000],
     )
     log.info("WM updated: %s", content[:120])
+async def prune_memories(pool) -> None:
+    """Slow-cycle prune: hard-expire past expires_at, age-prune stale non-critical rows.
+
+    - Hard expire: DELETE rows where expires_at < now()
+    - Age prune: DELETE active, non-critical (importance < 10) rows whose
+      last_accessed_at is older than MEMORY_TTL_DAYS. Rows with NULL
+      last_accessed_at are never pruned (we can't prove they're stale).
+    - CRITICAL rows (importance = 10) are never pruned.
+    """
+    try:
+        status1 = await pool.execute(
+            "DELETE FROM proxy.memories WHERE expires_at IS NOT NULL AND expires_at < now()"
+        )
+        hard_expired = int(status1.split()[-1]) if status1 else 0
+        status2 = await pool.execute(
+            "DELETE FROM proxy.memories WHERE active AND importance < 10 "
+            "AND last_accessed_at IS NOT NULL "
+            "AND last_accessed_at < now() - make_interval(days => $1)",
+            MEMORY_TTL_DAYS,
+        )
+        age_pruned = int(status2.split()[-1]) if status2 else 0
+        log.info("memory prune: hard_expired=%d age_pruned=%d (ttl_days=%d)",
+                 hard_expired, age_pruned, MEMORY_TTL_DAYS)
+    except Exception as e:
+        log.warning("memory prune failed (non-fatal): %s", e)
+
+
 async def claim_job():
     """Claim exactly ONE pending job (parallelism=1) with row locking."""
     return await pool.fetchrow(
@@ -444,8 +473,14 @@ async def process_job(job) -> None:
 
 async def poll():
     """Main poll loop with pre-load before first completion in a batch."""
+    last_prune = time.time()
     while running:
         try:
+            # Slow prune cycle (~6h): never in the hot path
+            now = time.time()
+            if now - last_prune > 6 * 3600:
+                await prune_memories(pool)
+                last_prune = now
             job = await claim_job()
             if job is not None:
                 # Pre-load: before the first completion, ensure model is loaded

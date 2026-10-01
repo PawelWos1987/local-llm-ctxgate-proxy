@@ -124,6 +124,57 @@ Set your LLM base URL to `http://127.0.0.1:9200/v1` in Goose config.
 
 ---
 
+## 🛠️ Local Development
+
+### Docker Compose (PostgreSQL 16)
+
+A `docker-compose.yml` is provided for a local PostgreSQL 16 instance with the project schema auto-applied on first start:
+
+```bash
+make db        # starts postgres:16 with schema/001-003.sql auto-applied
+make db-down   # stops the container
+make db-logs   # tails PostgreSQL logs
+```
+
+The three schema files (`schema/001_init.sql`, `schema/002_knowledge.sql`, `schema/003_memory_worker.sql`) are mounted into `/docker-entrypoint-initdb.d/` so they run in order on the first container start.
+
+### Makefile
+
+| Target | Description |
+|--------|-------------|
+| `make test` | Run all tests (`pytest tests/ -v`) |
+| `make test-unit` | Fast unit tests only (excludes e2e/stress/load) |
+| `make lint` | Ruff + mypy |
+| `make run` | Start the proxy (`python proxy/app.py`) |
+| `make worker` | Start the memory worker (`python worker/worker.py`) |
+| `make db` / `make db-down` / `make db-logs` | Docker Compose PostgreSQL |
+| `make clean` | Remove `__pycache__`, `.mypy_cache`, `.pytest_cache`, `*.pyc` |
+
+### Typical Dev Loop
+
+```bash
+# 1. Start the database
+make db
+
+# 2. Set environment variables (or source .env)
+export CTXGATE_DB_DSN="postgresql://ctxproxy:ctxproxy@localhost:5432/ctxproxy"
+export CTXGATE_VLLM_URL="http://127.0.0.1:29000/v1"
+export CTXGATE_QWEN_TOKENIZER=" "
+
+# 3. Run the fast test suite
+make test-unit
+
+# 4. Start the proxy
+make run
+
+# 5. In another terminal, start the memory worker
+make worker
+
+# 6. Point Goose at http://127.0.0.1:9200/v1
+```
+
+---
+
 ## ⚙️ Configuration
 
 All settings via environment variables (see [**.env.example**](.env.example)):

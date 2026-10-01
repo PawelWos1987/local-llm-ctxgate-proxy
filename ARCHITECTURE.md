@@ -235,3 +235,304 @@ local-llm-ctxgate-proxy/
 | CTXGATE_API_KEY | (off) | Optional bearer auth on /v1/chat/completions |
 | CTXGATE_MAX_BODY_BYTES | 20971520 | Max request body size (20 MB) |
 | CTXGATE_WORKER_CONCURRENCY | 1 | Worker parallelism |
+
+
+---
+
+## 7. Shutdown & Graceful Stop
+
+Both processes receive SIGTERM/SIGINT on stop. Their behavior differs — the worker is explicitly graceful, the proxy relies on uvicorn defaults.
+
+### 7.1 4B Memory Worker (worker/worker.py)
+- Explicit signal handlers (_sig) for SIGTERM and SIGINT set a running = False flag.
+- The poll() loop is while running: — on signal it lets the **in-flight process_job() finish**, then exits. Its finally block closes the httpx client and the asyncpg pool.
+- **Pending jobs are NOT lost**: unclaimed jobs stay in proxy.memory_jobs with status='pending' and are re-claimed on the next start. A job in outage-backoff requeues as pending.
+- SIGKILL (no signal) aborts immediately; the current job is left processing and is re-claimed/retried on restart (bounded by attempts / MAX_ATTEMPTS).
+
+### 7.2 Proxy (proxy/app.py)
+- Uses the FastAPI lifespan context manager: on startup it creates the asyncpg pool; on shutdown it runs await pool.close() and logs "ctxgate-proxy shutdown complete (graceful: pool drained)".
+- uvicorn.run(app, ...) installs uvicorn's built-in SIGTERM/SIGINT handling, which triggers that lifespan shutdown.
+- **In-flight SSE streams**: uvicorn's default timeout_graceful_shutdown=None means it stops accepting *new* connections but **waits for in-flight streams to complete** before exiting. A stream is therefore not torn down by a plain SIGTERM — but there is no *upper bound*, so a hung stream can block shutdown indefinitely.
+- **SIGKILL** bypasses all of this: the process dies instantly and any open stream is cut.
+
+### 7.3 Graceful Shutdown (IMPLEMENTED)
+- **Bound the proxy's graceful window** so a hung stream cannot block shutdown forever: `timeout_graceful_shutdown=30` is set on `uvicorn.run()`. In-flight streams get up to 30 s to finish before uvicorn force-closes them. The pool is drained by the lifespan.
+- The worker already has the correct pattern (finish current job, persist the rest) and needs no change.
+- **Operational rule**: always stop with SIGTERM (kill <pid>), never SIGKILL, so streams drain and the pool closes cleanly.
+
+
+---
+
+## 8. Memory TTL / Expiration (IMPLEMENTED)
+
+`proxy.memories` has `last_accessed_at` and `expires_at` columns (added by `schema/004_memory_ttl.sql`). The 4B worker **supersedes** a memory when a fact changes (sets `active=false, status='superseded'`). A periodic prune job in the worker (`prune_memories()`, 6-hour cadence) hard-expires rows past `expires_at` and age-prunes non-critical rows not accessed within `CTXGATE_MEMORY_TTL_DAYS` (default 90). CRITICAL (importance=10) rows are never pruned.
+
+The `last_accessed_at` column is stamped on every injection in `fetch_task_memory()` (touch-on-use), so actively-used memories are protected from pruning.
+
+**Implementation:**
+- `last_accessed_at TIMESTAMPTZ` — touched each time a memory is **injected** into the main model in `fetch_task_memory` (touch-on-use `UPDATE`). `expires_at TIMESTAMPTZ` (nullable; set per-category).
+- Touch on use: `fetch_task_memory` runs `UPDATE proxy.memories SET last_accessed_at=now() WHERE id=ANY($ids)` after selecting rows — "used" memories are protected from pruning.
+- Periodic prune job in the worker (`prune_memories()`, 6-hour cadence, not the hot path):
+  - Hard expire: `DELETE FROM proxy.memories WHERE expires_at IS NOT NULL AND expires_at < now()`
+  - Age prune of never-used: `DELETE FROM proxy.memories WHERE active AND last_accessed_at IS NOT NULL AND last_accessed_at < now() - interval '90 days'`
+  - Keep it conservative: never prune `importance=10` (CRITICAL) or recently-superseded rows; log every prune.
+- Retention window: `CTXGATE_MEMORY_TTL_DAYS` env var (default 90), tunable per deployment.
+
+Monitor via the dashboard's Produced Memories panel. The prune job runs automatically; manual pruning is rarely needed.
+
+---
+
+## 9. Configuration Validation at Startup
+
+### Previous State: Log-Only (No Fail-Fast) — Now Replaced
+
+```python
+def _validate_config(tok_name: str) -> None:
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(DB_DSN)
+        log.info("config: dsn_host=%s db=%s vllm=%s ...", ...)
+        if MAX_INPUT + SAFETY_MARGIN > MAX_CONTEXT:
+            log.warning("config: MAX_INPUT(%d)+SAFETY_MARGIN(%d) > MAX_CONTEXT(%d)", ...)
+    except Exception as e:
+        log.warning("config validation: %s", e)
+```
+
+The old `_validate_config()` was log-only and ran after pool creation. It has been **replaced** by `validate_config()` which runs **before** `asyncpg.create_pool()` and calls `sys.exit(1)` on any failure.
+
+### The Import-Time Crash Problem
+
+Numeric environment variables are parsed with bare `int()` at **module import time**:
+
+```python
+# proxy/app.py (top of file)
+MAX_CONTEXT = int(os.environ.get("CTXGATE_MAX_CONTEXT", "8192"))
+MAX_INPUT   = int(os.environ.get("CTXGATE_MAX_INPUT",   "6144"))
+# ...
+```
+
+If an operator sets `CTXGATE_WORKER_OUTAGE_TTL=abc`, the process dies at import with a raw `ValueError: invalid literal for int() with base 10: 'abc'` — no context, no list of other problems, no graceful message.
+
+### Implementation
+
+1. **`_env_int(name, default)` helper** (line 37) — returns `int(os.environ[name])` on success, logs a warning and returns `default` on `ValueError`. All 7 numeric env vars use it. Eliminates the import-time crash.
+2. **`validate_config()` in the FastAPI `lifespan`** — called **before** `asyncpg.create_pool()`. Collects all problems, then `sys.exit(1)`. Checks:
+   - DSN parses and has a reachable host (optional TCP probe)
+   - `VLLM_URL` is a valid HTTP/HTTPS URL
+   - `MAX_INPUT + SAFETY_MARGIN <= MAX_CONTEXT`
+   - `MAX_OUTPUT >= 1`
+   - Tokenizer file exists (if Qwen path is set)
+   - Collects **all** problems into a list, logs each, then `sys.exit(1)` if any are found.
+
+Operators get a single, complete error report at startup instead of a cryptic crash or a silent misconfiguration.
+
+---
+
+## 10. Token Budget Enforcement for Injected Memory
+
+### Budget Model
+
+`fetch_task_memory()` enforces a **hard cap of 2 000 tokens** total, split into two tiers:
+
+| Tier | Budget | Source |
+|------|--------|--------|
+| Working memory | 800 tokens | `proxy.working_memory` (1 row) |
+| Durable memories | 1 200 tokens | `proxy.memories` (up to 13 rows) |
+| **Total** | **2 000 tokens** | — |
+
+### Row Selection (SQL-level caps)
+
+```sql
+-- CRITICAL: at most 5 rows
+SELECT key, value FROM proxy.memories
+WHERE task_id=$1 AND active=true AND importance=10
+ORDER BY updated_at DESC LIMIT 5;
+
+-- Relevant: at most 8 rows
+SELECT key, value FROM proxy.memories
+WHERE task_id=$1 AND active=true
+  AND (key ILIKE ANY($2) OR value ILIKE ANY($2))
+ORDER BY importance DESC, updated_at DESC LIMIT 8;
+```
+
+5 + 8 = **13 rows maximum** are ever considered.
+
+### Injection Algorithm (no mid-row truncation)
+
+1. Deduplicate rows (normalized lower-case key+value).
+2. Skip rows already present in the current Goose context (`_already_in_context`).
+3. Skip rows whose value is a substring of the working-memory text.
+4. For each remaining row, compute `count_tokens(line)`.
+5. **Hard break**: if `total + t > min(mem_budget, total_budget)`, stop iterating.
+6. No row is ever truncated mid-sentence — it is either fully injected or fully skipped.
+
+### Adversarial Case
+
+A single 5 000-token row (e.g. a 4 B worker dumping an entire file into `value`) exceeds the 1 200-token durable budget on its own. The algorithm **skips** it (the `total + t > budget` check fires before the row is appended). The result is an **empty** injection for that row — not a truncated fragment.
+
+### Test Coverage
+
+See `tests/test_token_budget.py` — verifies the 2 000-token cap under normal, adversarial, and boundary conditions.
+
+---
+
+## 11. Streaming Backpressure
+
+### Zero-Application-Buffer Passthrough
+
+`stream_to_vllm()` uses a raw async generator with **no application-level buffering**:
+
+```python
+async with client.stream("POST", VLLM_URL + "/chat/completions", json=vllm_body) as resp:
+    async for line in resp.aiter_lines():
+        if line.startswith("data: "):
+            # ... optional usage-rewrite ...
+            yield "data: " + data_str + "\n\n"
+```
+
+Each SSE line is `yield`ed immediately after it is read from the httpx response iterator. There is **no list, queue, or ring buffer** between vLLM and Goose.
+
+### Backpressure Is TCP Flow Control
+
+Because the proxy does not buffer, the only backpressure mechanism is the **OS TCP receive window**:
+
+| Layer | Typical Buffer Size | Notes |
+|-------|-------------------|-------|
+| httpx (async) | ~64 KB | Per-connection read buffer; `aiter_lines()` drains it |
+| Uvicorn (ASGI) | ~4 KB | Per-socket send buffer before `send()` blocks |
+| OS TCP | 64–256 KB | Kernel receive/send windows (auto-tuned) |
+
+When Goose reads slowly, the TCP window shrinks, Uvicorn's `send()` blocks, the async generator pauses, and httpx stops reading from vLLM. The entire chain stalls cooperatively — no data is dropped, no OOM risk.
+
+### Failure Modes
+
+| Scenario | What Happens |
+|----------|-------------|
+| **Goose disconnects mid-stream** | Uvicorn detects the broken pipe on next `send()`; the async generator raises; httpx closes the vLLM connection. The partial SSE stream is lost. |
+| **vLLM 300 s timeout** | `httpx.TimeoutException` caught; proxy yields `data: [DONE]\n\n` and records the call as `timeout`. |
+| **vLLM returns non-200** | Proxy reads the error body, yields it as a single SSE `error` event + `[DONE]`, records `vllm_{status}`. |
+| **Goose is slow (backpressure)** | TCP window shrinks; the generator pauses; vLLM's TCP send buffer fills; vLLM slows its generation. No data loss, no timeout (as long as total time < 300 s). |
+
+---
+
+## 12. Tool-Call Validation Rules
+
+### All-or-Nothing Per Message
+
+`sanitize_tool_calls(message)` validates the **entire** `tool_calls` array. If **any** single item fails, the **entire** `tool_calls` key is stripped from the message. There is no per-item filtering.
+
+### The 5 Rules
+
+| # | Rule | Failure Example |
+|---|------|----------------|
+| 1 | Each item must be a `dict` | `tc = [42, {"id":"1"}]` → item 0 is `int` |
+| 2 | Item must have `id`, `type`, `function` keys | `{"id":"1","function":{...}}` → missing `type` |
+| 3 | `function` must have `name` and `arguments` | `{"id":"1","type":"function","function":{"name":"x"}}` → missing `arguments` |
+| 4 | `arguments` must be `str` or `dict` | `"arguments": [1,2,3]` → is a list |
+| 5 | If `arguments` is a `str`, it must parse via `json.loads` | `"arguments": "{bad json"` → `JSONDecodeError` |
+
+### Concrete Malformed Examples
+
+```json
+// Rule 1: not a dict
+"tool_calls": [42]
+
+// Rule 2: missing "type"
+"tool_calls": [{"id": "call_1", "function": {"name": "search", "arguments": "{}"}}]
+
+// Rule 3: function missing "arguments"
+"tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "search"}}]
+
+// Rule 4: arguments is a list
+"tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "search", "arguments": [1, 2]}}]
+
+// Rule 5: unparseable JSON string
+"tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "search", "arguments": "{query: 'test'"}}]
+```
+
+### What Is NOT Checked
+
+- The **value** of `function.name` (any string is accepted).
+- The **literal value** of `type` (must be present but can be any string).
+- **Argument size** — bounded only by the 20 MB HTTP body limit.
+- **Schema validation** of arguments against the tool's JSON Schema.
+
+### Effect on the Message
+
+When validation fails:
+1. The `tool_calls` key is **removed** from the message dict.
+2. If `content` is missing or empty, it is set to `""` (vLLM requires at least one content field).
+3. A `D9` warning is logged: `"D9: stripped malformed tool_calls from assistant message id=..."`.
+4. The `toolcall_strips` metric is incremented.
+
+---
+
+## 13. Local Development Setup
+
+### Docker Compose (PostgreSQL 16)
+
+`docker-compose.yml` provisions a local PostgreSQL 16 instance with the project schema auto-applied on first start:
+
+```yaml
+services:
+  postgres:
+    image: postgres:16
+    container_name: ctxproxy-pg
+    ports: ["5432:5432"]
+    environment:
+      POSTGRES_USER: ctxproxy
+      POSTGRES_PASSWORD: ctxproxy
+      POSTGRES_DB: ctxproxy
+    volumes:
+      - ctxproxy-pgdata:/var/lib/postgresql/data
+      - ./schema/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql
+      - ./schema/002_knowledge.sql:/docker-entrypoint-initdb.d/002_knowledge.sql
+      - ./schema/003_memory_worker.sql:/docker-entrypoint-initdb.d/003_memory_worker.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ctxproxy"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  ctxproxy-pgdata:
+```
+
+The three schema files are mounted into `/docker-entrypoint-initdb.d/` so PostgreSQL applies them in order on the **first** container start (when the data volume is empty). Subsequent starts reuse the existing data.
+
+### Makefile Targets
+
+| Target | Command | Description |
+|--------|---------|-------------|
+| `make db` | `docker compose up -d postgres` | Start PostgreSQL |
+| `make db-down` | `docker compose down` | Stop PostgreSQL |
+| `make db-logs` | `docker compose logs -f postgres` | Tail PostgreSQL logs |
+| `make test` | `pytest tests/ -v` | Run all tests |
+| `make test-unit` | `pytest tests/ -v -k 'not e2e and not stress and not load'` | Fast unit tests only |
+| `make lint` | `ruff check . && mypy proxy/ worker/` | Lint + type-check |
+| `make run` | `python proxy/app.py` | Start the proxy |
+| `make worker` | `python worker/worker.py` | Start the memory worker |
+| `make clean` | `rm -rf __pycache__ .mypy_cache .pytest_cache *.pyc` | Remove build artifacts |
+
+### Quick Dev Loop
+
+```bash
+# 1. Start the database (first time applies schema)
+make db
+
+# 2. Set environment (or use .env)
+export CTXGATE_DB_DSN="postgresql://ctxproxy:ctxproxy@localhost:5432/ctxproxy"
+export CTXGATE_VLLM_URL="http://127.0.0.1:29000/v1"
+export CTXGATE_QWEN_TOKENIZER=" "   # space = skip tokenizer, use len//4
+
+# 3. Run tests
+make test-unit
+
+# 4. Start the proxy
+make run
+
+# 5. In another terminal, start the worker
+make worker
+
+# 6. Point Goose at http://127.0.0.1:9200/v1
+```

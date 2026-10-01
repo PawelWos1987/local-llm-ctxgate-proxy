@@ -1,6 +1,7 @@
 """local-llm-ctxgate-proxy: Context gate proxy for Goose -> vLLM with PG memory."""
 import hashlib
 import os
+import sys
 import json
 import logging
 import time
@@ -15,21 +16,33 @@ import tokenizers
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+log = logging.getLogger("ctxgate-proxy")
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except (ValueError, TypeError) as e:
+        log.warning("env %s=%r is not a valid int; using default %d (%s)", name, raw, default, e)
+        return default
+
 # --- Constants ---
 VLLM_URL = os.environ.get("CTXGATE_VLLM_URL", "http://127.0.0.1:29000/v1")
 VLLM_MODEL = os.environ.get("CTXGATE_VLLM_MODEL", "Qwen3.8-27B")
-MAX_CONTEXT = int(os.environ.get("CTXGATE_MAX_CONTEXT", "84000"))
-MAX_INPUT = int(os.environ.get("CTXGATE_MAX_INPUT", "64000"))
-MAX_OUTPUT = int(os.environ.get("CTXGATE_MAX_OUTPUT", "18000"))
-SAFETY_MARGIN = int(os.environ.get("CTXGATE_SAFETY_MARGIN", "2000"))
+MAX_CONTEXT = _env_int("CTXGATE_MAX_CONTEXT", 84000)
+MAX_INPUT = _env_int("CTXGATE_MAX_INPUT", 64000)
+MAX_OUTPUT = _env_int("CTXGATE_MAX_OUTPUT", 18000)
+SAFETY_MARGIN = _env_int("CTXGATE_SAFETY_MARGIN", 2000)
+MEMORY_TTL_DAYS = _env_int("CTXGATE_MEMORY_TTL_DAYS", 90)
 DB_DSN = os.environ.get("CTXGATE_DB_DSN") or os.environ.get("CTXPROXY_DB_DSN") or "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy"
-PROXY_PORT = int(os.environ.get("CTXGATE_PROXY_PORT", "9200"))
+PROXY_PORT = _env_int("CTXGATE_PROXY_PORT", 9200)
 API_KEY = os.environ.get("CTXGATE_API_KEY", "")
-MAX_BODY_BYTES = int(os.environ.get("CTXGATE_MAX_BODY_BYTES", str(20 * 1024 * 1024)))
+MAX_BODY_BYTES = _env_int("CTXGATE_MAX_BODY_BYTES", 20 * 1024 * 1024)
 QWEN_TOKENIZER_PATH = os.environ.get("CTXGATE_QWEN_TOKENIZER", "/home/user/models/Swift-1.5-Qwen3.8-27b-W4A16-AutoRound/tokenizer.json")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-log = logging.getLogger("ctxgate-proxy")
 
 # --- Global state (per-session where applicable) ---
 pool: Optional[asyncpg.Pool] = None
@@ -55,6 +68,91 @@ metrics = {
     "started_at": time.time(),
 }
 
+# --- Injection / utilization metrics (persisted to JSON, survives restart) ---
+INJECTION_METRICS_PATH = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "injection_metrics.json"))
+
+def _default_injection_metrics() -> dict:
+    return {
+        "task_memory_injections": 0,
+        "task_memory_tokens": 0,
+        "knowledge_injections": 0,
+        "knowledge_tokens": 0,
+        "working_memory_injections": 0,
+        "working_memory_tokens": 0,
+        "total_requests": 0,
+        "sessions": {},
+        "last_injected_task_memory": "",
+        "last_injected_knowledge": "",
+        "events": [],
+    }
+
+def _load_injection_metrics() -> dict:
+    try:
+        with open(INJECTION_METRICS_PATH) as f:
+            data = json.load(f)
+        base = _default_injection_metrics()
+        if isinstance(data, dict):
+            base.update(data)
+        return base
+    except Exception:
+        return _default_injection_metrics()
+
+def _save_injection_metrics() -> None:
+    try:
+        with open(INJECTION_METRICS_PATH, "w") as f:
+            json.dump(injection_metrics, f)
+    except Exception as e:
+        log.warning("injection metrics save failed: %s", e)
+
+def _pct_str(n: int, d: int) -> str:
+    return f"{(100 * n / d):.1f}%" if d else "0.0%"
+
+def _record_injection(session_id: str, tm: str, kn: str) -> None:
+    """Record memory/knowledge injection utilization. Lightweight, no DB round-trips."""
+    global injection_metrics
+    try:
+        injection_metrics["total_requests"] += 1
+        events = []
+        if tm:
+            t = count_tokens(tm)
+            injection_metrics["task_memory_injections"] += 1
+            injection_metrics["task_memory_tokens"] += t
+            injection_metrics["last_injected_task_memory"] = tm[:2000]
+            events.append({"ts": time.time(), "session": session_id, "type": "task_memory", "tokens": t})
+        if kn:
+            t = count_tokens(kn)
+            injection_metrics["knowledge_injections"] += 1
+            injection_metrics["knowledge_tokens"] += t
+            injection_metrics["last_injected_knowledge"] = kn[:2000]
+            events.append({"ts": time.time(), "session": session_id, "type": "knowledge", "tokens": t})
+        # Working memory is a subset of task memory; count it when the WM line is present.
+        wm_line = ""
+        if tm and "WORKING MEMORY:" in tm:
+            for ln in tm.split("\n"):
+                if ln.startswith("WORKING MEMORY:"):
+                    wm_line = ln
+                    break
+        if wm_line:
+            injection_metrics["working_memory_injections"] += 1
+            injection_metrics["working_memory_tokens"] += count_tokens(wm_line)
+        s = injection_metrics["sessions"].setdefault(session_id, {"task_mem": 0, "knowledge": 0, "wm": 0, "requests": 0})
+        s["requests"] += 1
+        if tm:
+            s["task_mem"] += 1
+        if kn:
+            s["knowledge"] += 1
+        if wm_line:
+            s["wm"] += 1
+        for e in events:
+            injection_metrics["events"].append(e)
+        if len(injection_metrics["events"]) > 50:
+            injection_metrics["events"] = injection_metrics["events"][-50:]
+        _save_injection_metrics()
+    except Exception as e:
+        log.warning("injection metrics record failed: %s", e)
+
+injection_metrics = _load_injection_metrics()
+
 def _human_time(seconds: float) -> str:
     """Convert seconds to human readable format."""
     if seconds < 60:
@@ -68,20 +166,53 @@ def _human_time(seconds: float) -> str:
         m = int((seconds % 3600) // 60)
         return f"{h}h {m}m"
 
-def _validate_config(tok_name: str) -> None:
+def validate_config() -> None:
+    """Fail-fast config validation. Exits the process if any problem is found."""
+    import urllib.parse
+    problems: list[str] = []
+
+    # 1. DB_DSN must parse and have a hostname
     try:
-        from urllib.parse import urlparse
-        u = urlparse(DB_DSN)
-        log.info("config: dsn_host=%s db=%s vllm=%s model=%s max_ctx=%d max_in=%d max_out=%d margin=%d port=%d tokenizer=%s api_key=%s",
-                 u.hostname or "?", (u.path or "/").lstrip("/") or "?", VLLM_URL, VLLM_MODEL, MAX_CONTEXT, MAX_INPUT, MAX_OUTPUT, SAFETY_MARGIN, PROXY_PORT, tok_name, "set" if API_KEY else "off")
-        if MAX_INPUT + SAFETY_MARGIN > MAX_CONTEXT:
-            log.warning("config: MAX_INPUT(%d)+SAFETY_MARGIN(%d) > MAX_CONTEXT(%d)", MAX_INPUT, SAFETY_MARGIN, MAX_CONTEXT)
+        u = urllib.parse.urlparse(DB_DSN)
+        if not u.hostname:
+            problems.append(f"DB_DSN has no hostname: {DB_DSN!r}")
     except Exception as e:
-        log.warning("config validation: %s", e)
+        problems.append(f"DB_DSN unparseable: {e}")
+
+    # 2. VLLM_URL must be a valid http(s) URL
+    try:
+        u2 = urllib.parse.urlparse(VLLM_URL)
+        if u2.scheme not in ("http", "https") or not u2.hostname:
+            problems.append(f"VLLM_URL is not a valid http(s) URL: {VLLM_URL!r}")
+    except Exception as e:
+        problems.append(f"VLLM_URL unparseable: {e}")
+
+    # 3. MAX_INPUT + SAFETY_MARGIN <= MAX_CONTEXT
+    if MAX_INPUT + SAFETY_MARGIN > MAX_CONTEXT:
+        problems.append(f"MAX_INPUT({MAX_INPUT}) + SAFETY_MARGIN({SAFETY_MARGIN}) > MAX_CONTEXT({MAX_CONTEXT})")
+
+    # 4. MAX_OUTPUT >= 1
+    if MAX_OUTPUT < 1:
+        problems.append(f"MAX_OUTPUT must be >= 1, got {MAX_OUTPUT}")
+
+    # 5. Tokenizer path must exist if set
+    if QWEN_TOKENIZER_PATH and not os.path.exists(QWEN_TOKENIZER_PATH):
+        problems.append(f"Tokenizer path does not exist: {QWEN_TOKENIZER_PATH!r}")
+
+    for p in problems:
+        log.error("config: %s", p)
+
+    if problems:
+        log.error("config validation FAILED with %d problem(s); refusing to start", len(problems))
+        sys.exit(1)
+
+    log.info("config validation OK (dsn=%s vllm=%s max_ctx=%d max_in=%d max_out=%d margin=%d)",
+             DB_DSN, VLLM_URL, MAX_CONTEXT, MAX_INPUT, MAX_OUTPUT, SAFETY_MARGIN)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pool, enc
+    validate_config()
     pool = await asyncpg.create_pool(DB_DSN, min_size=2, max_size=10)
     tok_name = "cl100k_base (fallback)"
     try:
@@ -96,7 +227,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         enc = tiktoken.get_encoding("cl100k_base")
         log.warning("ctxgate-proxy: Qwen tokenizer load FAILED (%s), falling back to cl100k_base", e)
-    _validate_config(tok_name)
     yield
     await pool.close()
     log.info("ctxgate-proxy shutdown complete (graceful: pool drained)")
@@ -488,13 +618,14 @@ async def fetch_task_memory(session_id: str, messages: list, wm_budget: int = 80
     # 2. Durable memories: CRITICAL (small safety net) + relevant HIGH
     rows = []
     if total < total_budget:
-        crit = await pool.fetch("SELECT key, value FROM proxy.memories WHERE task_id=$1 AND active=true AND importance=10 ORDER BY updated_at DESC LIMIT 5", task_uuid)
+        crit = await pool.fetch("SELECT id, key, value FROM proxy.memories WHERE task_id=$1 AND active=true AND importance=10 ORDER BY updated_at DESC LIMIT 5", task_uuid)
         rel = []
         if terms:
-            rel = await pool.fetch("SELECT key, value FROM proxy.memories WHERE task_id=$1 AND active=true AND (key ILIKE ANY($2) OR value ILIKE ANY($2)) ORDER BY importance DESC, updated_at DESC LIMIT 8", task_uuid, ["%" + t + "%" for t in list(terms)[:20]])
+            rel = await pool.fetch("SELECT id, key, value FROM proxy.memories WHERE task_id=$1 AND active=true AND (key ILIKE ANY($2) OR value ILIKE ANY($2)) ORDER BY importance DESC, updated_at DESC LIMIT 8", task_uuid, ["%" + t + "%" for t in list(terms)[:20]])
         rows = list(crit) + list(rel)
 
     seen = set()
+    injected_ids: list = []
     for row in rows:
         line = row["key"] + ": " + row["value"]
         nk = _re.sub(r'[^a-z0-9]+', ' ', line.lower()).strip()
@@ -508,8 +639,16 @@ async def fetch_task_memory(session_id: str, messages: list, wm_budget: int = 80
         if total + t > min(mem_budget, total_budget):
             break
         parts.append(line)
+        injected_ids.append(row["id"])
         seen.add(nk)
         total += t
+
+    # Touch-on-use: stamp last_accessed_at for injected memory rows
+    try:
+        if injected_ids:
+            await pool.execute("UPDATE proxy.memories SET last_accessed_at = now() WHERE id = ANY($1)", injected_ids)
+    except Exception as e:
+        log.warning("touch-on-use update failed: %s", e)
 
     if not parts:
         return ""
@@ -776,6 +915,10 @@ async def chat_completions(request: Request):
     # Build context
     built = await build_context(messages)
 
+    # Safe defaults: guard _record_injection against a fetch exception leaving tm/kn unset
+    tm = ""
+    kn = ""
+
     # --- Cross-session knowledge injection ---
     try:
         kn = await fetch_relevant_knowledge(messages, max_items=5, max_tokens=400)
@@ -805,6 +948,9 @@ async def chat_completions(request: Request):
                 built.insert(0, {"role": "system", "content": tm})
     except Exception as e:
         log.warning("Task memory injection failed: %s", e)
+
+    # --- Injection / utilization instrumentation (lightweight, no DB) ---
+    _record_injection(x_sid, tm, kn)
 
     # Per-session prefix check
     check_prefix(session_key, built)
@@ -1156,6 +1302,183 @@ async def api_gpu():
     except Exception:
         return {"gpus": []}
 
+# --- Memory & utilization analytics API ---
+@app.get("/api/memory")
+async def api_memory(session: str = "", limit: int = 50):
+    """Per-session durable memories + working memory."""
+    if not pool or not session:
+        return {"memories": [], "working_memory": "", "count": 0}
+    try:
+        task_uuid = await _resolve_task(session, create=False)
+        if task_uuid is None:
+            return {"memories": [], "working_memory": "", "count": 0}
+        rows = await pool.fetch(
+            "SELECT key, value, category, importance, active, status, model_name, "
+            "created_at, updated_at, source_event_id FROM proxy.memories "
+            "WHERE task_id = $1 ORDER BY updated_at DESC LIMIT $2",
+            task_uuid, limit,
+        )
+        memories = [
+            {
+                "key": r["key"], "value": r["value"], "category": r["category"],
+                "importance": r["importance"], "active": r["active"], "status": r["status"],
+                "model_name": r["model_name"],
+                "created_at": str(r["created_at"]) if r["created_at"] else None,
+                "updated_at": str(r["updated_at"]) if r["updated_at"] else None,
+                "source_event_id": str(r["source_event_id"]) if r["source_event_id"] else None,
+            }
+            for r in rows
+        ]
+        wrow = await pool.fetchrow("SELECT content FROM proxy.working_memory WHERE task_id = $1", task_uuid)
+        wm = (wrow["content"] if wrow and wrow["content"] else "")
+        return {"memories": memories, "working_memory": wm, "count": len(memories)}
+    except Exception as e:
+        log.warning("api/memory failed: %s", e)
+        return {"memories": [], "working_memory": "", "count": 0, "error": str(e)}
+
+
+@app.get("/api/memory-analytics")
+async def api_memory_analytics():
+    """Full memory/knowledge/worker utilization analytics for the dashboard."""
+    result = {}
+    inj = injection_metrics
+    total_reqs = inj.get("total_requests", 0)
+    def _rate(n):
+        return (n / total_reqs) if total_reqs else 0.0
+    result["injection"] = {
+        "task_memory_injections": inj.get("task_memory_injections", 0),
+        "task_memory_tokens": inj.get("task_memory_tokens", 0),
+        "knowledge_injections": inj.get("knowledge_injections", 0),
+        "knowledge_tokens": inj.get("knowledge_tokens", 0),
+        "working_memory_injections": inj.get("working_memory_injections", 0),
+        "working_memory_tokens": inj.get("working_memory_tokens", 0),
+        "total_requests": total_reqs,
+        "task_memory_rate": round(_rate(inj.get("task_memory_injections", 0)), 4),
+        "knowledge_rate": round(_rate(inj.get("knowledge_injections", 0)), 4),
+        "wm_rate": round(_rate(inj.get("working_memory_injections", 0)), 4),
+        "last_injected_task_memory": inj.get("last_injected_task_memory", ""),
+        "last_injected_knowledge": inj.get("last_injected_knowledge", ""),
+        "events": inj.get("events", []),
+    }
+
+    # Memories
+    try:
+        if pool:
+            mem_total = await pool.fetchval("SELECT COUNT(*) FROM proxy.memories")
+            mem_active = await pool.fetchval("SELECT COUNT(*) FROM proxy.memories WHERE active = true")
+            mem_super = await pool.fetchval("SELECT COUNT(*) FROM proxy.memories WHERE active = false")
+            by_cat = await pool.fetch("SELECT category, COUNT(*) c FROM proxy.memories WHERE active = true GROUP BY category ORDER BY c DESC")
+            by_imp = await pool.fetch("SELECT importance, COUNT(*) c FROM proxy.memories WHERE active = true GROUP BY importance ORDER BY importance DESC")
+            by_model = await pool.fetch("SELECT model_name, COUNT(*) c FROM proxy.memories GROUP BY model_name ORDER BY c DESC")
+            recent = await pool.fetch("SELECT key, value, category, importance, updated_at, model_name FROM proxy.memories WHERE active = true ORDER BY updated_at DESC LIMIT 15")
+            result["memories"] = {
+                "total": mem_total, "active": mem_active, "superseded": mem_super,
+                "by_category": {r["category"]: r["c"] for r in by_cat},
+                "by_importance": {int(r["importance"]): r["c"] for r in by_imp},
+                "by_model": {r["model_name"]: r["c"] for r in by_model},
+                "recent": [
+                    {"key": r["key"], "value": r["value"], "category": r["category"],
+                     "importance": r["importance"], "model_name": r["model_name"],
+                     "updated_at": str(r["updated_at"]) if r["updated_at"] else None}
+                    for r in recent
+                ],
+            }
+        else:
+            result["memories"] = {"total": 0, "active": 0, "superseded": 0, "by_category": {}, "by_importance": {}, "by_model": {}, "recent": []}
+    except Exception as e:
+        result["memories"] = {"total": 0, "active": 0, "superseded": 0, "by_category": {}, "by_importance": {}, "by_model": {}, "recent": [], "error": str(e)}
+
+    # Jobs
+    try:
+        if pool:
+            j_total = await pool.fetchval("SELECT COUNT(*) FROM proxy.memory_jobs")
+            j_done = await pool.fetchval("SELECT COUNT(*) FROM proxy.memory_jobs WHERE status = 'done'")
+            j_failed = await pool.fetchval("SELECT COUNT(*) FROM proxy.memory_jobs WHERE status = 'failed'")
+            j_pending = await pool.fetchval("SELECT COUNT(*) FROM proxy.memory_jobs WHERE status IN ('pending','running')")
+            j_avg = await pool.fetchval("SELECT COALESCE(AVG(EXTRACT(epoch FROM completed_at - started_at)) * 1000, 0) FROM proxy.memory_jobs WHERE completed_at IS NOT NULL AND started_at IS NOT NULL")
+            result["jobs"] = {
+                "total": j_total, "done": j_done, "failed": j_failed, "pending": j_pending,
+                "avg_ms": round(j_avg or 0, 1),
+                "success_rate": round(j_done / j_total, 4) if j_total else 0.0,
+            }
+            by_hour = await pool.fetch(
+                "SELECT to_char(date_trunc('hour', completed_at), 'HH24') AS hour, "
+                "COUNT(*) FILTER (WHERE status = 'done') AS done, "
+                "COUNT(*) FILTER (WHERE status = 'failed') AS failed "
+                "FROM proxy.memory_jobs WHERE completed_at >= now() - interval '24 hours' "
+                "GROUP BY 1 ORDER BY 1"
+            )
+            result["jobs_by_hour"] = [{"hour": r["hour"], "done": r["done"], "failed": r["failed"]} for r in by_hour]
+        else:
+            result["jobs"] = {"total": 0, "done": 0, "failed": 0, "pending": 0, "avg_ms": 0, "success_rate": 0.0}
+            result["jobs_by_hour"] = []
+    except Exception as e:
+        result["jobs"] = {"total": 0, "done": 0, "failed": 0, "pending": 0, "avg_ms": 0, "success_rate": 0.0, "error": str(e)}
+        result["jobs_by_hour"] = []
+
+    # Knowledge
+    try:
+        if pool:
+            k_total = await pool.fetchval("SELECT COUNT(*) FROM proxy.knowledge")
+            k_active = await pool.fetchval("SELECT COUNT(*) FROM proxy.knowledge WHERE active = true")
+            k_dom = await pool.fetch("SELECT domain, COUNT(*) c FROM proxy.knowledge WHERE active = true GROUP BY domain ORDER BY c DESC")
+            k_recent = await pool.fetch("SELECT key, value, importance, domain, updated_at FROM proxy.knowledge WHERE active = true ORDER BY updated_at DESC LIMIT 10")
+            result["knowledge"] = {
+                "total": k_total, "active": k_active,
+                "by_domain": {r["domain"]: r["c"] for r in k_dom},
+                "recent": [
+                    {"key": r["key"], "value": r["value"], "importance": r["importance"],
+                     "domain": r["domain"], "updated_at": str(r["updated_at"]) if r["updated_at"] else None}
+                    for r in k_recent
+                ],
+            }
+        else:
+            result["knowledge"] = {"total": 0, "active": 0, "by_domain": {}, "recent": []}
+    except Exception as e:
+        result["knowledge"] = {"total": 0, "active": 0, "by_domain": {}, "recent": [], "error": str(e)}
+
+    # Sessions (per-session injection breakdown)
+    result["sessions"] = inj.get("sessions", {})
+
+    # Worker
+    last_job = None
+    jobs_today = 0
+    try:
+        if pool:
+            lj = await pool.fetchrow("SELECT completed_at FROM proxy.memory_jobs WHERE status = 'done' AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 1")
+            if lj and lj["completed_at"]:
+                last_job = str(lj["completed_at"])
+            jobs_today = await pool.fetchval("SELECT COUNT(*) FROM proxy.memory_jobs WHERE status = 'done' AND completed_at >= date_trunc('day', now())")
+    except Exception:
+        pass
+    result["worker"] = {
+        "model": os.environ.get("CTXGATE_LM_MODEL", "qwen3-4b-instruct-2507"),
+        "lm_url": os.environ.get("CTXGATE_LM_URL", "http://127.0.0.1:1234/v1/chat/completions"),
+        "poll": float(os.environ.get("CTXGATE_WORKER_POLL", "2.0")),
+        "max_attempts": _env_int("CTXGATE_WORKER_MAX_ATTEMPTS", 3),
+        "outage_ttl": float(os.environ.get("CTXGATE_WORKER_OUTAGE_TTL", "1800")),
+        "last_job_completed_at": last_job,
+        "jobs_done_today": jobs_today,
+    }
+
+    # Utilization summary (human-readable)
+    n = total_reqs
+    tm_i = inj.get("task_memory_injections", 0)
+    kn_i = inj.get("knowledge_injections", 0)
+    wm_i = inj.get("working_memory_injections", 0)
+    mem_total = result.get("memories", {}).get("total", 0)
+    j_done = result.get("jobs", {}).get("done", 0)
+    j_avg = result.get("jobs", {}).get("avg_ms", 0)
+    k_total = result.get("knowledge", {}).get("total", 0)
+    result["utilization_summary"] = [
+        f"Task memory injected in {_pct_str(tm_i, n)} of {n} requests ({tm_i} times)",
+        f"Shared knowledge injected in {_pct_str(kn_i, n)} of {n} requests ({kn_i} times)",
+        f"Working memory injected in {_pct_str(wm_i, n)} of {n} requests ({wm_i} times)",
+        f"4B worker produced {mem_total} memories from {j_done} jobs (avg {(j_avg / 1000):.1f} s)",
+        f"Knowledge sharing: {k_total} items, used in {_pct_str(kn_i, n)} of requests",
+    ]
+    return result
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     return DASHBOARD_HTML
@@ -1199,15 +1522,39 @@ tr:hover td { background: var(--surface2); }
 .badge.error { background: rgba(248,113,113,0.15); color: var(--red); }
 .badge.timeout { background: rgba(251,191,36,0.15); color: var(--yellow); }
 .chart-container { position: relative; height: 250px; }
+.chart-sm { position: relative; height: 150px; }
 .memory-item { padding: 12px; border-left: 3px solid var(--accent); margin-bottom: 8px; background: var(--surface2); border-radius: 0 var(--radius) var(--radius) 0; font-size: 0.85rem; }
 .memory-item .meta { color: var(--text2); font-size: 0.75rem; margin-top: 4px; }
 #status-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 20px; font-size: 0.8rem; color: var(--text2); }
 #status-bar .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
+.mini-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px,1fr)); gap: 12px; margin-bottom: 14px; }
+.mini-card { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+.mini-card .label { font-size: 0.7rem; color: var(--text2); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+.mini-card .value { font-size: 1.4rem; font-weight: 700; }
+.mini-card .sub { font-size: 0.72rem; color: var(--text2); margin-top: 3px; }
+.mini-card.green .value { color: var(--green); }
+.mini-card.red .value { color: var(--red); }
+.mini-card.blue .value { color: var(--blue); }
+.mini-card.yellow .value { color: var(--yellow); }
+.scrollbox { max-height: 220px; overflow-y: auto; }
+.txtbox { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-size: 0.8rem; white-space: pre-wrap; max-height: 200px; overflow-y: auto; line-height: 1.5; }
+.verdict { padding: 12px 16px; border-radius: 8px; font-weight: 700; font-size: 0.95rem; margin-bottom: 14px; }
+.verdict.active { background: rgba(74,222,128,0.15); color: var(--green); border: 1px solid rgba(74,222,128,0.4); }
+.verdict.inactive { background: rgba(248,113,113,0.15); color: var(--red); border: 1px solid rgba(248,113,113,0.4); }
+.catbar { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 0.78rem; }
+.catbar .name { width: 110px; color: var(--text2); }
+.catbar .bar { flex: 1; height: 8px; background: var(--surface2); border-radius: 4px; overflow: hidden; }
+.catbar .fill { height: 100%; background: var(--accent); }
+.catbar .cnt { width: 24px; text-align: right; color: var(--text); }
+select { background: var(--surface2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; font-size: 0.85rem; margin-bottom: 12px; }
+.summary-list { list-style: none; }
+.summary-list li { padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 0.85rem; color: var(--text); }
+.summary-list li:last-child { border-bottom: none; }
 </style>
 </head>
 <body>
 <h1>ctxgate-proxy</h1>
-<p class="subtitle">Context Proxy Dashboard &mdash; Goose&rarr;vLLM with session isolation</p>
+<p class="subtitle">Context Proxy Dashboard &mdash; Goose&rarr;vLLM with session isolation &amp; 4B memory worker</p>
 <div id="status-bar"><div class="dot" id="status-dot"></div><span id="status-text">Connecting...</span></div>
 
 <div class="grid" id="stat-cards"></div>
@@ -1248,6 +1595,28 @@ tr:hover td { background: var(--surface2); }
 
 <div class="row">
   <div class="section card" style="padding: 20px;">
+    <h2>4B Memory Worker</h2>
+    <div id="worker-panel"></div>
+  </div>
+  <div class="section card" style="padding: 20px;">
+    <h2>Memory Utilization</h2>
+    <div id="utilization-panel"></div>
+  </div>
+</div>
+
+<div class="row">
+  <div class="section card" style="padding: 20px;">
+    <h2>Produced Memories</h2>
+    <div id="memories-panel"></div>
+  </div>
+  <div class="section card" style="padding: 20px;">
+    <h2>Knowledge Sharing</h2>
+    <div id="knowledge-panel"></div>
+  </div>
+</div>
+
+<div class="row">
+  <div class="section card" style="padding: 20px;">
     <h2>4B Model (LM Studio)</h2>
     <div id="lmstudio-info">
       <p style="color: var(--text2); font-size: 0.85rem;">Loading...</p>
@@ -1268,21 +1637,59 @@ tr:hover td { background: var(--surface2); }
 
 <script>
 let tokenChart = null;
+const charts = {};
 
-async function fetchJSON(url) {
-  const r = await fetch(url);
-  return r.json();
+function setChart(id, cfg) {
+  if (charts[id]) { try { charts[id].destroy(); } catch (e) {} }
+  charts[id] = new Chart(document.getElementById(id), cfg);
+}
+
+function fetchJSON(url) {
+  return fetch(url).then(r => r.json());
 }
 
 function fmtNum(n) {
+  if (n == null) return '0';
   if (n >= 1000000) return (n/1000000).toFixed(1) + 'M';
   if (n >= 1000) return (n/1000).toFixed(1) + 'K';
-  return n.toString();
+  return String(n);
+}
+
+function pct(n, d) {
+  if (!d) return '0%';
+  return (100 * n / d).toFixed(1) + '%';
+}
+
+function esc(s) {
+  if (s == null) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 function badge(status) {
-  const cls = status === 'ok' ? 'ok' : (status.includes('timeout') ? 'timeout' : 'error');
-  return '<span class="badge ' + cls + '">' + status + '</span>';
+  const cls = status === 'ok' ? 'ok' : (status && status.includes('timeout') ? 'timeout' : 'error');
+  return '<span class="badge ' + cls + '">' + esc(status) + '</span>';
+}
+
+function catBadge(c) {
+  if (!c) return '<span class="badge">-</span>';
+  const m = { DECISION:'#60a5fa', FINDING:'#4ade80', FAILURE:'#f87171', TODO:'#fbbf24', CONSTRAINT:'#c084fc', FILE:'#22d3ee', STATE:'#8b8fa3', FACT:'#6c8cff' };
+  const col = m[c.toUpperCase()] || '#8b8fa3';
+  return '<span class="badge" style="background:' + col + '22;color:' + col + '">' + esc(c) + '</span>';
+}
+
+function miniCards(items) {
+  return '<div class="mini-grid">' + items.map(i =>
+    '<div class="mini-card ' + (i.cls||'') + '"><div class="label">' + i.label + '</div><div class="value">' + i.value + '</div>' + (i.sub ? '<div class="sub">' + i.sub + '</div>' : '') + '</div>'
+  ).join('') + '</div>';
+}
+
+function barRows(obj, maxN) {
+  const entries = Object.entries(obj || {});
+  if (!entries.length) return '<p style="color:var(--text2);font-size:0.8rem;">No data</p>';
+  const max = Math.max.apply(null, entries.map(e => e[1])) || 1;
+  return entries.slice(0, maxN || 12).map(e =>
+    '<div class="catbar"><div class="name">' + esc(e[0]) + '</div><div class="bar"><div class="fill" style="width:' + (100 * e[1] / max).toFixed(0) + '%"></div></div><div class="cnt">' + e[1] + '</div></div>'
+  ).join('');
 }
 
 async function refresh() {
@@ -1294,11 +1701,12 @@ async function refresh() {
       fetchJSON('/api/errors?n=20'),
       fetchJSON('/api/memory-summary'),
     ]);
+    let analytics = null;
+    try { analytics = await fetchJSON('/api/memory-analytics'); } catch (e) { analytics = null; }
 
     document.getElementById('status-dot').style.background = 'var(--green)';
-    document.getElementById('status-text').textContent = 'Live &middot; ' + m.uptime_human + ' uptime &middot; ' + m.active_sessions + ' sessions';
+    document.getElementById('status-text').textContent = 'Live · ' + m.uptime_human + ' uptime · ' + m.active_sessions + ' sessions';
 
-    // Stat cards
     const cards = [
       { label: 'Requests', value: m.requests_total, sub: m.requests_ok + ' ok / ' + m.requests_error + ' err', cls: 'blue' },
       { label: 'Tokens In', value: fmtNum(m.tokens_in_total), sub: 'max ctx: ' + fmtNum(m.max_context_seen), cls: '' },
@@ -1311,79 +1719,72 @@ async function refresh() {
       '<div class="card ' + c.cls + '"><div class="label">' + c.label + '</div><div class="value">' + c.value + '</div><div class="sub">' + c.sub + '</div></div>'
     ).join('');
 
-    // Token chart
     const labels = calls.map(c => c.ts_human);
     const inData = calls.map(c => c.in);
     const outData = calls.map(c => c.out);
-    if (tokenChart) tokenChart.destroy();
-    tokenChart = new Chart(document.getElementById('tokenChart'), {
+    setChart('tokenChart', {
       type: 'bar',
-      data: {
-        labels: labels,
-        datasets: [
-          { label: 'Input', data: inData, backgroundColor: 'rgba(96,165,250,0.6)', borderRadius: 4 },
-          { label: 'Output', data: outData, backgroundColor: 'rgba(74,222,128,0.6)', borderRadius: 4 },
-        ]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
+      data: { labels: labels, datasets: [
+        { label: 'Input', data: inData, backgroundColor: 'rgba(96,165,250,0.6)', borderRadius: 4 },
+        { label: 'Output', data: outData, backgroundColor: 'rgba(74,222,128,0.6)', borderRadius: 4 },
+      ]},
+      options: { responsive: true, maintainAspectRatio: false,
         plugins: { legend: { labels: { color: '#8b8fa3' } } },
-        scales: { x: { ticks: { color: '#8b8fa3', font: { size: 10 } } }, y: { ticks: { color: '#8b8fa3' } } }
-      }
+        scales: { x: { ticks: { color: '#8b8fa3', font: { size: 10 } } }, y: { ticks: { color: '#8b8fa3' } } } }
     });
 
-    // Calls table
     document.querySelector('#calls-table tbody').innerHTML = calls.map(c =>
-      '<tr><td>' + c.ts_human + '</td><td>' + c.session + '</td><td>' + fmtNum(c.in) + '</td><td>' + fmtNum(c.out) + '</td><td>' + badge(c.status) + '</td><td>' + (c.stream ? 'yes' : 'no') + '</td></tr>'
+      '<tr><td>' + c.ts_human + '</td><td>' + esc(c.session) + '</td><td>' + fmtNum(c.in) + '</td><td>' + fmtNum(c.out) + '</td><td>' + badge(c.status) + '</td><td>' + (c.stream ? 'yes' : 'no') + '</td></tr>'
     ).join('');
 
-    // Sessions table
     document.querySelector('#sessions-table tbody').innerHTML = sessions.map(s =>
-      '<tr><td>' + s.key + '</td><td>' + s.provider + '</td><td>' + s.requests + '</td><td>' + fmtNum(s.tokens_in) + '</td><td>' + fmtNum(s.tokens_out) + '</td><td>' + fmtNum(s.max_context) + '</td></tr>'
+      '<tr><td>' + esc(s.key) + '</td><td>' + esc(s.provider) + '</td><td>' + s.requests + '</td><td>' + fmtNum(s.tokens_in) + '</td><td>' + fmtNum(s.tokens_out) + '</td><td>' + fmtNum(s.max_context) + '</td></tr>'
     ).join('') || '<tr><td colspan="6" style="color:var(--text2)">No sessions yet</td></tr>';
 
-    // Errors
     document.getElementById('errors-list').innerHTML = errors.length
-      ? errors.map(e => '<div class="memory-item"><div>' + e.ts_human + ' &mdash; ' + e.session + ' &mdash; <span class="badge error">' + e.status + '</span></div>' + (e.explanation ? '<div class="meta" style="color:var(--red)" data-expl="true">' + e.explanation + '</div>' : '') + '<div class="meta">in: ' + fmtNum(e.in) + ' &middot; model: ' + e.model + '</div></div>').join('')
+      ? errors.map(e => '<div class="memory-item"><div>' + e.ts_human + ' &mdash; ' + esc(e.session) + ' &mdash; <span class="badge error">' + esc(e.status) + '</span></div>' + (e.explanation ? '<div class="meta" style="color:var(--red)">' + esc(e.explanation) + '</div>' : '') + '<div class="meta">in: ' + fmtNum(e.in) + ' &middot; model: ' + esc(e.model) + '</div></div>').join('')
       : '<p style="color: var(--green); font-size: 0.85rem;">No errors</p>';
 
-    // Memory
     document.getElementById('memory-list').innerHTML = mem.tasks.length
-      ? mem.tasks.map(t => '<div class="memory-item"><div><strong>' + t.session_id + '</strong></div><div class="meta">created: ' + t.created + ' &middot; updated: ' + t.updated + '</div></div>').join('') +
+      ? mem.tasks.map(t => '<div class="memory-item"><div><strong>' + esc(t.session_id) + '</strong></div><div class="meta">created: ' + esc(t.created) + ' &middot; updated: ' + esc(t.updated) + '</div></div>').join('') +
         '<p style="color:var(--text2); font-size:0.8rem; margin-top:8px;">' + mem.memory_entries + ' memory entries in DB</p>'
       : '<p style="color:var(--text2); font-size:0.85rem;">No tasks in database</p>';
 
+    renderWorker(analytics);
+    renderUtilization(analytics);
+    renderMemories(analytics);
+    renderKnowledge(analytics);
 
-    // LM Studio 4B model
     try {
       const lm = await fetchJSON('/api/lmstudio');
       if (lm.available) {
         const activeModel = lm.active_4b || lm.model;
         document.getElementById('lmstudio-info').innerHTML =
-          '<div class="memory-item"><div><strong>' + activeModel + '</strong></div>' +
-          '<div class="meta">Engine: ' + lm.engine + ' &middot; Port: ' + lm.port + '</div>' +
+          '<div class="memory-item"><div><strong>' + esc(activeModel) + '</strong></div>' +
+          '<div class="meta">Engine: ' + esc(lm.engine) + ' &middot; Port: ' + lm.port + '</div>' +
           '<div class="meta">PID: ' + (lm.pid || '?') + ' &middot; CPU: ' + (lm.cpu_pct || '?') + '% &middot; Mem: ' + (lm.mem_pct || '?') + '% (' + (lm.rss_mb || '?') + ' MB)</div>' +
           '<div class="meta">Uptime: ' + (lm.elapsed || '?') + ' &middot; Models loaded: ' + (lm.model_count || 0) + '</div>' +
-          (lm.models_loaded ? '<div class="meta" style="color:var(--green)">' + lm.models_loaded.join(', ') + '</div>' : '') +
+          (lm.models_loaded ? '<div class="meta" style="color:var(--green)">' + lm.models_loaded.map(esc).join(', ') + '</div>' : '') +
           '</div>';
       } else {
         document.getElementById('lmstudio-info').innerHTML =
           '<div class="memory-item" style="border-left-color: var(--red)"><div><strong style="color:var(--red)">LM Studio Offline</strong></div>' +
-          '<div class="meta">' + (lm.error || 'Not reachable') + '</div></div>';
+          '<div class="meta">' + esc(lm.error || 'Not reachable') + '</div></div>';
       }
     } catch (e) {
       document.getElementById('lmstudio-info').innerHTML =
         '<div class="memory-item" style="border-left-color:var(--red)"><div><strong style="color:var(--red)">LM Studio Unreachable</strong></div></div>';
     }
 
-    // GPU status
     try {
       const gpu = await fetchJSON('/api/gpu');
-      if (gpu.gpus) {
+      if (gpu.gpus && gpu.gpus.length) {
         document.getElementById('gpu-info').innerHTML = gpu.gpus.map(g =>
-          '<div class="memory-item"><div><strong>' + g.name + '</strong></div>' +
-          '<div class="meta">VRAM: ' + g.used + ' / ' + g.total + ' MB &middot; Util: ' + g.util + '%</div></div>'
+          '<div class="memory-item"><div><strong>' + esc(g.name) + '</strong></div>' +
+          '<div class="meta">VRAM: ' + esc(g.used) + ' / ' + esc(g.total) + ' MB &middot; Util: ' + esc(g.util) + '%</div></div>'
         ).join('');
+      } else {
+        document.getElementById('gpu-info').innerHTML = '<p style="color:var(--text2);font-size:0.85rem;">No GPU detected</p>';
       }
     } catch (e) {
       document.getElementById('gpu-info').innerHTML =
@@ -1396,6 +1797,144 @@ async function refresh() {
   }
 }
 
+function renderWorker(a) {
+  const el = document.getElementById('worker-panel');
+  if (!a) { el.innerHTML = '<p style="color:var(--text2);font-size:0.85rem;">Loading analytics...</p>'; return; }
+  const w = a.worker || {};
+  const j = a.jobs || {};
+  const cards = miniCards([
+    { label: 'Model', value: w.model || '-', cls: '' },
+    { label: 'Jobs Done', value: j.done || 0, sub: (j.total || 0) + ' total', cls: 'green' },
+    { label: 'Failed', value: j.failed || 0, sub: (j.pending || 0) + ' pending', cls: j.failed > 0 ? 'red' : '' },
+    { label: 'Avg Time', value: j.avg_ms ? (j.avg_ms / 1000).toFixed(1) + 's' : '-', sub: 'per job', cls: '' },
+    { label: 'Success', value: j.success_rate != null ? (j.success_rate * 100).toFixed(1) + '%' : '-', cls: j.success_rate >= 0.99 ? 'green' : 'yellow' },
+    { label: 'Last Job', value: w.last_job_completed_at ? w.last_job_completed_at.slice(11, 19) : '-', sub: w.jobs_done_today + ' today', cls: '' },
+  ]);
+  el.innerHTML = cards +
+    '<div class="memory-item" style="margin-bottom:10px"><div class="meta">LM URL: ' + esc(w.lm_url || '-') + '</div>' +
+    '<div class="meta">Poll: ' + (w.poll || '-') + 's &middot; Max attempts: ' + (w.max_attempts || '-') + ' &middot; Outage TTL: ' + (w.outage_ttl || '-') + 's</div></div>' +
+    '<div class="chart-sm"><canvas id="jobsChart"></canvas></div>';
+  const jobs = a.jobs_by_hour || [];
+  if (jobs.length) {
+    setChart('jobsChart', {
+      type: 'bar',
+      data: { labels: jobs.map(x => x.hour), datasets: [
+        { label: 'done', data: jobs.map(x => x.done), backgroundColor: 'rgba(74,222,128,0.6)', borderRadius: 3 },
+        { label: 'failed', data: jobs.map(x => x.failed), backgroundColor: 'rgba(248,113,113,0.6)', borderRadius: 3 },
+      ]},
+      options: { responsive: true, maintainAspectRatio: false,
+        plugins: { title: { display: true, text: 'Jobs over last 24h', color: '#8b8fa3', font: { size: 11 } }, legend: { labels: { color: '#8b8fa3', boxWidth: 10 } } },
+        scales: { x: { ticks: { color: '#8b8fa3', font: { size: 9 }, maxRotation: 60 } }, y: { ticks: { color: '#8b8fa3', stepSize: 1 } } } }
+    });
+  }
+}
+
+function renderUtilization(a) {
+  const el = document.getElementById('utilization-panel');
+  if (!a) { el.innerHTML = '<p style="color:var(--text2);font-size:0.85rem;">Loading analytics...</p>'; return; }
+  const inj = a.injection || {};
+  const N = inj.total_requests || 0;
+  const tmR = N ? inj.task_memory_injections / N : 0;
+  const knR = N ? inj.knowledge_injections / N : 0;
+  const wmR = N ? inj.working_memory_injections / N : 0;
+  const cards = miniCards([
+    { label: 'Task Memory', value: pct(inj.task_memory_injections, N), sub: (inj.task_memory_injections || 0) + ' times / ' + (inj.task_memory_tokens || 0) + ' tok', cls: 'blue' },
+    { label: 'Shared Knowledge', value: pct(inj.knowledge_injections, N), sub: (inj.knowledge_injections || 0) + ' times / ' + (inj.knowledge_tokens || 0) + ' tok', cls: 'green' },
+    { label: 'Working Memory', value: pct(inj.working_memory_injections, N), sub: (inj.working_memory_injections || 0) + ' times / ' + (inj.working_memory_tokens || 0) + ' tok', cls: 'yellow' },
+  ]);
+  let html = cards +
+    '<div class="chart-sm" style="margin-bottom:14px"><canvas id="utilChart"></canvas></div>' +
+    '<div class="label" style="margin-bottom:6px">Last Injected Task Memory</div><div class="txtbox" id="last-tm"></div>' +
+    '<div class="label" style="margin:12px 0 6px">Last Injected Knowledge</div><div class="txtbox" id="last-kn"></div>';
+  el.innerHTML = html;
+  setChart('utilChart', {
+    type: 'bar',
+    data: { labels: ['Task Memory', 'Shared Knowledge', 'Working Memory'], datasets: [
+      { label: 'Injection rate %', data: [(tmR * 100).toFixed(1), (knR * 100).toFixed(1), (wmR * 100).toFixed(1)],
+        backgroundColor: ['rgba(96,165,250,0.7)', 'rgba(74,222,128,0.7)', 'rgba(251,191,36,0.7)'], borderRadius: 4 }
+    ]},
+    options: { responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: { x: { ticks: { color: '#8b8fa3' } }, y: { ticks: { color: '#8b8fa3' }, max: 100 } } }
+  });
+  document.getElementById('last-tm').textContent = inj.last_injected_task_memory || '(none yet)';
+  document.getElementById('last-kn').textContent = inj.last_injected_knowledge || '(none yet)';
+}
+
+function renderMemories(a) {
+  const el = document.getElementById('memories-panel');
+  if (!a) { el.innerHTML = '<p style="color:var(--text2);font-size:0.85rem;">Loading analytics...</p>'; return; }
+  const mem = a.memories || {};
+  const recent = mem.recent || [];
+  const sel = document.createElement('select');
+  sel.id = 'mem-session';
+  sel.innerHTML = '<option value="">All sessions</option>' + (a.sessions || []).map(s => '<option value="' + esc(s) + '">' + esc(s) + '</option>').join('');
+  el.innerHTML =
+    '<div class="mini-grid" style="margin-bottom:12px">' +
+      '<div class="mini-card blue"><div class="label">Total</div><div class="value">' + (mem.total || 0) + '</div></div>' +
+      '<div class="mini-card green"><div class="label">Active</div><div class="value">' + (mem.active || 0) + '</div></div>' +
+      '<div class="mini-card red"><div class="label">Superseded</div><div class="value">' + (mem.superseded || 0) + '</div></div>' +
+    '</div>' +
+    '<div class="label" style="margin-bottom:6px">Category distribution</div><div style="margin-bottom:14px" id="mem-cats">' + barRows(mem.by_category || {}) + '</div>' +
+    '<div class="label" style="margin-bottom:6px">Recent active memories</div>' +
+    '<div class="scrollbox" style="margin-bottom:12px"><table><thead><tr><th>Key</th><th>Category</th><th>Imp</th><th>Model</th><th>Updated</th></tr></thead><tbody id="mem-recent-body"></tbody></table></div>' +
+    sel.outerHTML +
+    '<div id="session-mem"></div>';
+  document.getElementById('mem-recent-body').innerHTML = recent.length
+    ? recent.map(r => '<tr><td>' + esc(r.key) + '</td><td>' + catBadge(r.category) + '</td><td>' + (r.importance || '-') + '</td><td>' + esc(r.model_name || '') + '</td><td>' + esc((r.updated_at || '').slice(5, 16)) + '</td></tr>').join('')
+    : '<tr><td colspan="5" style="color:var(--text2)">No active memories</td></tr>';
+  sel.onchange = () => loadSessionMemory(sel.value);
+}
+
+function renderKnowledge(a) {
+  const el = document.getElementById('knowledge-panel');
+  if (!a) { el.innerHTML = '<p style="color:var(--text2);font-size:0.85rem;">Loading analytics...</p>'; return; }
+  const k = a.knowledge || {};
+  const inj = a.injection || {};
+  const N = inj.total_requests || 0;
+  const rate = N ? (inj.knowledge_injections || 0) / N : 0;
+  const active = rate > 0;
+  const recent = k.recent || [];
+  el.innerHTML =
+    '<div class="verdict ' + (active ? 'active' : 'inactive') + '">' +
+      (active ? 'KNOWLEDGE SHARING ACTIVE' : 'NOT BEING UTILIZED') +
+      ' &mdash; injected in ' + pct(inj.knowledge_injections, N) + ' of ' + N + ' requests</div>' +
+    '<div class="mini-grid" style="margin-bottom:12px">' +
+      '<div class="mini-card blue"><div class="label">Total</div><div class="value">' + (k.total || 0) + '</div></div>' +
+      '<div class="mini-card green"><div class="label">Active</div><div class="value">' + (k.active || 0) + '</div></div>' +
+    '</div>' +
+    '<div class="label" style="margin-bottom:6px">Domain distribution</div><div style="margin-bottom:14px" id="kn-domains">' + barRows(k.by_domain || {}) + '</div>' +
+    '<div class="label" style="margin-bottom:6px">Recent items</div>' +
+    '<div class="scrollbox">' + (recent.length
+      ? recent.map(r => '<div class="memory-item"><div><strong>' + esc(r.key) + '</strong></div><div class="meta">' + esc(r.value || '') + ' &middot; imp ' + (r.importance || '-') + ' &middot; ' + esc(r.domain || '') + '</div></div>').join('')
+      : '<p style="color:var(--text2);font-size:0.85rem;">No knowledge items</p>') + '</div>';
+}
+
+async function loadSessionMemory(sid) {
+  const el = document.getElementById('session-mem');
+  if (!el) return;
+  if (!sid) { el.innerHTML = ''; return; }
+  el.innerHTML = '<p style="color:var(--text2);font-size:0.8rem;margin-top:10px">Loading ' + esc(sid) + '...</p>';
+  try {
+    const d = await fetchJSON('/api/memory?session=' + encodeURIComponent(sid));
+    const ms = d.memories || [];
+    let html = '<div class="label" style="margin:10px 0 6px">Memories for ' + esc(sid) + ' (' + (d.count || 0) + ')</div>';
+    if (ms.length) {
+      html += '<div class="scrollbox" style="max-height:180px"><table><thead><tr><th>Key</th><th>Category</th><th>Imp</th><th>Status</th></tr></thead><tbody>';
+      html += ms.map(r => '<tr><td>' + esc(r.key) + '</td><td>' + catBadge(r.category) + '</td><td>' + (r.importance || '-') + '</td><td>' + esc(r.status || (r.active ? 'active' : 'inactive')) + '</td></tr>').join('');
+      html += '</tbody></table></div>';
+    } else {
+      html += '<p style="color:var(--text2);font-size:0.8rem">No memories for this session</p>';
+    }
+    if (d.working_memory) {
+      html += '<div class="label" style="margin:10px 0 6px">Working Memory</div><div class="txtbox">' + esc(d.working_memory) + '</div>';
+    }
+    el.innerHTML = html;
+  } catch (e) {
+    el.innerHTML = '<p style="color:var(--red);font-size:0.8rem">Failed to load: ' + esc(e.message) + '</p>';
+  }
+}
+
 refresh();
 setInterval(refresh, 5000);
 </script>
@@ -1404,4 +1943,4 @@ setInterval(refresh, 5000);
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=PROXY_PORT, log_level="info")
+    uvicorn.run(app, host="127.0.0.1", port=PROXY_PORT, log_level="info", timeout_graceful_shutdown=30)
