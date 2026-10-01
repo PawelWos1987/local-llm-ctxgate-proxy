@@ -1008,6 +1008,8 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             choices = data.get("choices", [])
             for choice in choices:
                 msg = choice.get("message", {})
+                if "reasoning_content" in msg:
+                    del msg["reasoning_content"]
                 if msg.get("tool_calls"):
                     cleaned, stripped = sanitize_tool_calls(msg)
                     if stripped:
@@ -1133,13 +1135,23 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                                 out_chunk = {"id": chunk.get("id", "gen"), "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": chunk.get("model", VLLM_MODEL), "choices": [{"index": 0, "delta": {"content": flush_part}, "finish_reason": None}]}
                                                 yield "data: " + json.dumps(out_chunk) + "\n\n"
                                             else:
-                                                non_content = {k: v for k, v in delta.items() if k != "content"}
+                                                non_content = {k: v for k, v in delta.items() if k not in ("content", "reasoning_content")}
                                                 if non_content:
                                                     out_chunk = {"id": chunk.get("id", "gen"), "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": chunk.get("model", VLLM_MODEL), "choices": [{"index": 0, "delta": non_content, "finish_reason": None}]}
                                                     yield "data: " + json.dumps(out_chunk) + "\n\n"
                                 except (json.JSONDecodeError, ValueError):
                                     yield "data: " + data_str + "\n\n"
                     total_output_tokens += seg_output_tokens
+                    if seg_content and full_content:
+                        tail = full_content[-100:]
+                        overlap = 0
+                        for j in range(min(len(tail), len(seg_content)), 0, -1):
+                            if seg_content[:j] == tail[-j:]:
+                                overlap = j
+                                break
+                        if overlap > 10:
+                            log.info("Seam dedup: trimmed %d overlapping chars", overlap)
+                            seg_content = seg_content[overlap:]
                     full_content += seg_content
                     if finish_reason == "length" and continuation_count < MAX_CONTINUATIONS:
                         continuation_count += 1
@@ -1154,8 +1166,12 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                             buf = ""
                         orig_messages = current_body.get("messages", [])
                         cont_messages = list(orig_messages)
-                        cont_messages.append({"role": "assistant", "content": full_content})
-                        cont_messages.append({"role": "user", "content": "Continue from exactly where you left off. Do not repeat any content already provided. Resume the next word/sentence/code line."})
+                        if len(full_content) > 50:
+                            cont_messages.append({"role": "assistant", "content": full_content})
+                            cont_messages.append({"role": "user", "content": "Your response was cut off. Continue writing from where it stopped. Do not repeat content. Resume the next word, sentence, or code line."})
+                        else:
+                            cont_messages.append({"role": "assistant", "content": full_content or "(in progress)"})
+                            cont_messages.append({"role": "user", "content": "You were interrupted before producing your answer. Now produce your complete final answer directly. Skip thinking and just give the response."})
                         current_body = dict(current_body)
                         current_body["messages"] = cont_messages
                         continue
@@ -1242,7 +1258,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                             }
                                             yield "data: " + json.dumps(out_chunk) + "\n\n"
                                         else:
-                                            non_content = {k: v for k, v in delta.items() if k != "content"}
+                                            non_content = {k: v for k, v in delta.items() if k not in ("content", "reasoning_content")}
                                             if non_content:
                                                 out_chunk = {
                                                     "id": chunk.get("id", "gen"),
