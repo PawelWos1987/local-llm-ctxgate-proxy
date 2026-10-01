@@ -1014,6 +1014,12 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                         metrics["toolcall_strips"] += 1
                         choice["message"]["tool_calls"] = None
                         choice["finish_reason"] = "stop"
+                if choice.get("finish_reason") == "length" and msg.get("content"):
+                    safe_c = _safe_truncate(msg["content"])
+                    if len(safe_c) != len(msg["content"]):
+                        log.info("Non-stream: trimmed %d chars (max_tokens hit)", len(msg["content"]) - len(safe_c))
+                        msg["content"] = safe_c
+                    choice["finish_reason"] = "stop"
             output_tokens = data.get("usage", {}).get("completion_tokens", 0)
             metrics["tokens_out_total"] += output_tokens
             metrics["requests_ok"] += 1
@@ -1030,11 +1036,30 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
         _record_call(session_key, input_tokens, 0, "error", VLLM_MODEL, False, str(e)[:300])
         return JSONResponse({"error": {"message": str(e), "explanation": explain_status("error", str(e)[:300])}}, status_code=500)
 
+def _safe_truncate(text):
+    """Truncate at a safe boundary (newline, sentence end, or space)."""
+    if not text:
+        return text
+    nl = text.rfind(chr(10))
+    if nl > len(text) * 0.8:
+        return text[:nl]
+    for i in range(len(text) - 1, max(len(text) - 200, 0), -1):
+        if text[i] in ".!?)\"'":
+            return text[:i + 1]
+    sp = text.rfind(" ")
+    if sp > len(text) * 0.8:
+        return text[:sp]
+    return text
+
+
 async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
     global metrics
     async def generate():
         global metrics
         output_tokens = 0
+        BUFFER_SIZE = 300
+        buf = ""
+        finish_reason = "stop"
         try:
             async with httpx.AsyncClient(timeout=300) as client:
                 async with client.stream("POST", VLLM_URL + "/chat/completions", json=vllm_body) as resp:
@@ -1050,7 +1075,6 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                             data_str = line[6:]
                             if data_str == "[DONE]":
                                 break
-                            # Rewrite usage chunk so prompt_tokens is authoritative
                             try:
                                 chunk = json.loads(data_str)
                                 usage = chunk.get("usage")
@@ -1059,10 +1083,69 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                         output_tokens = usage["completion_tokens"]
                                     usage["prompt_tokens"] = input_tokens
                                     usage["total_tokens"] = input_tokens + (usage.get("completion_tokens") or 0)
-                                    data_str = json.dumps(chunk)
+                                choices = chunk.get("choices", [])
+                                if choices:
+                                    fr = choices[0].get("finish_reason")
+                                    if fr:
+                                        finish_reason = fr
+                                    delta = choices[0].get("delta", {})
+                                    content_piece = delta.get("content", "")
+                                    if content_piece:
+                                        buf += content_piece
+                                        if len(buf) > BUFFER_SIZE:
+                                            flush_part = buf[:-BUFFER_SIZE]
+                                            buf = buf[-BUFFER_SIZE:]
+                                            out_chunk = {
+                                                "id": chunk.get("id", "gen"),
+                                                "object": "chat.completion.chunk",
+                                                "created": chunk.get("created", 0),
+                                                "model": chunk.get("model", VLLM_MODEL),
+                                                "choices": [{"index": 0, "delta": {"content": flush_part}, "finish_reason": None}]
+                                            }
+                                            yield "data: " + json.dumps(out_chunk) + "\n\n"
+                                        else:
+                                            non_content = {k: v for k, v in delta.items() if k != "content"}
+                                            if non_content:
+                                                out_chunk = {
+                                                    "id": chunk.get("id", "gen"),
+                                                    "object": "chat.completion.chunk",
+                                                    "created": chunk.get("created", 0),
+                                                    "model": chunk.get("model", VLLM_MODEL),
+                                                    "choices": [{"index": 0, "delta": non_content, "finish_reason": None}]
+                                                }
+                                                yield "data: " + json.dumps(out_chunk) + "\n\n"
                             except (json.JSONDecodeError, ValueError):
-                                pass
-                            yield "data: " + data_str + "\n\n"
+                                yield "data: " + data_str + "\n\n"
+                    if finish_reason == "length":
+                        log.info("vLLM hit max_tokens(%d) - safe-truncating stream", MAX_OUTPUT)
+                        safe_buf = _safe_truncate(buf)
+                        if len(buf) != len(safe_buf):
+                            log.info("Trimmed %d chars from stream tail", len(buf) - len(safe_buf))
+                        buf = safe_buf
+                        finish_reason = "stop"
+                    if buf:
+                        out_chunk = {
+                            "id": "gen",
+                            "object": "chat.completion.chunk",
+                            "created": 0,
+                            "model": VLLM_MODEL,
+                            "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]
+                        }
+                        yield "data: " + json.dumps(out_chunk) + "\n\n"
+                    final_chunk = {
+                        "id": "gen",
+                        "object": "chat.completion.chunk",
+                        "created": 0,
+                        "model": VLLM_MODEL,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                    }
+                    if output_tokens:
+                        final_chunk["usage"] = {
+                            "prompt_tokens": input_tokens,
+                            "completion_tokens": output_tokens,
+                            "total_tokens": input_tokens + output_tokens
+                        }
+                    yield "data: " + json.dumps(final_chunk) + "\n\n"
                     yield "data: [DONE]\n\n"
                     metrics["requests_ok"] += 1
                     if output_tokens:
@@ -1079,7 +1162,6 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             _record_call(session_key, input_tokens, output_tokens, "error", VLLM_MODEL, True, str(e)[:300])
             yield "data: [DONE]\n\n"
     return StreamingResponse(generate(), media_type="text/event-stream")
-
 async def _enqueue_memory_job(session_id, user_content):
     if os.environ.get("CTXGATE_MEMORY_WORKER", "1") == "0":
         return
