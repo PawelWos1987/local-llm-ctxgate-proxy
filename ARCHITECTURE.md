@@ -49,6 +49,7 @@ The proxy **never blocks** on the 4B model. Memory extraction is fully async.
 ### 1.3 4B Memory Worker (Async Durable Memory)
 
 A separate Python process (systemd user service) polls proxy.memory_jobs and calls the 4B LM Studio model to extract structured memories from conversation events.
+**Single-instance by design**: the worker enforces a single running instance via a `flock` on `worker/.worker.lock` (kernel-released on process death), a heartbeat written each poll cycle (`pid=` + `heartbeat=` epoch), and a stale-kill/takeover check on startup (a holder whose heartbeat is older than `CTXGATE_WORKER_LOCK_TTL`, default 30 s, is SIGKILLed; a healthy holder causes the new instance to exit). The systemd unit (`ctxproxy-worker.service`) also sets `WatchdogSec=30` so systemd independently kills a worker that stops pinging. Only one unit runs the worker.
 
 **Model**: qwen3-4b-instruct-2507 (higher quantization, LM Studio :1234)
 
@@ -243,6 +244,8 @@ local-llm-ctxgate-proxy/
 | CTXGATE_API_KEY | (off) | Optional bearer auth on /v1/chat/completions |
 | CTXGATE_MAX_BODY_BYTES | 20971520 | Max request body size (20 MB) |
 | CTXGATE_WORKER_CONCURRENCY | 1 | Worker parallelism |
+| CTXGATE_WORKER_LOCK | worker/.worker.lock | Lock file path for single-instance guard |
+| CTXGATE_WORKER_LOCK_TTL | 30 | Staleness threshold for frozen-holder detection (seconds) |
 
 
 ---

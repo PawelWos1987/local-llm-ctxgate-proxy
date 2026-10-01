@@ -19,7 +19,9 @@ import json
 import logging
 import os
 import re
+import fcntl
 import signal
+import socket
 import time
 from typing import Any, Optional
 
@@ -47,6 +49,14 @@ EVENT_EXCERPT_CHARS = 2500
 WM_EXCERPT_CHARS = 1500
 # TTL: days before a non-critical, never-reused memory is pruned
 MEMORY_TTL_DAYS = int(os.environ.get("CTXGATE_MEMORY_TTL_DAYS", "90"))
+
+# --- Single-instance guard (flock + heartbeat + stale takeover) ---
+# Guarantees at most ONE worker polls memory_jobs. The kernel releases the
+# flock automatically when the process dies (handles "dead/inactive"); the
+# heartbeat + stale-kill handles a "frozen" (alive but not progressing) holder
+# so a replacement can take over. See acquire_single_instance_lock().
+LOCK_FILE = os.environ.get("CTXGATE_WORKER_LOCK", "/home/user/ctxproxy/worker/.worker.lock")
+LOCK_TTL = float(os.environ.get("CTXGATE_WORKER_LOCK_TTL", "30"))  # heartbeat staleness threshold (s)
 
 # --- Section 15: LM Studio SYSTEM PROMPT (configured once; sent as system role) ---
 SYSTEM_PROMPT = (
@@ -112,6 +122,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 
 pool: Optional[asyncpg.Pool] = None
 client: Optional[httpx.AsyncClient] = None
+lock_fd: Optional[int] = None
 running = True
 
 # Outage tracking
@@ -475,6 +486,7 @@ async def poll():
     """Main poll loop with pre-load before first completion in a batch."""
     last_prune = time.time()
     while running:
+        _heartbeat()
         try:
             # Slow prune cycle (~6h): never in the hot path
             now = time.time()
@@ -494,10 +506,104 @@ async def poll():
             await asyncio.sleep(5)
 
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _write_lock(pid: int, ts: float) -> None:
+    try:
+        with open(LOCK_FILE, "w") as f:
+            f.write("pid=%d\nheartbeat=%.3f\n" % (pid, ts))
+    except OSError as e:
+        log.warning("could not write lock file: %s", e)
+
+
+def _read_lock():
+    try:
+        with open(LOCK_FILE) as f:
+            data = f.read()
+        pid = int(re.search(r"pid=(\d+)", data).group(1))
+        hb = float(re.search(r"heartbeat=([0-9.]+)", data).group(1))
+        return pid, hb
+    except (OSError, AttributeError, ValueError):
+        return None, None
+
+
+def _sd_notify(msg: str) -> None:
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "/" + addr[1:]
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        s.connect(addr)
+        s.sendall(msg.encode())
+        s.close()
+    except OSError:
+        pass
+
+
+def _heartbeat() -> None:
+    if lock_fd is not None:
+        _write_lock(os.getpid(), time.time())
+        _sd_notify("WATCHDOG=1")
+
+
+def acquire_single_instance_lock() -> bool:
+    """Acquire the single-instance lock. Returns False if another healthy
+    worker holds it (caller should exit). Kills a frozen holder first."""
+    global lock_fd
+    pid = os.getpid()
+    prior_pid, prior_hb = _read_lock()
+    if prior_pid is not None and prior_pid != pid and _pid_alive(prior_pid):
+        age = time.time() - prior_hb
+        if age < LOCK_TTL:
+            log.warning("another healthy worker (pid %d, heartbeat %.0fs ago) holds the lock; exiting", prior_pid, age)
+            return False
+        log.warning("worker pid %d is FROZEN (heartbeat %.0fs stale > %.0fs); killing it", prior_pid, age, LOCK_TTL)
+        try:
+            os.kill(prior_pid, signal.SIGKILL)
+        except OSError as e:
+            log.warning("could not kill frozen worker %d: %s", prior_pid, e)
+        time.sleep(1)
+    fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        log.warning("flock is held by a live worker; exiting (single-instance guard)")
+        os.close(fd)
+        return False
+    _write_lock(pid, time.time())
+    lock_fd = fd
+    log.info("single-instance lock acquired (pid %d, lock %s)", pid, LOCK_FILE)
+    return True
+
+
+def release_single_instance_lock() -> None:
+    global lock_fd
+    if lock_fd is not None:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        except OSError:
+            pass
+        lock_fd = None
+
+
 async def main():
-    global pool, client
+    global pool, client, lock_fd
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)
+    if not acquire_single_instance_lock():
+        return
+    _sd_notify("READY=1")
     pool = await asyncpg.create_pool(DSN, min_size=1, max_size=3)
     client = httpx.AsyncClient()
     log.info("4B memory worker started (model=%s, poll=%.1fs, max_attempts=%d, outage_ttl=%.0fs, concurrency=%d)",
@@ -507,6 +613,7 @@ async def main():
     finally:
         await client.aclose()
         await pool.close()
+        release_single_instance_lock()
         log.info("4B memory worker stopped")
 
 

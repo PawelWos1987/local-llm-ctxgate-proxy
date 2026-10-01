@@ -24,3 +24,4 @@ We aim to acknowledge all valid reports within 72 hours.
 - **Data:** All data (conversation context, memories, events) stays in local PostgreSQL. No data leaves the machine.
 - **Model endpoints:** local-llm-ctxgate-proxy communicates with local inference servers (vLLM, LM Studio) over localhost. No API keys are stored or transmitted to external services.
 - **Dependencies:** See .github/dependabot.yml for automated dependency vulnerability scanning.
+- **Single-instance worker guard:** the memory worker uses a flock + heartbeat + stale-kill mechanism to prevent duplicate workers from double-processing the memory job queue (defense against accidental double-launch).

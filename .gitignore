@@ -43,6 +43,7 @@ proxy.log
 worker.log
 proxy.pid
 worker.pid
+.worker.lock
 
 # Internal working notes (contains local secrets)
 NOTES.md

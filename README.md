@@ -215,6 +215,7 @@ All settings via environment variables (see [**.env.example**](.env.example)):
 - 🔒 **`.env` gitignored** — secrets never committed
 - 🔒 **GitHub Ruleset** — CI + CodeQL enforced on all pushes
 - 🔒 **Single-user** — one developer, admin-only bypass
+- 🔒 **Single-instance worker** — the memory worker self-locks; a second start exits cleanly, and a frozen instance is auto-replaced
 
 <details>
 <summary><b>Ruleset: protect master</b></summary>
