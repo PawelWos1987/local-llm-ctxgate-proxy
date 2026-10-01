@@ -12,20 +12,28 @@ The system is built on three distinct layers, each responsible for a different t
 
 | Layer | Role | Timescale |
 |---|---|---|
-| **Goose compaction** | Short-term continuity — in-context summarization | Per-session, triggered at 65% of window |
+| **Goose compaction** | Short-term continuity — in-context summarization | Per-session, triggered at 90% of window (backstop) |
 | **ctxgate-proxy** | Context boundary + small conditional memory supplement | Per-request, deterministic |
 | **4B memory worker** | Async durable-memory extraction | Per-turn, background |
 
-### 1.1 Goose Compaction (Short-Term Continuity)
+### 1.1 Goose Compaction (Safety Gate — Last Resort)
 
-Goose's in-context summarization is **enabled** at GOOSE_AUTO_COMPACT_THRESHOLD = 0.65. On an 84,000-token window this triggers at 54,600 total tokens — a deliberate safety margin below ctxgate-proxy's 64k input trim cap.
+Goose's in-context summarization is a **safety gate**, not the primary context manager. It is enabled at `GOOSE_AUTO_COMPACT_THRESHOLD = 0.90`. On an 84,000-token window this triggers at **75,600 total tokens** — a hard ceiling that only fires if ctxgate-proxy's rolling-window trim is unable to keep the request within bounds.
 
-Why 0.65:
-- **Above 0.75**: input approaches the 64k trim line; ctxgate-proxy would start dropping middle messages (lossy) before Goose's cleaner summarization runs.
-- **Below 0.5**: Goose compacts too aggressively, summarizing context that still fits. Wasted summarization calls, added latency.
-- **0.65**: leaves a comfortable margin. Non-lossy in practice.
+**Division of labor:**
 
-Goose compaction is the **index** — it tells the agent which files and sessions to re-read. It keeps a single session oriented.
+| Mechanism | Trigger | Role |
+|---|---|---|
+| **ctxgate-proxy** (primary) | Every request — trims input to `MAX_INPUT = 64,000` | Deterministic context boundary, the workhorse |
+| **Goose auto-compact** (safety gate) | Context reaches `0.90 × 84,000 = 75,600` | Last-resort summarization if the proxy's rolling window is insufficient |
+
+Why the proxy is primary and Goose compact is the fallback:
+- **The agent sees the full 84k window** and grows context freely — it does not self-limit.
+- **The proxy trims what is forwarded to vLLM** on every request: 64k input + 18k output + 2k margin = 84k. Deterministic, lossy middle-message trimming at < 5 ms.
+- **Goose compact at 0.90** is a coarser, lossy summarization that only runs if the proxy cannot keep the window in check — a backstop, not the steady-state path.
+- **The 4B memory worker** supplies the durable facts that let the agent recover what the proxy trimmed, so the safety gate rarely needs to fire.
+
+Goose compaction is the **index** — when it does run, it tells the agent which files and sessions to re-read. It keeps a single session oriented.
 
 ### 1.2 ctxgate-proxy (Context Boundary + Conditional Memory)
 
