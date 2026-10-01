@@ -22,7 +22,7 @@ MAX_CONTEXT = int(os.environ.get("CTXGATE_MAX_CONTEXT", "84000"))
 MAX_INPUT = int(os.environ.get("CTXGATE_MAX_INPUT", "64000"))
 MAX_OUTPUT = int(os.environ.get("CTXGATE_MAX_OUTPUT", "18000"))
 SAFETY_MARGIN = int(os.environ.get("CTXGATE_SAFETY_MARGIN", "2000"))
-DB_DSN = os.environ.get("CTXGATE_DB_DSN") or os.environ.get("CTXPROXY_DB_DSN") or "postgresql://postgres:postgres@127.0.0.1:5432/ctxproxy"
+DB_DSN = os.environ.get("CTXGATE_DB_DSN") or os.environ.get("CTXPROXY_DB_DSN") or "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy"
 PROXY_PORT = int(os.environ.get("CTXGATE_PROXY_PORT", "9200"))
 API_KEY = os.environ.get("CTXGATE_API_KEY", "")
 MAX_BODY_BYTES = int(os.environ.get("CTXGATE_MAX_BODY_BYTES", str(20 * 1024 * 1024)))
@@ -937,25 +937,38 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
 async def _enqueue_memory_job(session_id, user_content):
     if os.environ.get("CTXGATE_MEMORY_WORKER", "1") == "0":
         return
-    if not user_content or len(user_content.strip()) < 30:
+    # --- Boilerplate filter: strip <turn-context> blocks ---
+    import re
+    cleaned = re.sub(r'<turn-context>.*?</turn-context>', '', user_content, flags=re.DOTALL).strip()
+    if not cleaned or len(cleaned) < 30:
         return
     try:
         task_uuid = await _resolve_task(session_id, create=True)
         if task_uuid is None:
             return
+        # --- Dedup: skip if last event has same content fingerprint ---
+        last_row = await pool.fetchrow(
+            'SELECT content FROM proxy.events WHERE task_id=$1 ORDER BY seq DESC, id DESC LIMIT 1',
+            task_uuid)
+        if last_row:
+            last_fp = hashlib.sha256(last_row['content'][:5000].encode()).hexdigest()[:16]
+            new_fp = hashlib.sha256(cleaned[:5000].encode()).hexdigest()[:16]
+            if last_fp == new_fp:
+                log.debug('Dedup: skipping duplicate enqueue for session %s', session_id)
+                return
+        # --- Seq fix: COALESCE(MAX(seq),-1)+1 ---
         seq_row = await pool.fetchrow(
-            'SELECT COALESCE(MAX(seq),0) AS ns FROM proxy.events WHERE task_id=$1', task_uuid)
-        ns = seq_row['ns'] if seq_row else 1
+            'SELECT COALESCE(MAX(seq),-1) + 1 AS ns FROM proxy.events WHERE task_id=$1', task_uuid)
+        ns = seq_row['ns'] if seq_row else 0
         ev_id = await pool.fetchval(
             'INSERT INTO proxy.events (task_id, seq, role, content) VALUES ($1,$2,$3,$4) RETURNING id',
-            task_uuid, ns, 'user', user_content[:5000])
+            task_uuid, ns, 'user', cleaned[:5000])
         await pool.execute(
             'INSERT INTO proxy.memory_jobs (task_id, event_id, status) VALUES ($1,$2,$3)',
             task_uuid, ev_id, 'pending')
         log.info('Enqueued memory job for session %s (seq %d)', session_id, ns)
     except Exception as e:
         log.warning('Memory job enqueue failed %s: %s', session_id, e)
-
 async def _resolve_task(task_ref: str, create: bool = False):
     row = await pool.fetchrow("SELECT id FROM proxy.tasks WHERE session_id = $1", task_ref)
     if row:

@@ -29,7 +29,7 @@ import httpx
 # --- Configuration ---
 LM_URL = os.environ.get("CTXGATE_LM_URL", "http://127.0.0.1:1234/v1/chat/completions")
 LM_MODEL = os.environ.get("CTXGATE_LM_MODEL", "qwen3-4b-instruct-2507")
-DSN = os.environ.get("CTXGATE_DB_DSN") or os.environ.get("CTXPROXY_DB_DSN") or "postgresql://postgres:postgres@127.0.0.1:5432/ctxproxy"
+DSN = os.environ.get("CTXGATE_DB_DSN") or os.environ.get("CTXPROXY_DB_DSN") or "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy"
 POLL = float(os.environ.get("CTXGATE_WORKER_POLL", "2.0"))
 CONCURRENCY = int(os.environ.get("CTXGATE_WORKER_CONCURRENCY", "1"))
 MAX_ATTEMPTS = int(os.environ.get("CTXGATE_WORKER_MAX_ATTEMPTS", "3"))
@@ -333,21 +333,19 @@ async def apply_memories(task_id: str, event_id: str, resp: dict) -> int:
 
 
 async def update_working_memory(task_id: str, su: dict):
-    if not su.get("changed"):
-        return
+    # Refresh WM for every substantive turn - not just when 'changed' is true.
+    # The 4B always returns current_state; we use it to keep WM fresh.
     state = su.get("current_state") or ""
     subtask = su.get("current_subtask") or ""
-    content = "STATE: " + state + (" | SUBTASK: " + subtask if subtask else "")
     if not state and not subtask:
         return
+    content = "STATE: " + state + (" | SUBTASK: " + subtask if subtask else "")
     await pool.execute(
         "INSERT INTO proxy.working_memory(task_id,content,updated_at) VALUES($1,$2,now()) "
         "ON CONFLICT(task_id) DO UPDATE SET content=$2,updated_at=now()",
         task_id, content[:2000],
     )
     log.info("WM updated: %s", content[:120])
-
-
 async def claim_job():
     """Claim exactly ONE pending job (parallelism=1) with row locking."""
     return await pool.fetchrow(
