@@ -1135,7 +1135,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                                 out_chunk = {"id": chunk.get("id", "gen"), "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": chunk.get("model", VLLM_MODEL), "choices": [{"index": 0, "delta": {"content": flush_part}, "finish_reason": None}]}
                                                 yield "data: " + json.dumps(out_chunk) + "\n\n"
                                             else:
-                                                non_content = {k: v for k, v in delta.items() if k != "content")
+                                                non_content = {k: v for k, v in delta.items() if k != "content"}
                                                 if non_content:
                                                     out_chunk = {"id": chunk.get("id", "gen"), "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": chunk.get("model", VLLM_MODEL), "choices": [{"index": 0, "delta": non_content, "finish_reason": None}]}
                                                     yield "data: " + json.dumps(out_chunk) + "\n\n"
@@ -1258,7 +1258,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                             }
                                             yield "data: " + json.dumps(out_chunk) + "\n\n"
                                         else:
-                                            non_content = {k: v for k, v in delta.items() if k != "content")
+                                            non_content = {k: v for k, v in delta.items() if k != "content"}
                                             if non_content:
                                                 out_chunk = {
                                                     "id": chunk.get("id", "gen"),
