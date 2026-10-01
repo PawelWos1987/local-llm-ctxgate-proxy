@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Logs
+*.log
+*.pid
+
+# Venv
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Secrets / local config
+.env
+*.local.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+test_output/
+.pytest_cache/
+
+# Internal planning docs (not for public)
+REVISED_PLAN.md
+SESSION_PROMPT.md
+PHASE0_*.txt
+BUILD_STATE.md
+DECISIONS.md
+KNOWN_GAPS.md
+SPEC_USER.md
+
+# Runtime artifacts
+proxy.log
+worker.log
+proxy.pid
+worker.pid
+
+# Internal working notes (contains local secrets)
+NOTES.md
+FINAL_REPORT.md
+CODE_REVIEW.md
