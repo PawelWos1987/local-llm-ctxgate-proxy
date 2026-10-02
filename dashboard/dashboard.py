@@ -531,6 +531,28 @@ async def put_config(request: Request):
     _maybe_reload_config()
     return JSONResponse({"ok": True, "path": CONFIG_PATH})
 
+@app.get("/api/log")
+async def get_log(request: Request):
+    p = request.query_params
+    n = int(p.get("lines", "400"))
+    n = max(1, min(n, 3000))
+    source = p.get("source", "dashboard")
+    if source == "journal":
+        try:
+            res = await _run(["journalctl", "--user", "-u", "ctxproxy-dashboard.service", "-n", str(n), "--no-pager"])
+            text = res[1] if isinstance(res, (list, tuple)) else str(res)
+        except Exception as e:
+            return JSONResponse({"ok": False, "source": source, "error": str(e)}, status_code=400)
+    else:
+        path = os.environ.get("CTXGATE_LOG", "/home/user/ctxproxy/dashboard.log")
+        try:
+            with open(path) as f:
+                lines = f.readlines()
+            text = "".join(lines[-n:])
+        except Exception as e:
+            return JSONResponse({"ok": False, "source": source, "error": "read failed: " + str(e)}, status_code=400)
+    return JSONResponse({"ok": True, "source": source, "text": text})
+
 # --- Dashboard HTML (Control Room Pulpit) ---
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -615,11 +637,26 @@ body{font-family:'Consolas','Courier New',monospace;background:var(--bg);color:v
 .sb-btn{background:var(--panel);border:1px solid var(--border);color:var(--text);font-family:inherit;padding:6px 18px;cursor:pointer;font-size:.85em;letter-spacing:1px;margin-left:8px}
 .sb-btn:hover{border-color:var(--blue)}
 .sb-btn.save{border-color:var(--green);color:var(--green)}
+#logBtn{background:var(--panel);border:1px solid var(--border);color:var(--green);font-family:inherit;padding:5px 14px;cursor:pointer;font-size:.85em;letter-spacing:2px;flex-shrink:0;margin-left:8px}
+#logBtn:hover{border-color:var(--green);color:#fff}
+#logModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:110;justify-content:center;align-items:center}
+#logModal.open{display:flex}
+#logBox{width:960px;max-width:95vw;max-height:92vh;background:var(--bg);border:2px solid var(--border);display:flex;flex-direction:column}
+.lg-head{display:flex;justify-content:space-between;align-items:center;padding:10px 16px;border-bottom:1px solid var(--border);background:var(--panel)}
+.lg-head h2{font-size:.95em;color:var(--green);letter-spacing:3px}
+.lg-head .close{cursor:pointer;color:var(--red);font-size:1.2em}
+.lg-ctrl{display:flex;gap:16px;align-items:center;padding:7px 16px;border-bottom:1px solid var(--border);font-size:.78em;color:var(--dim)}
+.lg-ctrl label{cursor:pointer;user-select:none;display:flex;gap:5px;align-items:center}
+.lg-ctrl input[type=checkbox]{accent-color:var(--green)}
+.lg-ctrl select{background:var(--panel);color:var(--text);border:1px solid var(--border);font-family:inherit;font-size:.9em;padding:2px 6px}
+#lgStat{margin-left:auto;color:var(--dim)}
+#logText{flex:1;overflow:auto;background:#05080d;color:var(--text);padding:12px 16px;font-family:'Consolas','Courier New',monospace;font-size:.8em;line-height:1.4;white-space:pre-wrap;word-break:break-word;margin:0}
 </style>
 </head>
 <body>
 <div class="header">
     <button id="settingsBtn" onclick="openSettings()">&#9881; SETTINGS</button>
+    <button id="logBtn" onclick="openLog()">&#128203; LOGS</button>
 <h1>&#9889; CTXGATE CONTROL ROOM</h1>
 <div class="clock" id="clock">--:--:--</div>
 </div>
@@ -736,6 +773,22 @@ body{font-family:'Consolas','Courier New',monospace;background:var(--bg);color:v
     </div>
   </div>
 </div>
+<div id="logModal">
+  <div id="logBox">
+    <div class="lg-head"><h2>&#128203; LOG EXPLORER</h2><span class="close" onclick="closeLog()">&#10005;</span></div>
+    <div class="lg-ctrl">
+      <label><input type="checkbox" id="lgAuto" checked> AUTOSCROLL</label>
+      <label>SOURCE
+        <select id="lgSrc" onchange="loadLog()">
+          <option value="dashboard">dashboard.log</option>
+          <option value="journal">journalctl (systemd)</option>
+        </select>
+      </label>
+      <span id="lgStat"></span>
+    </div>
+    <pre id="logText"></pre>
+  </div>
+</div>
 <script>
 function $(id){return document.getElementById(id)}
 function setBox(id,st){var b=$('box-'+id);if(!b)return;b.className=b.className.replace(/\b(up|down|degraded)\b/g,'').trim();if(st==='up')b.classList.add('up');else if(st==='degraded')b.classList.add('degraded');else b.classList.add('down');}
@@ -829,6 +882,36 @@ function saveSettings(){
     }).catch(e=>{ msg.textContent = 'Save failed: ' + e; msg.style.color = 'var(--red)'; });
 }
 document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeSettings(); });
+let lgTimer = null;
+function openLog(){
+  document.getElementById('logModal').classList.add('open');
+  loadLog();
+  if(lgTimer) clearInterval(lgTimer);
+  lgTimer = setInterval(function(){ if(document.getElementById('logModal').classList.contains('open')) loadLog(); }, 2000);
+}
+function closeLog(){
+  document.getElementById('logModal').classList.remove('open');
+  if(lgTimer){ clearInterval(lgTimer); lgTimer = null; }
+}
+function loadLog(){
+  var src = document.getElementById('lgSrc').value;
+  fetch('/api/log?source=' + src + '&lines=500').then(function(r){return r.json();}).then(function(d){
+    var el = document.getElementById('logText');
+    var stat = document.getElementById('lgStat');
+    if(d.ok){
+      var atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 60;
+      var changed = (el._last !== d.text);
+      el.textContent = d.text;
+      el._last = d.text;
+      if(document.getElementById('lgAuto').checked && (atBottom || changed)){
+        el.scrollTop = el.scrollHeight;
+      }
+      stat.textContent = 'updated ' + new Date().toLocaleTimeString();
+    } else {
+      stat.textContent = 'error: ' + (d.error||'unknown');
+    }
+  }).catch(function(e){ document.getElementById('lgStat').textContent = 'fetch failed: ' + e; });
+}
 </script>
 </body>
 </html>"""
