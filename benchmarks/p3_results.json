@@ -1,0 +1,28 @@
+{
+  "benchmark": "P3_weighted_cache_hit_rate_FINAL",
+  "timestamp": "2026-10-02 22:30",
+  "target": 0.90,
+  "met_target": false,
+  "measured": {
+    "proxy_real_traffic_weighted_rate": 0.605,
+    "vllm_global_weighted_rate": 0.835,
+    "vllm_global": {"queries_tokens": 26953032, "hits_tokens": 22282624},
+    "benchmark_20turn_session": {"overall": 0.5365, "warm_t2_t20": 0.5454, "cached_prefix_cap_observed": 1664},
+    "benchmark_8turn_session": {"overall": 0.4131, "cached_prefix_progression": [0, 832, 832, 832, 832, 1664, 1664, 1664]},
+    "benchmark_200req_short_prompts": {"overall": 0.0, "note": "500-tok prompts too small for block-based prefix cache; direct vLLM identical"}
+  },
+  "root_cause": "NOT a proxy bug. Direct vLLM (bypassing proxy) shows identical 0->34%->64% pattern. vLLM 0.30 hybrid Mamba/attention model (kv-cache 1.97GB fp8, max-num-seqs 1, max-num-batched-tokens 4992, mamba-cache-mode align) caps reusable prefix at ~1664 tokens (104 x 16-token blocks) for ~2.5k-token prompts. Per-response hit rate plateaus ~60-65% and declines as prompt grows beyond the cap.",
+  "evidence": [
+    "3x identical 1061-tok direct vLLM: 0% every time; vllm:prefix_cache_queries +1061/req, hits +0",
+    "8-turn growing session: 0% -> 34% (832) -> 65% (1664); cache engages then caps",
+    "20-turn growing session: 35% -> 65% -> 58% (cap holds at 1664 while prompt grows to 2882)",
+    "vLLM global counters 83.5% on real Goose traffic (50k+ tok prompts)",
+    "proxy log: no prefix invalidations; seed freeze working; memory injection only at last-user position"
+  ],
+  "recommendations_to_reach_90pct": [
+    "Increase --kv-cache-memory-bytes in vllm-serve.fish (currently 1970000K ~1.97GB)",
+    "Review mamba checkpoint alignment granularity (1664-tok cap = 104 blocks)",
+    "Real Goose sessions (50k+ tok, ~100-500 new tok/turn) already 83.5% at vLLM; asymptote to 95%+ with bigger KV",
+    "Proxy side correct: frozen seed + byte-identical prefix forwarding verified. No proxy code change needed."
+  ]
+}
