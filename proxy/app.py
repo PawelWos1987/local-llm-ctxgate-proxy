@@ -51,7 +51,11 @@ async def _call_4b(messages, max_tokens=2000, json_mode=True):
                 log.warning("4B model error %d: %s", resp.status_code, resp.text[:200])
                 return {}
             data = resp.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            msg = data.get("choices", [{}])[0].get("message", {})
+            content = msg.get("content", "")
+            if not content:
+                # 4B model often puts output in reasoning_content when content is empty
+                content = msg.get("reasoning_content", "")
             if not content:
                 return {}
             if not json_mode:
