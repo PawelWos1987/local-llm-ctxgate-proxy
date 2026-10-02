@@ -49,7 +49,9 @@ def _watchdog_loop():
 # --- Configuration (config.yaml = single source of truth) ---
 # config.yaml can be edited from the GUI (SETTINGS button) or externally.
 # The dashboard hot-reloads it on mtime change - no restart needed.
-CONFIG_PATH = os.environ.get("CTXGATE_CONFIG", "/home/user/ctxproxy/config.yaml")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+CONFIG_PATH = os.environ.get("CTXGATE_CONFIG", os.path.join(_ROOT, "config.yaml"))
 
 def load_config() -> dict:
     # Load config.yaml; return {} on error so defaults below apply.
@@ -71,8 +73,8 @@ DEFAULT_SERVICES = {
     "postgresql": {"type": "tcp", "host": "127.0.0.1", "port": 5432},
     "vllm": {"type": "http", "url": "http://127.0.0.1:29000/v1/models"},
     "lm_studio": {"type": "http", "url": "http://127.0.0.1:1234/v1/models"},
-    "ctxgate_proxy": {"type": "http", "url": "http://127.0.0.1:9200/health"},
-    "worker": {"type": "file", "path": "/home/user/ctxproxy/worker/.worker.lock"},
+    "ctxgate_proxy": {"type": "http", "url": "http://127.0.0.1:9201/health"},
+    "worker": {"type": "file", "path": os.path.join(_ROOT, "worker", ".worker.lock")},
 }
 
 def build_services(cfg):
@@ -86,13 +88,13 @@ def build_services(cfg):
 DEFAULT_SVC_MAP = {
     "ctxgate_proxy": {
         "unit": "ctxproxy-proxy.service",
-        "port": 9200,
-        "health_url": "http://127.0.0.1:9200/health",
+        "port": 9201,
+        "health_url": "http://127.0.0.1:9201/health",
         "kind": "http",
     },
     "worker": {
         "unit": "ctxproxy-worker.service",
-        "lock_path": "/home/user/ctxproxy/worker/.worker.lock",
+        "lock_path": os.path.join(_ROOT, "worker", ".worker.lock"),
         "kind": "file",
     },
 }
@@ -112,10 +114,39 @@ _cfg = load_config()
 PORT = int(_get(_cfg, "dashboard", "port", default=9201) or 9201)
 POLL_INTERVAL = float(_get(_cfg, "dashboard", "poll_interval", default=3.0) or 3.0)
 SERVICES = build_services(_cfg)
-DB_DSN = _get(_cfg, "db", "dsn", default=None) or os.environ.get("CTXGATE_DB_DSN", "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy")
+DB_DSN = _get(_cfg, "db", "dsn", default=None) or os.environ.get("CTXGATE_DB_DSN")
 SVC_MAP = build_svc_map(_cfg)
 
-app = FastAPI(title="ctxgate-dashboard")
+from contextlib import asynccontextmanager
+_pg_pool = None
+HOST = os.environ.get("CTXGATE_DASHBOARD_HOST", "127.0.0.1")
+DASH_TOKEN = os.environ.get("CTXGATE_DASHBOARD_TOKEN", "")
+
+def _auth_ok(request) -> bool:
+    if not DASH_TOKEN:
+        return True
+    return request.headers.get("Authorization", "") == "Bearer " + DASH_TOKEN
+
+@asynccontextmanager
+async def _lifespan(_app):
+    _sd_notify("READY=1")
+    threading.Thread(target=_watchdog_loop, daemon=True).start()
+    try:
+        import asyncpg
+        if DB_DSN:
+            global _pg_pool
+            _pg_pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=3, command_timeout=5, max_inactive_connection_lifetime=300)
+    except Exception as e:
+        print("PG pool init failed:", e, flush=True)
+    asyncio.create_task(poll_health())
+    yield
+    if _pg_pool is not None:
+        try:
+            await _pg_pool.close()
+        except Exception:
+            pass
+
+app = FastAPI(title="ctxgate-dashboard", lifespan=_lifespan)
 
 # Health state (updated by background poller)
 health_state: dict = {
@@ -150,7 +181,7 @@ def _maybe_reload_config():
     _config_mtime = m
     globals()["SERVICES"] = build_services(new_cfg)
     globals()["SVC_MAP"] = build_svc_map(new_cfg)
-    globals()["DB_DSN"] = _get(new_cfg, "db", "dsn", default=None) or os.environ.get("CTXGATE_DB_DSN", "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy")
+    globals()["DB_DSN"] = _get(new_cfg, "db", "dsn", default=None) or os.environ.get("CTXGATE_DB_DSN")
     globals()["POLL_INTERVAL"] = float(_get(new_cfg, "dashboard", "poll_interval", default=POLL_INTERVAL) or POLL_INTERVAL)
     print("config.yaml reloaded:", CONFIG_PATH, flush=True)
 
@@ -229,7 +260,7 @@ async def get_db_metrics() -> dict:
 async def _run(cmd: list, timeout: float = 60.0):
     try:
         proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, start_new_session=True
         )
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         rc = proc.returncode if proc.returncode is not None else 0
@@ -462,11 +493,7 @@ async def poll_health():
         await asyncio.sleep(POLL_INTERVAL)
 
 # --- Startup ---
-@app.on_event("startup")
-async def startup():
-    _sd_notify("READY=1")
-    threading.Thread(target=_watchdog_loop, daemon=True).start()
-    asyncio.create_task(poll_health())
+# startup/shutdown handled by _lifespan
 
 # --- Routes ---
 @app.get("/health")
@@ -478,7 +505,9 @@ async def api_health():
     return JSONResponse(health_state)
 
 @app.post("/api/control/{name}/{action}")
-async def control(name: str, action: str):
+async def control(name: str, action: str, request: Request):
+    if not _auth_ok(request):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     if name not in SVC_MAP:
         return JSONResponse({"ok": False, "error": "unknown service: " + name}, status_code=400)
     if action == "start":
@@ -504,6 +533,8 @@ async def get_config():
 
 @app.post("/api/config")
 async def put_config(request: Request):
+    if not _auth_ok(request):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     data = await request.json()
     text = data.get("text")
     if not isinstance(text, str) or not text.strip():
@@ -544,7 +575,7 @@ async def get_log(request: Request):
         except Exception as e:
             return JSONResponse({"ok": False, "source": source, "error": str(e)}, status_code=400)
     else:
-        path = os.environ.get("CTXGATE_LOG", "/home/user/ctxproxy/dashboard.log")
+        path = os.environ.get("CTXGATE_LOG", os.path.join(_ROOT, "dashboard.log"))
         try:
             with open(path) as f:
                 lines = f.readlines()
@@ -698,14 +729,14 @@ body{font-family:'Consolas','Courier New',monospace;background:var(--bg);color:v
 <div class="box box-proxy" id="box-proxy">
 <div class="title"><span class="led"></span>CTXGATE PROXY</div>
 <div class="metrics">
-<div class="metric-row"><span>Port</span><span class="val">:9200</span></div>
+<div class="metric-row"><span>Port</span><span class="val">:9201</span></div>
 <div class="metric-row"><span>Status</span><span class="val" id="px-status">--</span></div>
 <div class="metric-row"><span>Latency</span><span class="val big" id="px-lat">--</span></div>
 </div>
 <div class="controls">
-<button class="s" onclick="ctrl('ctxgate_proxy','start')">START</button>
-<button class="p" onclick="ctrl('ctxgate_proxy','stop')">STOP</button>
-<button class="r" onclick="ctrl('ctxgate_proxy','restart')">RESTART</button>
+<button class="s" onclick="ctrl(event,'ctxgate_proxy','start')">START</button>
+<button class="p" onclick="ctrl(event,'ctxgate_proxy','stop')">STOP</button>
+<button class="r" onclick="ctrl(event,'ctxgate_proxy','restart')">RESTART</button>
 </div>
 </div>
 
@@ -738,9 +769,9 @@ body{font-family:'Consolas','Courier New',monospace;background:var(--bg);color:v
 <div class="metric-row"><span>Heartbeat</span><span class="val big" id="wk-hb">--</span></div>
 </div>
 <div class="controls">
-<button class="s" onclick="ctrl('worker','start')">START</button>
-<button class="p" onclick="ctrl('worker','stop')">STOP</button>
-<button class="r" onclick="ctrl('worker','restart')">RESTART</button>
+<button class="s" onclick="ctrl(event,'worker','start')">START</button>
+<button class="p" onclick="ctrl(event,'worker','stop')">STOP</button>
+<button class="r" onclick="ctrl(event,'worker','restart')">RESTART</button>
 </div>
 </div>
 
@@ -765,7 +796,7 @@ body{font-family:'Consolas','Courier New',monospace;background:var(--bg);color:v
 <div id="settingsModal">
   <div id="settingsBox">
     <div class="sb-head"><h2>&#9881; SETTINGS — config.yaml</h2><span class="close" onclick="closeSettings()">&#10005;</span></div>
-    <div class="sb-hint">All runtime parameters (ports, URLs, DSN, poll interval, watchdog, service units). Edit the YAML and press SAVE. File: /home/user/ctxproxy/config.yaml — also editable externally; changes are hot-reloaded, no restart needed.</div>
+    <div class="sb-hint">All runtime parameters (ports, URLs, DSN, poll interval, watchdog, service units). Edit the YAML and press SAVE. File: config.yaml (project root) — also editable externally; changes are hot-reloaded, no restart needed.</div>
     <textarea id="settingsText" spellcheck="false"></textarea>
     <div class="sb-foot">
       <span class="msg" id="settingsMsg"></span>
@@ -847,8 +878,8 @@ el.classList.remove('fiber-out','fiber-in');
 el.classList.add('fiber-dim');
 }
 }
-async function ctrl(n,a){
-var b=event.target;b.disabled=true;
+async function ctrl(ev,n,a){
+var b=ev.target;b.disabled=true;
 try{var r=await fetch('/api/control/'+n+'/'+a,{method:'POST'});var d=await r.json();if(!d.ok)alert('Err: '+(d.error||'?'))}
 catch(e){alert('Ctrl: '+e.message)}
 b.disabled=false;
@@ -919,4 +950,4 @@ function loadLog(){
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(app, host=HOST, port=PORT)

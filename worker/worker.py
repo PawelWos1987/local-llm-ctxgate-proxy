@@ -26,6 +26,7 @@ import time
 from typing import Any, Optional
 
 import asyncpg
+import threading
 import httpx
 
 # --- Configuration ---
@@ -68,10 +69,11 @@ MEMORY_TTL_DAYS = int(os.environ.get("CTXGATE_MEMORY_TTL_DAYS", "90"))
 # flock automatically when the process dies (handles "dead/inactive"); the
 # heartbeat + stale-kill handles a "frozen" (alive but not progressing) holder
 # so a replacement can take over. See acquire_single_instance_lock().
-LOCK_FILE = os.environ.get("CTXGATE_WORKER_LOCK", "/home/user/ctxproxy/worker/.worker.lock")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+LOCK_FILE = os.environ.get("CTXGATE_WORKER_LOCK", os.path.join(_HERE, ".worker.lock"))
 LOCK_TTL = float(os.environ.get("CTXGATE_WORKER_LOCK_TTL", "30"))  # heartbeat staleness threshold (s)
 # --- Worker status file (lag + heartbeat) read by proxy + dashboard ---
-STATUS_FILE = os.environ.get("CTXGATE_WORKER_STATUS", "/home/user/ctxproxy/worker/.worker_status.json")
+STATUS_FILE = os.environ.get("CTXGATE_WORKER_STATUS", os.path.join(_HERE, ".worker_status.json"))
 
 # --- Section 15: LM Studio SYSTEM PROMPT (configured once; sent as system role) ---
 SYSTEM_PROMPT = (
@@ -143,7 +145,8 @@ running = True
 
 # Outage tracking
 outage_since: Optional[float] = None  # timestamp when outage started
-model_loaded: bool = False  # whether we've confirmed the model is loaded this session
+model_loaded: bool = False
+_last_status_write = 0.0  # whether we've confirmed the model is loaded this session
 # Lag / completion tracking (source of the worker_lag_seconds metric)
 last_completion: Optional[float] = None  # time.time() of the last successful job
 jobs_done_total: int = 0
@@ -261,7 +264,8 @@ async def ensure_model_loaded() -> bool:
         model_loaded = True  # give it a chance; the completion call will auto-load
         return True
     except Exception as e:
-        log.warning("ensure_model_loaded: LM Studio unreachable: %s", e)
+        model_loaded = False
+        log.warning("ensure_model_loaded: LM Studio unreachable: %s (reset model_loaded for retry)", e)
         return False
 
 
@@ -526,7 +530,7 @@ async def process_job(job) -> None:
         log.info("JOB done %s (applied=%d)", jid, applied)
         last_completion = time.time()
         jobs_done_total += 1
-        _write_status()
+        _write_status(force=True)
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.PoolTimeout) as e:
         # LM Studio unreachable/outage - use TTL-based backoff
         now = time.time()
@@ -624,7 +628,12 @@ def _write_lock(pid: int, ts: float) -> None:
         log.warning("could not write lock file: %s", e)
 
 
-def _write_status() -> None:
+def _write_status(force: bool = False) -> None:
+    global _last_status_write
+    _now = time.time()
+    if not force and (_now - _last_status_write) < 5.0:
+        return
+    _last_status_write = _now
     """Write a machine-readable status file (lag + heartbeat) for proxy + dashboard."""
     now = time.time()
     lag = (now - last_completion) if last_completion else 0.0
@@ -721,8 +730,9 @@ def release_single_instance_lock() -> None:
 
 async def main():
     global pool, client, lock_fd
-    signal.signal(signal.SIGTERM, _sig)
-    signal.signal(signal.SIGINT, _sig)
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _sig)
+        signal.signal(signal.SIGINT, _sig)
     if not acquire_single_instance_lock():
         return
     _sd_notify("READY=1")
