@@ -9,17 +9,17 @@ Hard-restart = stop -> SIGKILL leftovers -> free the port (kill whatever
 holds it) -> reset-failed -> fresh start -> verify health. Zero terminal.
 """
 import asyncio
-import json
+import logging
+import logging.handlers
 import os
 import re
 import signal
-import time
-import logging
-import logging.handlers
 import threading
-import yaml
+import time
 from contextlib import asynccontextmanager
 from typing import Optional
+
+import yaml
 
 # --- Logging with rotation (10MB x 5 backups) ---
 _LOG_PATH = os.environ.get("CTXGATE_LOG", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "dashboard.log"))
@@ -29,10 +29,12 @@ _log = logging.getLogger("dashboard")
 _log.setLevel(logging.INFO)
 _log.addHandler(_log_handler)
 
+import socket
+
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-import socket
+
 
 def _sd_notify(msg: str) -> None:
     """Send sd_notify message to systemd (watchdog keepalive)."""

@@ -1,26 +1,25 @@
 """local-llm-ctxgate-proxy: Context gate proxy for Goose -> vLLM with PG memory."""
-import hashlib
-import re
-import math
-import datetime
-import os
-import sys
-import json
-from collections import deque
-import logging
-import time
 import asyncio
-import uuid
-from typing import Any, Optional
+import datetime
+import hashlib
+import json
+import logging
+import math
+import os
+import re
+import sys
+import time
+from collections import deque
 from contextlib import asynccontextmanager
+from typing import Any, Optional
 
-import asyncpg
 import aiosqlite
+import asyncpg
 import httpx
 import tiktoken
 import tokenizers
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("ctxgate-proxy")
@@ -208,7 +207,7 @@ async def _update_working_memory(task_uuid, state_update):
 
 async def _process_memory_job(job_id, task_uuid, event_id):
     """1-Step Memory Extract: 4B model extracts facts from event, we store them.
-    
+
     The 4B model (qwen3-4b-instruct-2507) is too small for a 4-step orchestrator.
     A single extract-and-store pass is the right complexity level.
     """
@@ -219,16 +218,16 @@ async def _process_memory_job(job_id, task_uuid, event_id):
         if not event:
             await pool.execute("UPDATE proxy.memory_jobs SET status='done', completed_at=now() WHERE id=$1", job_id)
             return
-        
+
         event_text = event["content"][:3000]
-        
+
         # Single 4B call: no system message — LM Studio's configured
         # system prompt + structured output schema handle the format.
         extraction = await _call_4b(
             [{"role": "user", "content": event_text}],
             max_tokens=2000, json_mode=True
         )
-        
+
         if not extraction:
             await pool.execute(
                 "UPDATE proxy.memory_jobs SET status='done', completed_at=now(), attempts=1, result=$2 WHERE id=$1",
@@ -236,10 +235,10 @@ async def _process_memory_job(job_id, task_uuid, event_id):
             )
             log.info("Memory job %s: no extraction from 4B", job_id)
             return
-        
+
         actions = extraction.get("memory_actions", [])
         state_update = extraction.get("state_update", {})
-        
+
         # Update working memory if state changed
         if state_update.get("changed", False):
             new_state = state_update.get("current_state", "unknown")
@@ -252,14 +251,14 @@ async def _process_memory_job(job_id, task_uuid, event_id):
                 "ON CONFLICT (task_id) DO UPDATE SET content=$2, updated_at=now()",
                 task_uuid, wm_content
             )
-        
+
         # Store extracted memories
         if actions:
             await _store_memory_actions(task_uuid, actions, event_id)
             log.info("Memory job %s: stored %d memories", job_id, len(actions))
         else:
             log.info("Memory job %s: no memory actions extracted", job_id)
-        
+
         await pool.execute(
             "UPDATE proxy.memory_jobs SET status='done', completed_at=now(), attempts=1, result=$2 WHERE id=$1",
             job_id, json.dumps(extraction)
@@ -326,7 +325,7 @@ async def _summarize_trimmed_messages(task_uuid, session_key, trimmed_messages, 
         existing = await pool.fetchrow("SELECT summary FROM proxy.session_summaries WHERE task_id=$1 ORDER BY created_at DESC LIMIT 1", task_uuid)
         prior_summary = existing["summary"] if existing else "No prior summary."
         # === 4-Step Orchestrator for Session Summarization ===
-        
+
         # === Single-call summarization (LM Studio system prompt + schema) ===
         # Do NOT send a system message — LM Studio's configured system prompt
         # ("durable-memory worker") + structured output schema handle the format.
@@ -339,7 +338,7 @@ async def _summarize_trimmed_messages(task_uuid, session_key, trimmed_messages, 
         result = await _call_4b([
             {"role": "user", "content": user_msg}
         ], max_tokens=1500, json_mode=True)
-        
+
         # Extract summary from the model's native schema
         summary_text = ""
         if isinstance(result, dict):
@@ -364,11 +363,11 @@ async def _summarize_trimmed_messages(task_uuid, session_key, trimmed_messages, 
                             summary_text = su["current_state"].strip()
                 except Exception:
                     pass
-        
+
         if not summary_text:
             log.warning("Trim summarization: no usable text from 4B model")
             return
-        
+
         # === Deterministic quality check (no LLM call) ===
         # Rules: must be >50 chars, must contain at least one file name or code reference,
         # must not be identical to prior summary
@@ -383,13 +382,13 @@ async def _summarize_trimmed_messages(task_uuid, session_key, trimmed_messages, 
         elif not any(c.isalpha() for c in summary_text):
             quality_ok = False
             quality_reason = "no alphabetic content"
-        
+
         log.info("Trim summary quality (deterministic): %s (%s)", "PASS" if quality_ok else "FAIL", quality_reason[:60])
-        
+
         if not quality_ok:
             log.info("Trim summary discarded (deterministic quality): %s", quality_reason)
             return
-        
+
         # === Deterministic store decision (no LLM call) ===
         # Store if: summary is meaningfully different from prior (token overlap < 80%)
         store = True
@@ -404,10 +403,10 @@ async def _summarize_trimmed_messages(task_uuid, session_key, trimmed_messages, 
                 if overlap > 0.85:
                     store = False
                     log.info("Trim summary discarded (85%%+ overlap with prior: %.0f%%)", overlap * 100)
-        
+
         if not store:
             return
-        
+
         await pool.execute("INSERT INTO proxy.session_summaries (task_id, session_key, summary, trimmed_msg_count, trimmed_tokens) VALUES ($1,$2,$3,$4,$5)", task_uuid, session_key, summary_text[:3000], len(trimmed_messages), trimmed_tokens)
         log.info("Trim summary stored: %d msgs, %d tokens, summary=%d chars", len(trimmed_messages), trimmed_tokens, len(summary_text))
     except Exception as e:
@@ -416,7 +415,7 @@ async def _summarize_trimmed_messages(task_uuid, session_key, trimmed_messages, 
 
 async def _fetch_session_summary(task_uuid, budget=800, session_key: str = ""):
     """Fetch the most recent session summary for a task.
-    
+
     Falls back to matching by session_key prefix (x_sid) if task_uuid has no summary,
     ensuring summaries are found even when task resolution changes.
     """
@@ -647,7 +646,6 @@ async def lifespan(app: FastAPI):
     global pool, enc
     validate_config()
     # Retry DB connection (service starts independently, waits for PG)
-    import time as _time
     for _attempt in range(60):
         try:
             pool = await asyncpg.create_pool(DB_DSN, min_size=2, max_size=10)
@@ -667,7 +665,7 @@ async def lifespan(app: FastAPI):
         except Exception:
             vocab = -1
         log.info("ctxgate-proxy started: tokenizer=%s vocab=%d, vllm=%s model=%s, api_key=%s",
-                 QWEN_TOKENIZER_PATH, vocab, VLLM_URL, VLLM_MODEL, "set" if API_KEY else "off")
+                 tok_name, vocab, VLLM_URL, VLLM_MODEL, "set" if API_KEY else "off")
     except Exception as e:
         enc = tiktoken.get_encoding("cl100k_base")
         log.warning("ctxgate-proxy: Qwen tokenizer load FAILED (%s), falling back to cl100k_base", e)
@@ -995,7 +993,7 @@ def _truncate_message_content(msg: dict, max_chars: int) -> dict:
 
 def trim_context(messages: list, max_tokens: int) -> list:
     """FIFO trim: protect system + NEWEST user message, drop oldest first.
-    
+
     Strategy:
     1. System messages always kept (truncated if necessary)
     2. The LAST user message (current request) is ALWAYS protected - never truncated
@@ -1476,7 +1474,7 @@ async def fetch_task_memory(session_id: str, messages: list, task_uuid: str = No
             scored.sort(key=lambda x: x[0], reverse=True)
             return [r for _, r in scored[:8]]
         return []
-    
+
     wrow, summary, crit, rel = await asyncio.gather(
         pool.fetchrow("SELECT content FROM proxy.working_memory WHERE task_id=$1", task_uuid),
         _fetch_session_summary(task_uuid, budget=600, session_key=session_id),
@@ -1496,7 +1494,7 @@ async def fetch_task_memory(session_id: str, messages: list, task_uuid: str = No
     if isinstance(rel, Exception):
         log.warning("Relevant memory fetch failed: %s", rel)
         rel = []
-    
+
     wm_text = (wrow["content"].strip() if wrow and wrow["content"] else "")
     if wm_text and not _already_in_context(wm_text, blob):
         line = "WORKING MEMORY: " + wm_text
@@ -1504,14 +1502,14 @@ async def fetch_task_memory(session_id: str, messages: list, task_uuid: str = No
         if t <= wm_budget and total + t <= total_budget:
             parts.append(line)
             total += t
-    
+
     if summary and not _already_in_context(summary, blob):
         line = "SESSION SUMMARY: " + summary
         t = count_tokens(line)
         if t <= 600 and total + t <= total_budget:
             parts.append(line)
             total += t
-    
+
     rows = list(crit) + list(rel)
 
     seen = set()
@@ -1829,7 +1827,7 @@ async def chat_completions(request: Request):
         task_uuid = await _resolve_task(x_sid, create=True)
     except Exception:
         pass
-    
+
     _t0 = time.monotonic()
     built = await build_context(messages, task_uuid=task_uuid, session_key=session_key)
     _dt = (time.monotonic() - _t0) * 1000
@@ -2368,7 +2366,7 @@ async def _get_goose_session_id() -> str:
 
 async def _get_goose_session_info(session_id: str) -> Optional[dict]:
     """Fetch full session metadata from Goose SQLite DB by session ID.
-    
+
     Returns dict with: id, name, session_type, working_dir, provider_name
     or None if not found.
     """
@@ -2442,7 +2440,7 @@ async def _enqueue_memory_job(session_id, user_content):
         log.warning('Memory job enqueue failed %s: %s', session_id, e)
 async def _resolve_task(task_ref: str, create: bool = False):
     """Resolve or create a proxy task, enriching with Goose DB session metadata.
-    
+
     Uses exact columns from Goose sessions DB: id, name, session_type, working_dir, provider_name.
     This ensures each Goose session gets its own properly-named proxy task.
     """
@@ -2567,9 +2565,9 @@ async def create_deliverable(request: Request):
         provider_name = body.get("provider_name", "")
         summary = body.get("summary", "")
         document_path = body.get("document_path", "")
-        
+
         row = await pool.fetchrow(
-            """INSERT INTO proxy.deliverables 
+            """INSERT INTO proxy.deliverables
                (name, session_type, working_dir, provider_name, summary, document_path)
                VALUES ($1, $2, $3, $4, $5, $6)
                RETURNING id, name, session_type, working_dir, provider_name, summary, document_path, created_at""",
@@ -3393,8 +3391,9 @@ setInterval(refresh, 5000);
 </html>"""
 
 if __name__ == "__main__":
-    import uvicorn
     import socket as _sock
+
+    import uvicorn
 
     # Port-lock guard: if port is already bound, exit cleanly (no crash loop)
     _s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)

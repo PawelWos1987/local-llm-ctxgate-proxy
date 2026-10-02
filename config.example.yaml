@@ -1,0 +1,37 @@
+# ctxgate-proxy configuration
+# Copy this to config.yaml and fill in your values.
+# All values can also be set via environment variables (env vars take precedence).
+
+proxy:
+  host: 127.0.0.1
+  port: 9201
+
+vllm:
+  host: 127.0.0.1
+  port: 29000
+  model: your-model-name
+
+dashboard:
+  host: 127.0.0.1
+  port: 9202
+  poll_interval: 3.0
+  watchdog_timeout: 30
+
+db:
+  # PostgreSQL connection string
+  # Format: postgresql://user:password@host:port/dbname
+  dsn: postgresql://postgres:your-password@127.0.0.1:5432/ctxproxy
+
+lm_studio:
+  host: 127.0.0.1
+  port: 1234
+
+worker:
+  poll_interval: 2.0
+  max_attempts: 3
+  outage_ttl: 300
+
+compaction:
+  max_context_tokens: 100000
+  max_continuations: 5
+  trailing_memory_block: true

@@ -1,0 +1,65 @@
+[project]
+name = "local-llm-ctxgate-proxy"
+version = "1.0.0"
+description = "Local LLM context gateway proxy with session-aware KV-cache optimization, 4B memory worker, and real-time dashboard"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Pawel Wos" },
+]
+keywords = ["llm", "proxy", "kv-cache", "context-management", "vllm"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/PawelWos1987/local-llm-ctxgate-proxy"
+Issues = "https://github.com/PawelWos1987/local-llm-ctxgate-proxy/issues"
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["proxy*", "worker*", "dashboard*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+exclude = ["proxy/patch_fixes.py"]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+]
+ignore = [
+    "E501",   # line too long (SQL strings, URLs)
+    "E701",   # multiple statements on one line (compact test style)
+    "E702",   # multiple statements on one line (compact test style)
+    "E722",   # bare except (intentional resilience in worker/proxy)
+    "E741",   # ambiguous variable names (e, l, O)
+    "W293",   # trailing whitespace on blank lines (cosmetic, in docstrings)
+    "E402",   # module level import not at top (conditional imports)
+    "F811",   # redefinition of unused name (intentional overrides)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["F841"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["proxy", "worker", "dashboard"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

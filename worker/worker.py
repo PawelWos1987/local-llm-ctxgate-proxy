@@ -15,18 +15,18 @@ exponential backoff for up to CTXGATE_WORKER_OUTAGE_TTL (default 1800s = 30 min)
 Only after that window expires are jobs marked failed.
 """
 import asyncio
+import fcntl
 import json
 import logging
 import os
 import re
-import fcntl
 import signal
 import socket
+import threading
 import time
 from typing import Any, Optional
 
 import asyncpg
-import threading
 import httpx
 
 # --- Configuration ---
@@ -459,7 +459,7 @@ async def process_job(job) -> None:
     - If past OUTAGE_TTL: mark as failed
     On other errors: use standard MAX_ATTEMPTS bounded retry
     """
-    global outage_since, last_completion, jobs_done_total, consecutive_lm_failures
+    global outage_since, last_completion, jobs_done_total, consecutive_lm_failures, model_loaded
     jid, task_id, event_id = str(job["id"]), str(job["task_id"]), str(job["event_id"]) if job["event_id"] else None
     await pool.execute("UPDATE proxy.memory_jobs SET status='processing',started_at=now() WHERE id=$1", jid)
     try:
