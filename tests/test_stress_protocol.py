@@ -2,7 +2,7 @@
 """Suite 10: HTTP protocol edges, response fields, concurrency, boundaries, consistency."""
 import json, time, urllib.request, urllib.error, threading, sys
 
-BASE = "http://127.0.0.1:9200"
+BASE = "http://127.0.0.1:9201"
 MODEL = "Qwen3.8-27B"
 PASS = 0
 FAIL = 0

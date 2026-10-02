@@ -1,7 +1,7 @@
 """ctxgate-dashboard: Health monitoring + control center for the ctxgate-proxy ecosystem.
 
 Monitors: PostgreSQL, vLLM, LM Studio, ctxgate-proxy, 4B worker.
-Serves a single-page GUI on port 9201.
+Serves a single-page GUI on port 9202.
 Starts independently (no ordering deps); polls service health asynchronously.
 
 Control: the GUI buttons start / stop / hard-restart the proxy and worker.
@@ -111,10 +111,10 @@ def build_svc_map(cfg):
 
 _cfg = load_config()
 
-PORT = int(_get(_cfg, "dashboard", "port", default=9201) or 9201)
+PORT = int(os.environ.get("CTXGATE_DASHBOARD_PORT") or _get(_cfg, "dashboard", "port", default=9202) or 9202)
 POLL_INTERVAL = float(_get(_cfg, "dashboard", "poll_interval", default=3.0) or 3.0)
 SERVICES = build_services(_cfg)
-DB_DSN = _get(_cfg, "db", "dsn", default=None) or os.environ.get("CTXGATE_DB_DSN")
+DB_DSN = os.environ.get("CTXGATE_DB_DSN") or os.environ.get("CTXPROXY_DB_DSN") or _get(_cfg, "db", "dsn", default=None) or "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy"
 SVC_MAP = build_svc_map(_cfg)
 
 from contextlib import asynccontextmanager
@@ -181,7 +181,7 @@ def _maybe_reload_config():
     _config_mtime = m
     globals()["SERVICES"] = build_services(new_cfg)
     globals()["SVC_MAP"] = build_svc_map(new_cfg)
-    globals()["DB_DSN"] = _get(new_cfg, "db", "dsn", default=None) or os.environ.get("CTXGATE_DB_DSN")
+    globals()["DB_DSN"] = os.environ.get("CTXGATE_DB_DSN") or os.environ.get("CTXPROXY_DB_DSN") or _get(new_cfg, "db", "dsn", default=None) or "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy"
     globals()["POLL_INTERVAL"] = float(_get(new_cfg, "dashboard", "poll_interval", default=POLL_INTERVAL) or POLL_INTERVAL)
     print("config.yaml reloaded:", CONFIG_PATH, flush=True)
 
@@ -231,26 +231,34 @@ async def check_worker_file(path: str) -> dict:
     except Exception as e:
         return {"status": "down", "error": str(e)[:100]}
 
+async def _db_counts(conn) -> dict:
+    tasks = await conn.fetchval("SELECT count(*) FROM proxy.tasks")
+    events = await conn.fetchval("SELECT count(*) FROM proxy.events")
+    memories = await conn.fetchval("SELECT count(*) FROM proxy.memories WHERE active=true")
+    knowledge = await conn.fetchval("SELECT count(*) FROM proxy.knowledge WHERE active=true")
+    jobs_pending = await conn.fetchval("SELECT count(*) FROM proxy.memory_jobs WHERE status='pending'")
+    jobs_processing = await conn.fetchval("SELECT count(*) FROM proxy.memory_jobs WHERE status='processing'")
+    jobs_done = await conn.fetchval("SELECT count(*) FROM proxy.memory_jobs WHERE status='done'")
+    jobs_failed = await conn.fetchval("SELECT count(*) FROM proxy.memory_jobs WHERE status='failed'")
+    return {
+        "tasks": tasks, "events": events, "memories": memories,
+        "knowledge": knowledge, "jobs_pending": jobs_pending,
+        "jobs_processing": jobs_processing, "jobs_done": jobs_done,
+        "jobs_failed": jobs_failed,
+    }
+
 async def get_db_metrics() -> dict:
-    """Query PG for operational metrics."""
+    """Query PG for operational metrics. Reuses the lifespan-managed pool
+    (no per-poll connection churn); falls back to a one-shot connect only if
+    the pool has not been created (e.g. DSN missing at startup)."""
     try:
+        if _pg_pool is not None:
+            async with _pg_pool.acquire() as conn:
+                return await _db_counts(conn)
         import asyncpg
         conn = await asyncio.wait_for(asyncpg.connect(DB_DSN), timeout=5)
         try:
-            tasks = await conn.fetchval("SELECT count(*) FROM proxy.tasks")
-            events = await conn.fetchval("SELECT count(*) FROM proxy.events")
-            memories = await conn.fetchval("SELECT count(*) FROM proxy.memories WHERE active=true")
-            knowledge = await conn.fetchval("SELECT count(*) FROM proxy.knowledge WHERE active=true")
-            jobs_pending = await conn.fetchval("SELECT count(*) FROM proxy.memory_jobs WHERE status='pending'")
-            jobs_processing = await conn.fetchval("SELECT count(*) FROM proxy.memory_jobs WHERE status='processing'")
-            jobs_done = await conn.fetchval("SELECT count(*) FROM proxy.memory_jobs WHERE status='done'")
-            jobs_failed = await conn.fetchval("SELECT count(*) FROM proxy.memory_jobs WHERE status='failed'")
-            return {
-                "tasks": tasks, "events": events, "memories": memories,
-                "knowledge": knowledge, "jobs_pending": jobs_pending,
-                "jobs_processing": jobs_processing, "jobs_done": jobs_done,
-                "jobs_failed": jobs_failed,
-            }
+            return await _db_counts(conn)
         finally:
             await conn.close()
     except Exception as e:
@@ -729,7 +737,7 @@ body{font-family:'Consolas','Courier New',monospace;background:var(--bg);color:v
 <div class="box box-proxy" id="box-proxy">
 <div class="title"><span class="led"></span>CTXGATE PROXY</div>
 <div class="metrics">
-<div class="metric-row"><span>Port</span><span class="val">:9201</span></div>
+<div class="metric-row"><span>Port</span><span class="val">:9202</span></div>
 <div class="metric-row"><span>Status</span><span class="val" id="px-status">--</span></div>
 <div class="metric-row"><span>Latency</span><span class="val big" id="px-lat">--</span></div>
 </div>

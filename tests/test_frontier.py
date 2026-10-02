@@ -4,7 +4,7 @@ concurrent streaming, session isolation, stream integrity, metrics,
 edge payloads, memory lifecycle."""
 import json, time, urllib.request, urllib.error, threading
 
-PROXY = "http://127.0.0.1:9200"
+PROXY = "http://127.0.0.1:9201"
 passed, failed = 0, 0
 failures = []
 

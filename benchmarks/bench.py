@@ -1,5 +1,5 @@
 import json, time, statistics, urllib.request
-PROXY="http://127.0.0.1:9200/v1/chat/completions"
+PROXY="http://127.0.0.1:9201/v1/chat/completions"
 DIRECT="http://127.0.0.1:29000/v1/chat/completions"
 MODEL="Qwen3.8-27B"
 TOK="/home/user/models/Swift-1.5-Qwen3.8-27b-W4A16-AutoRound/tokenizer.json"

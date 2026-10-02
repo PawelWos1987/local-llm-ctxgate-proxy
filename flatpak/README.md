@@ -6,7 +6,7 @@ Packages the ctxgate-proxy ecosystem (proxy + worker + dashboard) as a Flatpak a
 
 | Component | Port | Description |
 |-----------|------|-------------|
-| ctxgate-proxy | 9200 | Main LLM context management proxy |
+| ctxgate-proxy | 9201 | Main LLM context management proxy |
 | 4B Worker | — | Memory extraction worker |
 | Dashboard | 9201 | Web GUI for health monitoring |
 

@@ -3,7 +3,7 @@
 A self-contained local LLM infrastructure: a token-aware context-gate proxy
 in front of vLLM, a 4B-model memory worker backed by PostgreSQL, and a
 health-monitoring GUI with full service control. **Everything is operated
-from the GUI (http://127.0.0.1:9201). Zero terminal, zero bash, zero fish.**
+from the GUI (http://127.0.0.1:9202). Zero terminal, zero bash, zero fish.**
 
 ---
 
@@ -14,7 +14,7 @@ from the GUI (http://127.0.0.1:9201). Zero terminal, zero bash, zero fish.**
                         │                        HOST                            │
                         │                                                        │
   Goose agent ──POST /v1/chat/completions──► ┌──────────────────┐                │
-  (any LLM client)                            │  ctxgate-proxy   │  :9200        │
+  (any LLM client)                            │  ctxgate-proxy   │  :9201        │
                                             │  (FastAPI)        │                │
                                             │  - rolling-window │                │
                                             │    trimming (130k) │               │
@@ -45,7 +45,7 @@ from the GUI (http://127.0.0.1:9201). Zero terminal, zero bash, zero fish.**
                    │ health (TCP 5432)                                           │
                    ▼                                                             │
   Browser ──► ┌─────────────────────────────────────────────────────────┐         │
-  (you)       │  ctxgate-dashboard :9201                               │         │
+  (you)       │  ctxgate-dashboard :9202                               │         │
               │  • red/yellow/green dots for all 5 monitored targets    │         │
               │  • database metrics card                               │         │
               │  • START / STOP / RESTART buttons for proxy & worker   │         │
@@ -55,7 +55,7 @@ from the GUI (http://127.0.0.1:9201). Zero terminal, zero bash, zero fish.**
 
 ### What flows where
 
-1. **Goose → proxy (:9200)**: every `/v1/chat/completions` request. The proxy
+1. **Goose → proxy (:9201)**: every `/v1/chat/completions` request. The proxy
    trims the message list to fit the upstream context window (token-aware,
    dependency-graph safe), logs the event to PostgreSQL, enqueues a memory job,
    and forwards the request to vLLM.
@@ -68,7 +68,7 @@ from the GUI (http://127.0.0.1:9201). Zero terminal, zero bash, zero fish.**
    check on a compact payload. A bad job is discarded, never fatal. If LM Studio
    is down, jobs back off for up to 30 min, then are marked failed.
 6. **worker → PostgreSQL**: dedupe / UPDATE / SUPERSEDE into `proxy.memories`.
-7. **dashboard (:9201) → everything**: independent poller (every 300 s by
+7. **dashboard (:9202) → everything**: independent poller (every 300 s by
    default) checks PostgreSQL (TCP), vLLM (HTTP), LM Studio (HTTP), proxy
    (HTTP /health), worker (lock-file heartbeat) + DB row metrics. It is the
    **single source of truth for health**, and also the **only control surface**.
@@ -112,7 +112,7 @@ sudo systemctl enable --now ctxgate-worker
 sudo systemctl enable --now ctxgate-dashboard
 
 # 3. open the GUI
-#    http://127.0.0.1:9201
+#    http://127.0.0.1:9202
 ```
 
 ### B. User-level services (current live setup)
@@ -140,12 +140,12 @@ Then use the AUR services. From that moment **all control is in the GUI**.
 | `CTXGATE_WORKER_POLL` | 2.0 | worker poll interval (s) |
 | `CTXGATE_WORKER_MAX_ATTEMPTS` | 3 | per-job retries |
 | `CTXGATE_WORKER_OUTAGE_TTL` | 1800 | backoff window before jobs fail |
-| `CTXGATE_DASHBOARD_PORT` | 9201 | GUI port |
+| `CTXGATE_DASHBOARD_PORT` | 9202 | GUI port |
 | `CTXGATE_DASHBOARD_POLL` | 300 | health poll interval (s) |
 
 ---
 
-## 3. The GUI (http://127.0.0.1:9201)
+## 3. The GUI (http://127.0.0.1:9202)
 
 One dark single-page dashboard, auto-refreshes every 10 s. Three regions:
 
@@ -158,7 +158,7 @@ Five monitored targets, one row each: **dot + name + status + detail**.
 | `postgresql` | 🟢 / 🔴 | DB reachable / not | TCP connect to 127.0.0.1:5432 |
 | `vllm` | 🟢 / 🟡 / 🔴 | main LLM up (ms latency) / non-200 / unreachable | GET :29000/v1/models |
 | `lm_studio` | 🟢 / 🟡 / 🔴 | 4B model up / non-200 / unreachable | GET :1234/v1/models |
-| `ctxgate_proxy` | 🟢 / 🟡 / 🔴 | proxy up (ms) / non-200 / unreachable — **controllable** | GET :9200/health |
+| `ctxgate_proxy` | 🟢 / 🟡 / 🔴 | proxy up (ms) / non-200 / unreachable — **controllable** | GET :9201/health |
 | `worker` | 🟢 / 🟡 / 🔴 | fresh heartbeat (<30 s) / stale (30–120 s) / dead (>120 s) — **controllable** | lock-file heartbeat |
 
 - **🟢 up** — healthy.
@@ -180,7 +180,7 @@ Five monitored targets, one row each: **dot + name + status + detail**.
 Below the cards. Shows the last control action and its full step trace, e.g.:
 
 ```
-OK: ctxgate_proxy restart done  ||  stop rc=0 -> port 9200: free -> reset-failed rc=0 -> start rc=0 -> verify: HTTP 200
+OK: ctxgate_proxy restart done  ||  stop rc=0 -> port 9201: free -> reset-failed rc=0 -> start rc=0 -> verify: HTTP 200
 ```
 
 Buttons disable while an action runs (an action can take a few seconds; the
@@ -218,9 +218,9 @@ crashes, it comes back in 5 s. You never type a command.
 
 ```
 ctxproxy/
-├── proxy/app.py            # :9200 context-gate proxy (FastAPI)
+├── proxy/app.py            # :9201 context-gate proxy (FastAPI)
 ├── worker/worker.py        # 4B memory worker (async, lock-file heartbeat)
-├── dashboard/dashboard.py  # :9201 GUI + health poller + control API
+├── dashboard/dashboard.py  # :9202 GUI + health poller + control API
 ├── schema/00X_*.sql        # PostgreSQL schema (6 migrations)
 ├── .env / .env.example     # configuration
 └── pkg/ctxgate-proxy/      # AUR package (PKGBUILD, .SRCINFO, tarball, systemd/)

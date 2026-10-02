@@ -1,5 +1,5 @@
 import json, time, urllib.request, urllib.error
-PROXY="http://127.0.0.1:9200/v1/chat/completions"
+PROXY="http://127.0.0.1:9201/v1/chat/completions"
 DIRECT="http://127.0.0.1:29000/v1/chat/completions"
 MODEL="Qwen3.8-27B"
 HDRS={"Content-Type": "application/json"}

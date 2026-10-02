@@ -1,8 +1,8 @@
 control:
   ctxgate_proxy:
-    health_url: http://127.0.0.1:9200/health
+    health_url: http://127.0.0.1:9201/health
     kind: http
-    port: 9200
+    port: 9201
     unit: ctxproxy-proxy.service
   worker:
     kind: file
@@ -10,7 +10,7 @@ control:
     unit: ctxproxy-worker.service
 dashboard:
   poll_interval: 3.0
-  port: 9201
+  port: 9202
   watchdog_timeout: 30
 db:
   dsn: postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy
@@ -41,7 +41,7 @@ proxy:
 services:
   ctxgate_proxy:
     type: http
-    url: http://127.0.0.1:9200/health
+    url: http://127.0.0.1:9201/health
   lm_studio:
     type: http
     url: http://127.0.0.1:1234/v1/models

@@ -1,6 +1,6 @@
 """Performance A/B/C comparison (section 22).
 
-Measures the final architecture against baselines on the LIVE proxy (:9200):
+Measures the final architecture against baselines on the LIVE proxy (:9201):
   A. Goose + Qwen only            (no X-Session-ID -> no memory injection)
   B. Goose + local-llm-ctxgate-proxy, no 4B write (X-Session-ID, memory from PG only)
   C. Goose + local-llm-ctxgate-proxy + 4B        (X-Session-ID + fresh event enqueued, 4B async)
@@ -13,7 +13,7 @@ automatic memory injection is normally small or absent.
 import json, time, http.client, urllib.request, os, uuid, sys
 
 BASE = "127.0.0.1"
-PORT = 9200
+PORT = 9201
 MODEL = "Qwen3.8-27B"
 DSN = os.environ.get("CTXGATE_DB_DSN", "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/local-llm-ctxgate-proxy")
 

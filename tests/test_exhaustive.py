@@ -23,7 +23,7 @@ import urllib.error
 import sys
 import uuid
 
-PROXY = "http://127.0.0.1:9200"
+PROXY = "http://127.0.0.1:9201"
 VLLM = "http://127.0.0.1:29000/v1"
 MODEL = "Qwen3.8-27B"
 passed = 0

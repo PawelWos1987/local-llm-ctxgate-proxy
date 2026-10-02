@@ -12,8 +12,8 @@ if [ -f .env ]; then
 fi
 
 # Default ports (override via .env)
-export CTXGATE_PROXY_PORT=${CTXGATE_PROXY_PORT:-9200}
-export CTXGATE_DASHBOARD_PORT=${CTXGATE_DASHBOARD_PORT:-9201}
+export CTXGATE_PROXY_PORT=${CTXGATE_PROXY_PORT:-9201}
+export CTXGATE_DASHBOARD_PORT=${CTXGATE_DASHBOARD_PORT:-9202}
 
 echo "[ctxgate] Starting services..."
 

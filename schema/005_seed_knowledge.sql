@@ -2,7 +2,7 @@
 -- Seed knowledge table with relevant ctxproxy knowledge
 INSERT INTO proxy.knowledge (domain, key, value, importance, source_session, source_key, updated_at)
 VALUES 
-    ('config', 'proxy_port', 'ctxgate-proxy runs on port 9200 (CTXGATE_PROXY_PORT=9200)', 8, '20261002_17', '20261002_17:00000000', now()),
+    ('config', 'proxy_port', 'ctxgate-proxy runs on port 9201 (CTXGATE_PROXY_PORT=9201)', 8, '20261002_17', '20261002_17:00000000', now()),
     ('config', 'vllm_endpoint', 'vLLM serves Qwen3.8-27B at http://127.0.0.1:29000/v1 with 130k context window', 8, '20261002_17', '20261002_17:00000000', now()),
     ('config', '4b_model', '4B memory worker uses qwen3-4b-instruct-2507 via LM Studio at http://127.0.0.1:1234/v1', 7, '20261002_17', '20261002_17:00000000', now()),
     ('architecture', 'session_isolation', 'Each Goose session gets a unique proxy.tasks row keyed by session_id; memories and summaries are per-task', 9, '20261002_17', '20261002_17:00000000', now()),

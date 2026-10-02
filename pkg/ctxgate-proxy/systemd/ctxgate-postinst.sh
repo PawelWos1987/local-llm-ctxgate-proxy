@@ -13,7 +13,7 @@ systemctl enable --now ctxgate-worker.service
 systemctl enable --now ctxgate-dashboard.service
 echo ""
 echo "=== Ready ==="
-echo "  Proxy:     http://127.0.0.1:9200/v1"
+echo "  Proxy:     http://127.0.0.1:9201/v1"
 echo "  Dashboard: http://127.0.0.1:9201"
 echo "  Logs:      /var/log/ctxgate-proxy/"
 echo "  Config:    /etc/ctxgate-proxy/.env"

@@ -69,7 +69,7 @@ Goose Desktop
     |  POST /v1/chat/completions
     v
 +----------------------------------------------------------------+
-| ctxgate-proxy (port 9200)                                      |
+| ctxgate-proxy (port 9201)                                      |
 |                                                                |
 |  1. Auth check (optional API key)                               |
 |  2. Body size guard (MAX_BODY_BYTES)                            |
@@ -246,7 +246,7 @@ This is what Goose Desktop reads to display the cache hit indicator in the messa
 ### 9.1 Proxy (supervisor.sh)
 
 - **Lock file** (`supervisor.lock`): prevents double-start
-- **Stale port kill**: at startup, kills any process on port 9200
+- **Stale port kill**: at startup, kills any process on port 9201
 - **Backoff**: clean exit → 1s; crash > 5s → 2s; 3+ consecutive crashes → 10s
 - **PID file** (`proxy.pid`): for external monitoring
 
@@ -265,7 +265,7 @@ This is what Goose Desktop reads to display the cache hit indicator in the messa
 3. LM Studio (4B model, port 1234)
 4. ctxgate-proxy (supervisor.sh)
 5. worker (worker/worker.py)
-6. Goose (connects to proxy:9200)
+6. Goose (connects to proxy:9201)
 ```
 
 The proxy retries DB connection for up to 120s (60 x 2s). The worker does the same.
@@ -348,7 +348,7 @@ The proxy retries DB connection for up to 120s (60 x 2s). The worker does the sa
 | `CTXGATE_SAFETY_MARGIN` | 2000 | Reserved tokens |
 | `CTXGATE_WALL_CLOCK_MAX` | 1800 | Max wall-clock per request (seconds) |
 | `CTXGATE_MAX_CONTINUATIONS` | 5 | Max auto-continuation retries |
-| `CTXGATE_PROXY_PORT` | 9200 | Listen port |
+| `CTXGATE_PROXY_PORT` | 9201 | Listen port |
 | `CTXGATE_API_KEY` | — | Optional Bearer auth |
 | `CTXGATE_MAX_BODY_BYTES` | 50MB | Request body size limit |
 | `CTXGATE_MEMORY_WORKER` | 1 | Enable/disable memory job enqueue |

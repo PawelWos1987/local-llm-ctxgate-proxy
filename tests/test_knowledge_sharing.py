@@ -6,7 +6,7 @@ import sys
 import subprocess
 import os
 
-PROXY = "http://127.0.0.1:9200"
+PROXY = "http://127.0.0.1:9201"
 PGENV = "PGPASSWORD=" + os.environ.get("CTXGATE_PG_PASS", "postgres") + " psql -h 127.0.0.1 -U postgres -d local-llm-ctxgate-proxy -t"
 PASS = 0
 FAIL = 0
@@ -48,7 +48,7 @@ print("=" * 60)
 
 # --- K1: Create knowledge item via API ---
 print("\nK1: POST /knowledge creates a global knowledge item")
-r = api_post("/knowledge", {"domain": "config", "key": "test_port", "value": "9200", "importance": 8})
+r = api_post("/knowledge", {"domain": "config", "key": "test_port", "value": "9201", "importance": 8})
 check("K1a: 200 response", r.status_code == 200)
 check("K1b: status ok", r.json().get("status") == "ok")
 
@@ -93,14 +93,14 @@ check("K5d: importance is max(5,7)=7", len(items) > 0 and items[0]["importance"]
 print("\nK6: Chat in session A extracts + stores knowledge")
 msgs_a = [
     {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "The proxy port is 9200 and the vLLM url is http://127.0.0.1:29000/v1. We decided to use Qwen3.8-27B model."}
+    {"role": "user", "content": "The proxy port is 9201 and the vLLM url is http://127.0.0.1:29000/v1. We decided to use Qwen3.8-27B model."}
 ]
 r = chat(msgs_a, "kn-test-A")
 check("K6a: 200 response", r.status_code == 200)
 time.sleep(3)
-r = api_get("/knowledge/search", {"q": "9200", "limit": 10})
-items_9200 = [i for i in r.json().get("items", []) if "9200" in i["value"] or "9200" in i["key"]]
-check("K6b: port 9200 knowledge stored", len(items_9200) >= 1)
+r = api_get("/knowledge/search", {"q": "9201", "limit": 10})
+items_9201 = [i for i in r.json().get("items", []) if "9201" in i["value"] or "9201" in i["key"]]
+check("K6b: port 9201 knowledge stored", len(items_9201) >= 1)
 
 r = api_get("/knowledge/search", {"q": "29000", "limit": 10})
 items_29000 = [i for i in r.json().get("items", []) if "29000" in i["value"] or "29000" in i["key"]]

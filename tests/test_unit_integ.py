@@ -29,7 +29,7 @@ from proxy.app import (
     trim_context
 )
 
-PROXY = "http://127.0.0.1:9200"
+PROXY = "http://127.0.0.1:9201"
 MODEL = "Qwen3.8-27B"
 passed = 0
 failed = 0

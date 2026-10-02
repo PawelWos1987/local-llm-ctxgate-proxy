@@ -2,7 +2,7 @@
 """local-llm-ctxgate-proxy EXTENDED TEST SUITE - real-world Goose patterns, D9/D10/D11, streaming+tools, memory, stress."""
 import json, urllib.request, urllib.error, time, threading, sys
 
-BASE = "http://127.0.0.1:9200"
+BASE = "http://127.0.0.1:9201"
 PASS = 0; FAIL = 0; RESULTS = []
 
 def record(name, ok, detail=""):

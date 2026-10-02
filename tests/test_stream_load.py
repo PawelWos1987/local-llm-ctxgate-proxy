@@ -11,7 +11,7 @@ import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-BASE = "http://127.0.0.1:9200"
+BASE = "http://127.0.0.1:9201"
 MODEL = "Qwen3.8-27B"
 passed = 0
 failed = 0

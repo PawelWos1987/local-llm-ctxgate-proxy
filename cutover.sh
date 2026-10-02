@@ -1,5 +1,5 @@
 #!/bin/sh
-# local-llm-ctxgate-proxy cutover: point goose custom_qwen provider at the proxy (:9200)
+# local-llm-ctxgate-proxy cutover: point goose custom_qwen provider at the proxy (:9201)
 set -e
 CFG=/home/user/.config/goose/custom_providers/custom_qwen.json
 TS=$(date +%Y%m%d-%H%M%S)
@@ -11,8 +11,8 @@ import sys, json
 p = sys.argv[1]
 d = json.load(open(p))
 old = d.get('base_url')
-d['base_url'] = 'http://127.0.0.1:9200/v1'
-d['description'] = 'via local-llm-ctxgate-proxy :9200 (context assembly + PG memory + D9/D10/D11)'
+d['base_url'] = 'http://127.0.0.1:9201/v1'
+d['description'] = 'via local-llm-ctxgate-proxy :9201 (context assembly + PG memory + D9/D10/D11)'
 json.dump(d, open(p,'w'), indent=2)
 print('base_url:', old, '->', d['base_url'])
 PYEOF

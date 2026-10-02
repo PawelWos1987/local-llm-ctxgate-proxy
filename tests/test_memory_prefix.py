@@ -15,7 +15,7 @@ sys.path.insert(0, "/home/user/local-llm-ctxgate-proxy/proxy")
 import app as _proxy
 from concurrent.futures import ThreadPoolExecutor
 
-BASE = "http://127.0.0.1:9200"
+BASE = "http://127.0.0.1:9201"
 MODEL = "Qwen3.8-27B"
 PG_PASS = os.environ.get("CTXGATE_PG_PASS", "postgres")
 passed = 0

@@ -2,7 +2,7 @@
 """Suite 11: Streaming SSE, memory lifecycle, reset prefix, session isolation, prefix fingerprint, metrics deltas."""
 import json, time, urllib.request, urllib.error, threading, sys, http.client, re
 
-BASE = "http://127.0.0.1:9200"
+BASE = "http://127.0.0.1:9201"
 MODEL = "Qwen3.8-27B"
 PASS = 0
 FAIL = 0
@@ -49,7 +49,7 @@ def stream_req(messages, session_id=None, max_tokens=20, **kw):
     hdrs = {"Content-Type": "application/json"}
     if session_id:
         hdrs["X-Session-ID"] = session_id
-    conn = http.client.HTTPConnection("127.0.0.1", 9200, timeout=60)
+    conn = http.client.HTTPConnection("127.0.0.1", 9201, timeout=60)
     payload = json.dumps(body).encode("utf-8")
     conn.request("POST", "/v1/chat/completions", body=payload, headers=hdrs)
     resp = conn.getresponse()

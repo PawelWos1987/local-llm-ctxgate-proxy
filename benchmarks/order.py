@@ -18,7 +18,7 @@ def post(url, mt):
         with urllib.request.urlopen(req,timeout=120) as r: d=json.load(r)
         return round(time.time()-t0,2)
     except Exception as e: return "ERR "+str(e)
-P="http://127.0.0.1:9200/v1/chat/completions"
+P="http://127.0.0.1:9201/v1/chat/completions"
 D="http://127.0.0.1:29000/v1/chat/completions"
 print("=== ROUND A: PROXY first (cold) then DIRECT ===")
 print("A1 proxy(cold) ", post(P,16))

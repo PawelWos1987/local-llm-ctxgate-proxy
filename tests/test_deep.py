@@ -2,7 +2,7 @@
 """local-llm-ctxgate-proxy DEEP TEST SUITE - tool chains, sampling, sessions, protocol, metrics, edge cases."""
 import json, urllib.request, urllib.error, time, threading, sys, re
 
-BASE = "http://127.0.0.1:9200"
+BASE = "http://127.0.0.1:9201"
 PASS = 0; FAIL = 0; RESULTS = []
 
 def record(name, ok, detail=""):

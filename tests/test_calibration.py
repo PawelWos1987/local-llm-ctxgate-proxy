@@ -9,7 +9,7 @@ Proves the Qwen-tokenizer fix against vLLM's REAL reported prompt_tokens:
 import json, re, time, urllib.request, urllib.error
 import tokenizers, tiktoken
 
-BASE = "http://127.0.0.1:9200"
+BASE = "http://127.0.0.1:9201"
 MD = "/home/user/models/Swift-1.5-Qwen3.8-27b-W4A16-AutoRound"
 MAX_INPUT = 64000
 MAX_CONTEXT = 84000

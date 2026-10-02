@@ -6,7 +6,7 @@ import urllib.request
 
 import pytest
 
-PROXY = "http://127.0.0.1:9200"
+PROXY = "http://127.0.0.1:9201"
 
 
 def _post_stream(path, body, headers=None):
