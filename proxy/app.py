@@ -692,7 +692,7 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
-app = FastAPI(title="local-llm-ctxgate-proxy", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="local-llm-ctxgate-proxy", version="1.0.0", lifespan=lifespan)
 
 # --- Token counting ---
 def count_tokens(text: str) -> int:
@@ -1595,7 +1595,7 @@ def _record_call(session_key: str, input_tokens: int, output_tokens: int, status
 # --- Health endpoint ---
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.2.0", "sessions": len(session_fingerprints)}
+    return {"status": "ok", "version": "1.0.0", "sessions": len(session_fingerprints)}
 
 # --- Metrics endpoints ---
 @app.get("/metrics")
