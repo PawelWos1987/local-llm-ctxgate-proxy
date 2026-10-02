@@ -11,6 +11,7 @@ from typing import Any, Optional
 from contextlib import asynccontextmanager
 
 import asyncpg
+import aiosqlite
 import httpx
 import tiktoken
 import tokenizers
@@ -33,9 +34,33 @@ def _env_int(name: str, default: int) -> int:
 
 LM_STUDIO_URL = os.environ.get("CTXGATE_LM_URL", "http://127.0.0.1:1234/v1")
 LM_STUDIO_MODEL = os.environ.get("CTXGATE_LM_MODEL", "qwen3-4b-instruct-2507")
-LM_STUDIO_TIMEOUT = _env_int("CTXGATE_LM_TIMEOUT", 30)
+LM_STUDIO_TIMEOUT = _env_int("CTXGATE_LM_TIMEOUT", 120)
+GOOSE_SESSIONS_DB = os.environ.get("GOOSE_SESSIONS_DB", "/home/user/.local/share/goose/sessions/sessions.db")
 
-_MEMORY_SYSTEM_PROMPT = "You are the durable-memory worker for a long-running software engineering agent. Your only job is to extract and maintain information that the main 27B agent will need after the current conversation context is no longer available. Read the current task state and the new event. Preserve only durable, useful information: confirmed decisions, important findings, failed approaches, constraints, important TODOs, important files, state changes, and stable facts. Do not solve the task, do not execute tools, do not invent information, and do not repeat information that is already known unless the new event corrects or supersedes it. Prefer precise factual statements over summaries or explanations. Never guess. Only use information explicitly present in the input. When a new fact contradicts an existing memory, mark the old information as superseded through the requested memory action. When nothing important changed, return no memory changes. Return only the JSON structure defined by the configured output schema. No Markdown. No commentary. No explanation outside the JSON."
+# === 4-Step Orchestrator Prompts ===
+
+_PROMPT_EXTRACT = (
+    "Extract concrete facts from the text below. "
+    "Output JSON only with this structure: "
+    "{\"state_update\": {\"changed\": true/false, \"current_state\": \"brief state\", \"current_subtask\": \"current task\"}, "
+    "\"memory_actions\": [{\"action\": \"NEW\", \"type\": \"FACT\", \"importance\": \"NORMAL\", \"title\": \"short title\", \"content\": \"the fact\"}]} "
+    "Extract: project names, tech stack, file paths, decisions, constraints, errors, config values, user preferences. "
+    "Only extract what is explicitly stated. Never invent. If no new facts, use empty array for memory_actions."
+)
+
+_PROMPT_QUALITY = (
+    "Review the proposed memory extraction. Check for hallucination (facts not in the original event) or broken JSON format. "
+    "If ok, return: {\"pass\": true, \"reason\": \"clean\"} "
+    "If hallucinated or malformed, return: {\"pass\": false, \"reason\": \"why\"} "
+    "Output JSON only."
+)
+
+_PROMPT_DECIDE = (
+    "Should these extracted memories be stored? They come from a real conversation event. "
+    "If the facts are concrete and stated in the event: {\"store\": true} "
+    "If empty, meaningless, or fully duplicated: {\"store\": false, \"reason\": \"why\"} "
+    "Prefer storing. Output JSON only."
+)
 
 _IMPORTANCE_MAP = {"CRITICAL": 10, "HIGH": 8, "NORMAL": 5, "LOW": 3}
 
@@ -44,8 +69,9 @@ async def _call_4b(messages, max_tokens=2000, json_mode=True):
     try:
         async with httpx.AsyncClient(timeout=LM_STUDIO_TIMEOUT) as client:
             body = {"model": LM_STUDIO_MODEL, "messages": messages, "max_tokens": max_tokens, "temperature": 0}
-            if json_mode:
-                body["response_format"] = {"type": "json_object"}
+            # Note: LM Studio Qwen3-4b does NOT support response_format="json_object"
+            # (only "json_schema" or "text"). We rely on the prompt instruction
+            # "Output JSON only" which is sufficient for a 4B model.
             resp = await client.post(LM_STUDIO_URL + "/chat/completions", json=body)
             if resp.status_code != 200:
                 log.warning("4B model error %d: %s", resp.status_code, resp.text[:200])
@@ -156,84 +182,105 @@ async def _store_memory_actions(task_uuid, actions, source_event_id):
 
 
 async def _update_working_memory(task_uuid, state_update):
-    if not pool or not state_update:
-        return
-    if not state_update.get("changed", False):
-        return
-    state = state_update.get("current_state")
-    subtask = state_update.get("current_subtask")
-    if not state and not subtask:
-        return
-    content = "STATE: " + (state or "unknown") + " | SUBTASK: " + (subtask or "none")
-    await pool.execute("INSERT INTO proxy.working_memory (task_id, content, updated_at) VALUES ($1,$2,now()) ON CONFLICT (task_id) DO UPDATE SET content=$2, updated_at=now()", task_uuid, content)
-    log.info("Working memory updated: %s", content[:100])
-
-
-async def _process_memory_job(job_id, task_uuid, event_id):
     if not pool:
         return
-    max_retries = 3
-    for attempt in range(1, max_retries + 1):
-        try:
-            event = await pool.fetchrow("SELECT content FROM proxy.events WHERE id=$1", event_id)
-            if not event:
-                await pool.execute("UPDATE proxy.memory_jobs SET status='done', completed_at=now() WHERE id=$1", job_id)
-                return
-            wm = await pool.fetchrow("SELECT content FROM proxy.working_memory WHERE task_id=$1", task_uuid)
-            current_state = wm["content"] if wm and wm["content"] else "No prior state"
-            recent_mems = await pool.fetch(
-                "SELECT key, value FROM proxy.memories WHERE task_id=$1 AND active=true ORDER BY updated_at DESC LIMIT 10",
-                task_uuid
-            )
-            mem_context = ""
-            if recent_mems:
-                parts = []
-                for r in recent_mems:
-                    parts.append("- " + r["key"] + ": " + r["value"][:100])
-                mem_context = "\nKnown memories:\n" + "\n".join(parts)
-            user_msg = (
-                "Current task state: " + current_state + "\n" + mem_context +
-                "\n\nNew event:\n" + event["content"][:3000] +
-                "\n\nExtract durable memories and update state."
-            )
-            result = await _call_4b(
-                [{"role": "system", "content": _MEMORY_SYSTEM_PROMPT},
-                 {"role": "user", "content": user_msg}],
-                max_tokens=2000, json_mode=True
-            )
-            if result:
-                await _store_memory_actions(task_uuid, result.get("memory_actions", []), event_id)
-                await _update_working_memory(task_uuid, result.get("state_update", {}))
-            await pool.execute(
-                "UPDATE proxy.memory_jobs SET status='done', completed_at=now(), attempts=$2 WHERE id=$1",
-                job_id, attempt
-            )
-            log.info("Memory job %s processed (attempt %d)", job_id, attempt)
+    changed = state_update.get("changed", False)
+    if not changed:
+        return
+    state = state_update.get("current_state", "")
+    subtask = state_update.get("current_subtask", "")
+    # Strip any existing STATE:/SUBTASK: prefix from model output to avoid doubling
+    if state.startswith("STATE:"):
+        state = state[len("STATE:"):].strip()
+    if subtask.startswith("SUBTASK:"):
+        subtask = subtask[len("SUBTASK:"):].strip()
+    content_str = "STATE: " + state + " | SUBTASK: " + subtask
+    await pool.execute(
+        "INSERT INTO proxy.working_memory (task_id, content, updated_at) VALUES ($1, $2, now()) "
+        "ON CONFLICT (task_id) DO UPDATE SET content=$2, updated_at=now()",
+        task_uuid, content_str
+    )
+
+async def _process_memory_job(job_id, task_uuid, event_id):
+    """1-Step Memory Extract: 4B model extracts facts from event, we store them.
+    
+    The 4B model (qwen3-4b-instruct-2507) is too small for a 4-step orchestrator.
+    A single extract-and-store pass is the right complexity level.
+    """
+    if not pool:
+        return
+    try:
+        event = await pool.fetchrow("SELECT content FROM proxy.events WHERE id=$1", event_id)
+        if not event:
+            await pool.execute("UPDATE proxy.memory_jobs SET status='done', completed_at=now() WHERE id=$1", job_id)
             return
-        except Exception as e:
-            log.warning("Memory job %s attempt %d/%d failed: %s", job_id, attempt, max_retries, e)
-            if attempt < max_retries:
-                await asyncio.sleep(2 * attempt)
-            else:
-                try:
-                    await pool.execute(
-                        "UPDATE proxy.memory_jobs SET status='failed', error=$2, attempts=$3, completed_at=now() WHERE id=$1",
-                        job_id, str(e)[:200], attempt
-                    )
-                except Exception:
-                    pass
-                log.error("Memory job %s permanently failed", job_id)
-                return
+        
+        event_text = event["content"][:3000]
+        
+        # Single 4B call: no system message — LM Studio's configured
+        # system prompt + structured output schema handle the format.
+        extraction = await _call_4b(
+            [{"role": "user", "content": event_text}],
+            max_tokens=2000, json_mode=True
+        )
+        
+        if not extraction:
+            await pool.execute(
+                "UPDATE proxy.memory_jobs SET status='done', completed_at=now(), attempts=1, result=$2 WHERE id=$1",
+                job_id, "{}"
+            )
+            log.info("Memory job %s: no extraction from 4B", job_id)
+            return
+        
+        actions = extraction.get("memory_actions", [])
+        state_update = extraction.get("state_update", {})
+        
+        # Update working memory if state changed
+        if state_update.get("changed", False):
+            new_state = state_update.get("current_state", "unknown")
+            new_subtask = state_update.get("current_subtask", "")
+            wm_content = "STATE: " + new_state
+            if new_subtask:
+                wm_content += " | SUBTASK: " + new_subtask
+            await pool.execute(
+                "INSERT INTO proxy.working_memory (task_id, content, updated_at) VALUES ($1, $2, now()) "
+                "ON CONFLICT (task_id) DO UPDATE SET content=$2, updated_at=now()",
+                task_uuid, wm_content
+            )
+        
+        # Store extracted memories
+        if actions:
+            await _store_memory_actions(task_uuid, actions, event_id)
+            log.info("Memory job %s: stored %d memories", job_id, len(actions))
+        else:
+            log.info("Memory job %s: no memory actions extracted", job_id)
+        
+        await pool.execute(
+            "UPDATE proxy.memory_jobs SET status='done', completed_at=now(), attempts=1, result=$2 WHERE id=$1",
+            job_id, json.dumps(extraction)
+        )
+    except Exception as e:
+        log.warning("Memory job %s failed: %s", job_id, e)
+        await pool.execute(
+            "UPDATE proxy.memory_jobs SET status='failed', error=$2, completed_at=now() WHERE id=$1",
+            job_id, str(e)[:500]
+        )
+
 
 
 async def _memory_worker_loop():
-    log.info("Memory worker loop started (model=%s, url=%s)", LM_STUDIO_MODEL, LM_STUDIO_URL)
+    """DEPRECATED: Memory extraction is handled by worker/worker.py (dedicated process).
+    This loop is kept as a no-op to avoid racing with the dedicated worker.
+    The dedicated worker uses FOR UPDATE SKIP LOCKED for safe concurrent access.
+    """
+    log.info("Memory worker loop: DISABLED (dedicated worker.py handles extraction)")
     while True:
         try:
             await asyncio.sleep(5)
             if not pool:
                 continue
-            # Recovery: reset stuck 'processing' jobs (>120s)
+            # Only do recovery (reset stuck jobs), do NOT pick up pending jobs
+            # (the dedicated worker.py handles that)
             stuck = await pool.fetch(
                 "SELECT id FROM proxy.memory_jobs WHERE status='processing' AND started_at < now() - interval '120 seconds'"
             )
@@ -243,27 +290,6 @@ async def _memory_worker_loop():
                     "UPDATE proxy.memory_jobs SET status='failed', error='stuck_timeout', completed_at=now() WHERE id=$1",
                     s["id"]
                 )
-            # Pick up pending jobs
-            jobs = await pool.fetch(
-                "SELECT mj.id, mj.task_id, mj.event_id FROM proxy.memory_jobs mj "
-                "WHERE mj.status='pending' ORDER BY mj.created_at ASC LIMIT 5"
-            )
-            for job in jobs:
-                await pool.execute(
-                    "UPDATE proxy.memory_jobs SET status='processing', started_at=now() WHERE id=$1",
-                    job["id"]
-                )
-                try:
-                    await asyncio.wait_for(
-                        _process_memory_job(str(job["id"]), str(job["task_id"]), str(job["event_id"])),
-                        timeout=90
-                    )
-                except asyncio.TimeoutError:
-                    log.warning("Memory job %s timed out", job["id"])
-                    await pool.execute(
-                        "UPDATE proxy.memory_jobs SET status='failed', error='timeout_90s', completed_at=now() WHERE id=$1",
-                        job["id"]
-                    )
         except asyncio.CancelledError:
             log.info("Memory worker loop cancelled")
             break
@@ -272,7 +298,7 @@ async def _memory_worker_loop():
             await asyncio.sleep(10)
 
 
-async def _summarize_trimmed_messages(task_uuid, session_key, trimmed_messages):
+async def _summarize_trimmed_messages(task_uuid, session_key, trimmed_messages, session_name: str = ""):
     if not pool or not trimmed_messages:
         return
     try:
@@ -294,62 +320,87 @@ async def _summarize_trimmed_messages(task_uuid, session_key, trimmed_messages):
         trimmed_tokens = count_tokens(trimmed_text)
         existing = await pool.fetchrow("SELECT summary FROM proxy.session_summaries WHERE task_id=$1 ORDER BY created_at DESC LIMIT 1", task_uuid)
         prior_summary = existing["summary"] if existing else "No prior summary."
-        user_msg = "Prior summary:\n" + prior_summary + "\n\nCut messages:\n" + trimmed_text[:4000] + "\n\nSummarize the above. Format: GOAL: ... | DECISIONS: ... | CONSTRAINTS: ... | FILES: ... | PROGRESS: ... | NEXT: ..."
-        # Use json_mode=True because 4B ALWAYS returns JSON regardless of instructions
-        result = await _call_4b([
-            {"role": "system", "content": "You are a summarizer. Summarize the session context. Keep it under 300 words."},
-            {"role": "user", "content": user_msg}
-        ], max_tokens=1500, json_mode=False)
+        # === 4-Step Orchestrator for Session Summarization ===
         
+        # === Single-call summarization (LM Studio system prompt + schema) ===
+        # Do NOT send a system message — LM Studio's configured system prompt
+        # ("durable-memory worker") + structured output schema handle the format.
+        # Sending our own system message conflicts with it and slows the model.
+        name_hint = (" [Session: " + session_name + "]") if session_name else ""
+        user_msg = (
+            "Prior state: " + prior_summary +
+            "\n\nNew messages" + name_hint + ":\n" + trimmed_text[:4000]
+        )
+        result = await _call_4b([
+            {"role": "user", "content": user_msg}
+        ], max_tokens=1500, json_mode=True)
+        
+        # Extract summary from the model's native schema
         summary_text = ""
-        if isinstance(result, str) and result.strip():
-            stripped = result.strip()
-            # Check if it's JSON (4B persona override)
-            if stripped.startswith('{'):
+        if isinstance(result, dict):
+            # Primary: state_update.current_state
+            su = result.get("state_update", {})
+            if isinstance(su, dict) and su.get("current_state"):
+                summary_text = su["current_state"].strip()
+            # Fallback: first memory_action content
+            if not summary_text:
+                actions = result.get("memory_actions", [])
+                if actions and isinstance(actions[0], dict) and actions[0].get("content"):
+                    summary_text = actions[0]["content"].strip()
+        elif isinstance(result, str) and result.strip():
+            summary_text = result.strip()
+            # Try to parse as JSON in case model wrapped it
+            if summary_text.startswith('{'):
                 try:
-                    import json as _json
-                    parsed = _json.loads(stripped)
+                    parsed = json.loads(summary_text)
                     if isinstance(parsed, dict):
-                        # Build summary from memory_actions
-                        actions = parsed.get('memory_actions', [])
-                        parts = []
-                        for a in actions:
-                            if isinstance(a, dict):
-                                t = a.get('title', '')
-                                c = a.get('content', '')
-                                if t and c:
-                                    parts.append(t + ': ' + c)
-                                elif t:
-                                    parts.append(t)
-                        su = parsed.get('state_update', {})
-                        if isinstance(su, dict) and su.get('current_state'):
-                            parts.insert(0, "STATE: " + su['current_state'])
-                        summary_text = ' | ' .join(parts) if parts else ''
-                    else:
-                        summary_text = str(parsed)
+                        su = parsed.get("state_update", {})
+                        if isinstance(su, dict) and su.get("current_state"):
+                            summary_text = su["current_state"].strip()
                 except Exception:
-                    summary_text = stripped
-            else:
-                summary_text = stripped
-        elif isinstance(result, dict):
-            # _call_4b returned parsed JSON (json_mode=True path)
-            actions = result.get('memory_actions', [])
-            parts = []
-            for a in actions:
-                if isinstance(a, dict):
-                    t = a.get('title', '')
-                    c = a.get('content', '')
-                    if t and c:
-                        parts.append(t + ': ' + c)
-                    elif t:
-                        parts.append(t)
-            su = result.get('state_update', {})
-            if isinstance(su, dict) and su.get('current_state'):
-                parts.insert(0, "STATE: " + su['current_state'])
-            summary_text = ' | ' .join(parts) if parts else ''
+                    pass
         
         if not summary_text:
-            log.warning("Trim summarization produced no usable text")
+            log.warning("Trim summarization: no usable text from 4B model")
+            return
+        
+        # === Deterministic quality check (no LLM call) ===
+        # Rules: must be >50 chars, must contain at least one file name or code reference,
+        # must not be identical to prior summary
+        quality_ok = True
+        quality_reason = ""
+        if len(summary_text) < 50:
+            quality_ok = False
+            quality_reason = "too short (%d chars)" % len(summary_text)
+        elif summary_text == prior_summary.strip():
+            quality_ok = False
+            quality_reason = "identical to prior summary"
+        elif not any(c.isalpha() for c in summary_text):
+            quality_ok = False
+            quality_reason = "no alphabetic content"
+        
+        log.info("Trim summary quality (deterministic): %s (%s)", "PASS" if quality_ok else "FAIL", quality_reason[:60])
+        
+        if not quality_ok:
+            log.info("Trim summary discarded (deterministic quality): %s", quality_reason)
+            return
+        
+        # === Deterministic store decision (no LLM call) ===
+        # Store if: summary is meaningfully different from prior (token overlap < 80%)
+        store = True
+        if prior_summary and prior_summary.strip() != "No prior summary.":
+            # Simple token overlap check
+            def _tokens(s):
+                return set(s.lower().split())
+            new_t = _tokens(summary_text)
+            old_t = _tokens(prior_summary)
+            if old_t:
+                overlap = len(new_t & old_t) / max(1, len(old_t))
+                if overlap > 0.85:
+                    store = False
+                    log.info("Trim summary discarded (85%%+ overlap with prior: %.0f%%)", overlap * 100)
+        
+        if not store:
             return
         
         await pool.execute("INSERT INTO proxy.session_summaries (task_id, session_key, summary, trimmed_msg_count, trimmed_tokens) VALUES ($1,$2,$3,$4,$5)", task_uuid, session_key, summary_text[:3000], len(trimmed_messages), trimmed_tokens)
@@ -358,11 +409,25 @@ async def _summarize_trimmed_messages(task_uuid, session_key, trimmed_messages):
         log.warning("Trim summarization failed: %s", e)
 
 
-async def _fetch_session_summary(task_uuid, budget=800):
+async def _fetch_session_summary(task_uuid, budget=800, session_key: str = ""):
+    """Fetch the most recent session summary for a task.
+    
+    Falls back to matching by session_key prefix (x_sid) if task_uuid has no summary,
+    ensuring summaries are found even when task resolution changes.
+    """
     if not pool:
         return ""
     try:
         row = await pool.fetchrow("SELECT summary FROM proxy.session_summaries WHERE task_id=$1 ORDER BY created_at DESC LIMIT 1", task_uuid)
+        if not row and session_key:
+            # Fallback: match by session_key prefix (the x_sid part)
+            x_sid = session_key.split(":")[0] if ":" in session_key else session_key
+            row = await pool.fetchrow(
+                "SELECT ss.summary FROM proxy.session_summaries ss "
+                "JOIN proxy.tasks t ON t.id = ss.task_id "
+                "WHERE t.session_id = $1 ORDER BY ss.created_at DESC LIMIT 1",
+                x_sid
+            )
         if row and row["summary"]:
             s = row["summary"].strip()
             t = count_tokens(s)
@@ -388,11 +453,13 @@ PROXY_PORT = _env_int("CTXGATE_PROXY_PORT", 9201)
 API_KEY = os.environ.get("CTXGATE_API_KEY", "")
 MAX_BODY_BYTES = _env_int("CTXGATE_MAX_BODY_BYTES", 20 * 1024 * 1024)
 QWEN_TOKENIZER_PATH = os.environ.get("CTXGATE_QWEN_TOKENIZER", "/home/user/models/Swift-1.5-Qwen3.8-27b-W4A16-AutoRound/tokenizer.json")
+vllm_alive = False  # Updated by _vllm_health_loop
 
 
 # --- Global state (per-session where applicable) ---
 pool: Optional[asyncpg.Pool] = None
 enc: Optional[Any] = None
+sqlite_conn: Optional[aiosqlite.Connection] = None
 
 # Per-session state, keyed by session_key = "{x_session_id}:{content_fp[:8]}"
 session_fingerprints: dict[str, str] = {}
@@ -576,12 +643,20 @@ async def lifespan(app: FastAPI):
 
     # Start memory worker background loop
     worker_task = asyncio.create_task(_memory_worker_loop())
+    health_task = asyncio.create_task(_vllm_health_loop())
     yield
+    if sqlite_conn:
+        await sqlite_conn.close()
     await pool.close()
     log.info("ctxgate-proxy shutdown complete (graceful: pool drained)")
     worker_task.cancel()
+    health_task.cancel()
     try:
         await worker_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await health_task
     except asyncio.CancelledError:
         pass
 
@@ -612,7 +687,7 @@ def count_messages_tokens(messages: list) -> int:
     total = 0
     for m in messages:
         total += count_message_tokens(m)
-    total += len(messages) * 4
+    total += len(messages) * 12  # Qwen3 chat template: ~12 tokens per message (role tags + separators)
     return total
 
 # --- Session key (D11 per-session) ---
@@ -781,36 +856,144 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
             after_ids = set(id(m) for m in messages)
             dropped = [m for m in before if id(m) not in after_ids]
             if dropped:
-                asyncio.ensure_future(_summarize_trimmed_messages(task_uuid, session_key, dropped))
+                # Fetch session name for context-aware summarization
+                sname = ""
+                try:
+                    trow = await pool.fetchrow("SELECT name FROM proxy.tasks WHERE id=$1", task_uuid)
+                    if trow and trow["name"]:
+                        sname = trow["name"]
+                except Exception:
+                    pass
+                asyncio.ensure_future(_summarize_trimmed_messages(task_uuid, session_key, dropped, sname))
     return messages
 
+def _truncate_message_content(msg: dict, max_chars: int) -> dict:
+    """Truncate a message's content to fit within max_chars (approximate token->char ratio 4:1)."""
+    content = msg.get("content")
+    if content is None:
+        return msg
+    if isinstance(content, str):
+        if len(content) > max_chars:
+            m = dict(msg)
+            m["content"] = content[:max_chars] + "\n[...truncated...]"
+            return m
+        return msg
+    if isinstance(content, list):
+        # Multi-part content: truncate the text parts
+        total = sum(len(p.get("text", "")) for p in content if isinstance(p, dict))
+        if total > max_chars:
+            m = dict(msg)
+            m["content"] = content[:1]  # keep first part only
+            if isinstance(content[0], dict) and "text" in content[0]:
+                m["content"] = [dict(content[0], text=content[0]["text"][:max_chars] + "\n[...truncated...]")]
+            return m
+        return msg
+    return msg
+
+
 def trim_context(messages: list, max_tokens: int) -> list:
-    if len(messages) <= 3:
-        return messages
+    """FIFO trim: protect system + NEWEST user message, drop oldest first.
+    
+    Strategy:
+    1. System messages always kept (truncated if necessary)
+    2. The LAST user message (current request) is ALWAYS protected - never truncated
+    3. Fill remaining budget from newest-to-oldest (excluding protected)
+    4. If a middle message doesn't fit, truncate its content
+    5. Oldest messages are dropped first
+    """
     system_msgs = [m for m in messages if m.get("role") == "system"]
-    first_user = next((m for m in messages if m.get("role") == "user"), None)
+    last_user = None
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            last_user = m
+            break
+
     keep_head = []
     if system_msgs:
         keep_head.extend(system_msgs)
-    if first_user:
-        keep_head.append(first_user)
+    if last_user:
+        keep_head.append(last_user)
+
     head_tokens = count_messages_tokens(keep_head)
+
+    # If head alone exceeds budget, truncate system messages (never the last user)
+    if head_tokens >= max_tokens:
+        log.warning("Head alone is %d tokens (limit %d) - truncating system msgs", head_tokens, max_tokens)
+        last_user_tok = count_message_tokens(last_user) if last_user else 0
+        sys_budget = max(500, (max_tokens - last_user_tok - 200) // max(1, len(system_msgs))) if system_msgs else 0
+        new_head = []
+        for m in keep_head:
+            if m is last_user:
+                new_head.append(m)
+            else:
+                new_head.append(_truncate_message_content(m, sys_budget * 4))
+        keep_head = new_head
+        head_tokens = count_messages_tokens(keep_head)
+
     tail_budget = max_tokens - head_tokens - 100
+    if tail_budget < 100:
+        log.warning("Tail budget is only %d - returning head only", tail_budget)
+        return keep_head
+
+    head_ids = set(id(x) for x in keep_head)
     tail = []
     tail_tokens = 0
     for m in reversed(messages):
-        if id(m) in [id(x) for x in keep_head]:
+        if id(m) in head_ids:
             continue
         mt = count_message_tokens(m)
         if tail_tokens + mt > tail_budget:
+            remaining = tail_budget - tail_tokens
+            if remaining > 200:
+                # Truncate to fit the REMAINING space (not total budget)
+                char_budget = max(200, remaining * 3)  # 3:1 ratio (conservative)
+                truncated = _truncate_message_content(m, char_budget)
+                tmt = count_message_tokens(truncated)
+                if tmt <= remaining:
+                    tail.insert(0, truncated)
+                    tail_tokens += tmt
+                    log.info("Trimmed older message to fit (was %d, now %d tokens, remaining=%d)", mt, tmt, remaining)
+                else:
+                    # Truncation wasn't aggressive enough - force harder cut
+                    char_budget = max(100, (remaining // 2) * 3)
+                    truncated = _truncate_message_content(m, char_budget)
+                    tmt = count_message_tokens(truncated)
+                    if tmt <= remaining:
+                        tail.insert(0, truncated)
+                        tail_tokens += tmt
+                        log.info("Force-trimmed older message (was %d, now %d tokens)", mt, tmt)
             break
         tail.insert(0, m)
         tail_tokens += mt
-    result = keep_head + tail
-    log.info("Trimmed: %d -> %d messages", len(messages), len(result))
+
+    # Strip leading assistant messages from tail (orphaned after trim -
+    # an assistant msg with no preceding user msg breaks the chat template)
+    while tail and tail[0].get("role") == "assistant":
+        tail.pop(0)
+    # Reorder: system first, then chronological tail, then last_user at end
+    result = [m for m in keep_head if m is not last_user]
+    result.extend(tail)
+    if last_user:
+        result.append(last_user)
+
+    # Safety net: if result still exceeds budget, drop oldest tail messages
+    total = count_messages_tokens(result)
+    if total > max_tokens:
+        over = total - max_tokens
+        log.warning("Post-trim safety: still %d tokens over (%d > %d), dropping oldest", over, total, max_tokens)
+        # Drop from the oldest non-protected messages (start of result after system msgs)
+        sys_count = len([m for m in result if m.get("role") == "system"])
+        while over > 0 and len(result) > sys_count + 2:  # keep system + last_user minimum
+            oldest = result[sys_count]
+            ot = count_message_tokens(oldest)
+            result.pop(sys_count)
+            over -= ot
+        total = count_messages_tokens(result)
+        log.info("Post-trim safety: now %d messages, %d tokens", len(result), total)
+
+    log.info("Trimmed: %d -> %d messages (protected newest)", len(messages), len(result))
     return result
 
-# --- Per-session token tracking ---
 def _track_session_tokens(session_key: str, input_tokens: int, output_tokens: int = 0, count_req: bool = True):
     """Update per-session token counters. count_req=False for output-only updates."""
     if session_key not in session_tokens:
@@ -820,6 +1003,7 @@ def _track_session_tokens(session_key: str, input_tokens: int, output_tokens: in
     st["out"] += output_tokens
     if count_req:
         st["reqs"] += 1
+    st["last_active"] = time.strftime("%H:%M:%S", time.localtime())
     st["max_ctx"] = max(st["max_ctx"], input_tokens)
 
 def explain_status(status: str, detail: str = "") -> str:
@@ -857,84 +1041,214 @@ def explain_status(status: str, detail: str = "") -> str:
 # --- Cross-session knowledge sharing ---
 import re as _re
 
-def extract_knowledge(session_id: str, session_key: str, messages: list) -> list:
-    """Deterministic extraction with quality gates.
-    
-    Quality gates:
-    - Keys must be >= 4 chars, not common English words
-    - Values must be >= 20 chars (meaningful statement, not fragment)
-    - Max 5 items per batch
+
+async def _call_lm_4b(prompt: str, system: str = "Return only valid JSON. No markdown, no commentary.", temperature: float = 0.3, max_tokens: int = 512) -> str:
+    """Single 4B LM Studio call. Returns raw text content or empty string on failure."""
+    import httpx as _h
+    try:
+        async with _h.AsyncClient() as cl:
+            r = await cl.post(LM_STUDIO_URL + "/chat/completions",
+                json={"model": LM_STUDIO_MODEL, "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt}],
+                    "temperature": temperature, "max_tokens": max_tokens}, timeout=30)
+            if r.status_code != 200:
+                return ""
+            t = r.json()["choices"][0]["message"]["content"].strip()
+            if t.startswith("```"):
+                t = t.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            return t
+    except Exception as e:
+        log.debug("_call_lm_4b failed: %s", e)
+        return ""
+
+
+async def _verify_knowledge_quality(items: list) -> list:
+    """Ask the 4B model to judge quality of extracted knowledge items.
+
+    Returns a list of booleans: True = good quality, False = bad.
     """
-    _STOP_KEYS = {
-        "that","this","it","was","are","be","would","could","should","can","will",
-        "have","has","had","do","does","did","not","no","yes","ok","okay","fine",
-        "good","great","the","and","for","with","from","your","what","when","where",
-        "which","how","about","there","here","been","being","were","all","any","but",
-        "its","you","our","their","then","than","into","over","under","also","just",
-        "only","some","such","more","most","other","out","use","using","used","make",
-        "made","get","got","one","two","see","now","new","old","set","add","run",
-        "test","tests","file","line","code","error","warn","info","debug","http",
-        "true","false","null","none","void","return","import","class","def","if",
-    }
-    def _valid_key(k):
-        k = k.strip().lower()
-        if len(k) < 4 or len(k) > 60: return False
-        if k in _STOP_KEYS: return False
-        if not _re.search(r'[a-z]', k): return False
-        if len(k) < 6 and not _re.search(r'\d', k): return False
-        return True
-    def _valid_value(v):
-        v = v.strip().rstrip('.')
-        if len(v) < 20 or len(v) > 300: return False
-        if len(v.split()) < 3: return False
-        if not _re.search(r'[a-zA-Z]{3,}', v): return False
-        return True
-    items = []
-    seen = set()
-    for m in messages:
-        role = m.get("role", "")
-        if role not in ("user", "assistant"): continue
-        content = m.get("content") or ""
-        if isinstance(content, list):
-            content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
-        if not content: continue
-        for match in _re.finditer(
-            r'\b([a-zA-Z_][a-zA-Z0-9_]{3,}(?:\s+[a-zA-Z_][a-zA-Z0-9_]{2,}){0,3})\s+(?:is|equals|is set to|set to|\=|should be)\s+(.{20,300})',
-            content, _re.IGNORECASE
-        ):
-            k = match.group(1).strip().lower()
-            v = match.group(2).strip().rstrip('.')
-            if _valid_key(k) and _valid_value(v):
-                dedup = (k, v[:80])
-                if dedup not in seen:
-                    seen.add(dedup)
-                    items.append({"domain": "fact", "key": k, "value": v[:250], "importance": 5})
-        for match in _re.finditer(
-            r'(?:decided to|going with|will use|chose|chooses|decided on)\s+(.{20,200})',
-            content, _re.IGNORECASE
-        ):
-            v = match.group(1).strip().rstrip('.')
-            if _valid_value(v):
-                k = v[:50].lower()
-                if _valid_key(k):
-                    dedup = ("decision", v[:80])
-                    if dedup not in seen:
-                        seen.add(dedup)
-                        items.append({"domain": "decision", "key": k, "value": v[:250], "importance": 7})
-        for match in _re.finditer(
-            r'\b(port|url|model|threshold|limit|timeout|max_\w+|min_\w+|pool_size|batch_size)\b\s*(?:is|\=|set to|:)?\s*([\w./:=\-]{2,100})',
-            content, _re.IGNORECASE
-        ):
-            k = match.group(1).strip().lower()
-            v = match.group(2).strip()
-            if len(v) >= 2 and len(v) <= 100:
-                dedup = (k, v)
-                if dedup not in seen:
-                    seen.add(dedup)
-                    items.append({"domain": "config", "key": k, "value": v[:200], "importance": 8})
-    return items[:5]
+    if not items:
+        return []
+    desc = "\n".join(
+        "{i}. domain={d}, key={k}, value={v}, importance={imp}".format(
+            i=i+1, d=it["domain"], k=repr(it["key"]), v=repr(it["value"]), imp=it["importance"]
+        ) for i, it in enumerate(items)
+    )
+    prompt = (
+        "You are a quality gate for a knowledge base. For each item below, judge whether it is "
+        "USEFUL and WELL-FORMED for a long-running AI agent cross-session memory.\n\n"
+        "Criteria for GOOD quality:\n"
+        "- key is a meaningful identifier (2-5 descriptive words, not a single common word)\n"
+        "- value is a complete semantic statement (not a fragment, not a single word)\n"
+        "- value contains actionable or referenceable information\n"
+        "- no artifacts (trailing pipes, backticks, markdown remnants)\n\n"
+        "Criteria for BAD quality:\n"
+        "- key is a single common word (e.g. and, which, table, limit)\n"
+        "- value is a word fragment or incomplete phrase\n"
+        "- value contains formatting artifacts\n"
+        "- value is trivially obvious or adds no information\n\n"
+        "Items to judge:\n" + desc + "\n\n"
+        "Return a JSON array of booleans, one per item, in order. true=good, false=bad."
+    )
+    raw = await _call_lm_4b(prompt, system="Return only a JSON array of booleans.", temperature=0.1, max_tokens=100)
+    if not raw:
+        return [True] * len(items)
+    try:
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        verdicts = json.loads(raw)
+        if not isinstance(verdicts, list):
+            return [True] * len(items)
+        while len(verdicts) < len(items):
+            verdicts.append(True)
+        return [bool(v) for v in verdicts[:len(items)]]
+    except (json.JSONDecodeError, IndexError):
+        return [True] * len(items)
 
 
+async def _regenerate_knowledge_item(item: dict, context: str) -> dict | None:
+    """Ask the 4B to regenerate a single knowledge item with better quality.
+
+    Returns the improved item dict or None if regeneration fails / model says discard.
+    """
+    prompt = (
+        "The following knowledge item was rejected for poor quality. Regenerate it as a "
+        "proper, meaningful knowledge entry.\n\n"
+        f"Rejected item: domain={item['domain']}, key={repr(item['key'])}, value={repr(item['value'])}\n\n"
+        f"Context it was extracted from:\n{context[:1500]}\n\n"
+        "Return a JSON object with keys: domain, key, value, importance.\n"
+        "Rules: key must be 2-5 descriptive words. value must be a complete semantic sentence (30-200 chars). "
+        "No fragments, no single words, no artifacts. If truly not worth preserving, return {\"discard\": true}."
+    )
+    raw = await _call_lm_4b(prompt, system="Return only a JSON object.", temperature=0.3, max_tokens=256)
+    if not raw:
+        return None
+    try:
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        obj = json.loads(raw)
+        if not isinstance(obj, dict):
+            return None
+        if obj.get("discard"):
+            return None
+        d = obj.get("domain", "fact")
+        k = (obj.get("key") or "").strip().lower()
+        v = (obj.get("value") or "").strip()
+        imp = min(10, max(1, int(obj.get("importance", 5))))
+        if len(k) < 4 or len(k) > 80:
+            return None
+        if len(v) < 20 or len(v) > 300:
+            return None
+        if d not in ("fact", "decision", "config", "preference"):
+            d = "fact"
+        return {"domain": d, "key": k, "value": v, "importance": imp}
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+async def _fire_and_forget_extract(session_id: str, session_key: str, messages: list):
+    """Background knowledge extraction - never blocks the request path."""
+    try:
+        k_items = await extract_knowledge(session_id, session_key, messages)
+        if k_items:
+            await store_knowledge(k_items, session_id, session_key)
+    except Exception as e:
+        log.warning("Knowledge extraction (background) failed: %s", e)
+
+async def extract_knowledge(session_id: str, session_key: str, messages: list) -> list:
+    """Async 4B-based knowledge extraction with quality orchestration.
+
+    Flow:
+    1. Generate: 4B extracts 0-3 knowledge items from the conversation
+    2. Verify: 4B judges quality of each item (good/bad)
+    3. Retry: bad items are regenerated by 4B with explicit quality instructions
+    4. Re-verify: regenerated items are checked again
+    5. Delete: items that fail quality twice are discarded (never stored)
+
+    Only items that pass quality verification are returned for storage.
+    """
+    if not pool or not messages:
+        return []
+    relevant = [m for m in messages if m.get("role") in ("user", "assistant")][-6:]
+    if not relevant:
+        return []
+    parts = []
+    for m in relevant:
+        c = m.get("content") or ""
+        if isinstance(c, list):
+            c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+        if c:
+            parts.append(m["role"] + ": " + c[:800])
+    if not parts:
+        return []
+    context = "\n".join(parts)
+
+    # --- Step 1: Generate ---
+    gen_prompt = (
+        "Extract 0-3 knowledge items worth preserving across sessions. "
+        "Return a JSON array of {domain, key, value, importance}.\n"
+        "domain: fact|decision|config|preference\n"
+        "key: 2-5 descriptive words (not a single common word)\n"
+        "value: 30-200 chars, a complete semantic statement (not a fragment)\n"
+        "importance: 5-10\n"
+        "Return [] if nothing is worth preserving.\n\n" + context
+    )
+    raw = await _call_lm_4b(gen_prompt, temperature=0.3, max_tokens=512)
+    if not raw:
+        return []
+    try:
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+        items = json.loads(raw)
+        if not isinstance(items, list):
+            return []
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+    # Basic structural filter
+    candidates = []
+    for it in items[:3]:
+        if not isinstance(it, dict):
+            continue
+        d = it.get("domain", "fact")
+        k = (it.get("key") or "").strip().lower()
+        v = (it.get("value") or "").strip()
+        imp = min(10, max(1, int(it.get("importance", 5))))
+        if len(k) < 4 or len(k) > 80:
+            continue
+        if len(v) < 20 or len(v) > 300:
+            continue
+        if d not in ("fact", "decision", "config", "preference"):
+            d = "fact"
+        candidates.append({"domain": d, "key": k, "value": v, "importance": imp})
+
+    if not candidates:
+        return []
+
+    # --- Step 2: Verify quality ---
+    verdicts = await _verify_knowledge_quality(candidates)
+
+    # --- Step 3-5: Retry bad items, re-verify, delete if still bad ---
+    final = []
+    for i, item in enumerate(candidates):
+        if verdicts[i]:
+            final.append(item)
+        else:
+            log.info("Knowledge item failed quality check (attempt 1), regenerating: key=%s", item["key"])
+            regenerated = await _regenerate_knowledge_item(item, context)
+            if regenerated is None:
+                log.info("Knowledge item discarded after failed regeneration: key=%s", item["key"])
+                continue
+            re_verdicts = await _verify_knowledge_quality([regenerated])
+            if re_verdicts[0]:
+                log.info("Knowledge item passed quality check on retry: key=%s", regenerated["key"])
+                final.append(regenerated)
+            else:
+                log.info("Knowledge item discarded after failed re-verification: key=%s", regenerated["key"])
+                continue
+
+    return final
 async def store_knowledge(items: list, source_session: str, source_key: str) -> int:
     """Upsert knowledge items into the global knowledge table."""
     if not pool or not items:
@@ -995,7 +1309,7 @@ def _already_in_context(text: str, blob: str) -> bool:
     return present >= max(1, int(0.6 * len(uniq)))
 
 
-async def fetch_task_memory(session_id: str, messages: list, wm_budget: int = 800, mem_budget: int = 1200, total_budget: int = 2000) -> str:
+async def fetch_task_memory(session_id: str, messages: list, task_uuid: str = None, wm_budget: int = 800, mem_budget: int = 1200, total_budget: int = 2000) -> str:
     """Section 13/14: per-task durable memory as a SMALL CONDITIONAL supplement.
 
     Final-architecture rules:
@@ -1009,8 +1323,10 @@ async def fetch_task_memory(session_id: str, messages: list, wm_budget: int = 80
     """
     if not pool:
         return ""
-    task_uuid = await _resolve_task(session_id, create=False)
     if task_uuid is None:
+        task_uuid = await _resolve_task(session_id, create=False)
+        if task_uuid is None:
+            return ""
         return ""
     blob = _context_blob(messages)
     terms = _extract_terms(messages)
@@ -1018,7 +1334,37 @@ async def fetch_task_memory(session_id: str, messages: list, wm_budget: int = 80
     total = 0
 
     # 1. Working memory (current working state) - inject only if not already in context
-    wrow = await pool.fetchrow("SELECT content FROM proxy.working_memory WHERE task_id=$1", task_uuid)
+    # 1+1b+2. Working memory + session summary + durable memories (parallel)
+    async def _fetch_rel_mem():
+        if terms:
+            return await pool.fetch(
+                "SELECT id, key, value FROM proxy.memories WHERE task_id=$1 AND active=true "
+                "AND (key ILIKE ANY($2) OR value ILIKE ANY($2)) "
+                "ORDER BY importance DESC, updated_at DESC LIMIT 8",
+                task_uuid, ["%" + t + "%" for t in list(terms)[:20]]
+            )
+        return []
+    
+    wrow, summary, crit, rel = await asyncio.gather(
+        pool.fetchrow("SELECT content FROM proxy.working_memory WHERE task_id=$1", task_uuid),
+        _fetch_session_summary(task_uuid, budget=600, session_key=session_id),
+        pool.fetch("SELECT id, key, value FROM proxy.memories WHERE task_id=$1 AND active=true AND importance=10 ORDER BY updated_at DESC LIMIT 5", task_uuid),
+        _fetch_rel_mem(),
+        return_exceptions=True
+    )
+    if isinstance(wrow, Exception):
+        log.warning("Working memory fetch failed: %s", wrow)
+        wrow = None
+    if isinstance(summary, Exception):
+        log.warning("Session summary fetch failed: %s", summary)
+        summary = ""
+    if isinstance(crit, Exception):
+        log.warning("Critical memory fetch failed: %s", crit)
+        crit = []
+    if isinstance(rel, Exception):
+        log.warning("Relevant memory fetch failed: %s", rel)
+        rel = []
+    
     wm_text = (wrow["content"].strip() if wrow and wrow["content"] else "")
     if wm_text and not _already_in_context(wm_text, blob):
         line = "WORKING MEMORY: " + wm_text
@@ -1026,24 +1372,15 @@ async def fetch_task_memory(session_id: str, messages: list, wm_budget: int = 80
         if t <= wm_budget and total + t <= total_budget:
             parts.append(line)
             total += t
-
-    # 1b. Session summary (from trimmed context) - inject if not already in context
-    summary = await _fetch_session_summary(task_uuid, budget=600)
+    
     if summary and not _already_in_context(summary, blob):
         line = "SESSION SUMMARY: " + summary
         t = count_tokens(line)
         if t <= 600 and total + t <= total_budget:
             parts.append(line)
             total += t
-
-    # 2. Durable memories: CRITICAL (small safety net) + relevant HIGH
-    rows = []
-    if total < total_budget:
-        crit = await pool.fetch("SELECT id, key, value FROM proxy.memories WHERE task_id=$1 AND active=true AND importance=10 ORDER BY updated_at DESC LIMIT 5", task_uuid)
-        rel = []
-        if terms:
-            rel = await pool.fetch("SELECT id, key, value FROM proxy.memories WHERE task_id=$1 AND active=true AND (key ILIKE ANY($2) OR value ILIKE ANY($2)) ORDER BY importance DESC, updated_at DESC LIMIT 8", task_uuid, ["%" + t + "%" for t in list(terms)[:20]])
-        rows = list(crit) + list(rel)
+    
+    rows = list(crit) + list(rel)
 
     seen = set()
     injected_ids: list = []
@@ -1232,6 +1569,7 @@ async def api_sessions():
             "tokens_out": st["out"],
             "requests": st["reqs"],
             "max_context": st["max_ctx"],
+            "last_active": st.get("last_active", ""),
         })
     sessions.sort(key=lambda s: s["requests"], reverse=True)
     return sessions
@@ -1316,7 +1654,7 @@ async def chat_completions(request: Request):
         return JSONResponse({"error": "No messages provided"}, status_code=400)
 
     # --- Session key: provider identity + content fingerprint ---
-    x_sid = request.headers.get('X-Session-ID', 'unknown')
+    x_sid = request.headers.get('X-Session-ID') or await _get_goose_session_id()
     session_key = make_session_key(x_sid, messages)
 
     # Memory job (uses provider-level session id, not content-scoped)
@@ -1347,35 +1685,36 @@ async def chat_completions(request: Request):
     tm = ""
     kn = ""
 
-    # --- Cross-session knowledge injection ---
-    try:
-        kn = await fetch_relevant_knowledge(messages, max_items=5, max_tokens=400)
-        if kn:
-            has_system = any(m.get("role") == "system" for m in built)
-            if has_system:
-                for i, m in enumerate(built):
-                    if m.get("role") == "system":
-                        built[i] = {**m, "content": m.get("content", "") + "\n\n" + kn}
-                        break
-            else:
-                built.insert(0, {"role": "system", "content": kn})
-    except Exception as e:
-        log.warning("Knowledge injection failed: %s", e)
-
-    # --- Per-task durable memory injection (section 13) ---
-    try:
-        tm = await fetch_task_memory(x_sid, messages)
-        if tm:
-            has_system = any(m.get("role") == "system" for m in built)
-            if has_system:
-                for i, m in enumerate(built):
-                    if m.get("role") == "system":
-                        built[i] = {**m, "content": m.get("content", "") + "\"\"" + tm}
-                        break
-            else:
-                built.insert(0, {"role": "system", "content": tm})
-    except Exception as e:
-        log.warning("Task memory injection failed: %s", e)
+    # --- Knowledge + memory injection (parallel) ---
+    kn, tm = await asyncio.gather(
+        fetch_relevant_knowledge(messages, max_items=5, max_tokens=400),
+        fetch_task_memory(x_sid, messages, task_uuid=task_uuid),
+        return_exceptions=True
+    )
+    if isinstance(kn, Exception):
+        log.warning("Knowledge injection failed: %s", kn)
+        kn = ""
+    if kn:
+        has_system = any(m.get("role") == "system" for m in built)
+        if has_system:
+            for i, m in enumerate(built):
+                if m.get("role") == "system":
+                    built[i] = {**m, "content": m.get("content", "") + "\n\n" + kn}
+                    break
+        else:
+            built.insert(0, {"role": "system", "content": kn})
+    if isinstance(tm, Exception):
+        log.warning("Task memory injection failed: %s", tm)
+        tm = ""
+    if tm:
+        has_system = any(m.get("role") == "system" for m in built)
+        if has_system:
+            for i, m in enumerate(built):
+                if m.get("role") == "system":
+                    built[i] = {**m, "content": m.get("content", "") + "\n\n" + tm}
+                    break
+        else:
+            built.insert(0, {"role": "system", "content": tm})
 
     # --- Injection / utilization instrumentation (lightweight, no DB) ---
     _record_injection(x_sid, tm, kn)
@@ -1391,14 +1730,8 @@ async def chat_completions(request: Request):
     metrics["tokens_in_total"] += input_tokens
     _track_session_tokens(session_key, input_tokens)
 
-    # --- Cross-session knowledge extraction (deterministic, async) ---
-    try:
-        k_items = extract_knowledge(x_sid, session_key, messages)
-        if k_items:
-            import asyncio
-            asyncio.ensure_future(store_knowledge(k_items, x_sid, session_key))
-    except Exception as e:
-        log.warning("Knowledge extraction failed: %s", e)
+    # --- Cross-session knowledge extraction (fire-and-forget, non-blocking) ---
+    asyncio.ensure_future(_fire_and_forget_extract(x_sid, session_key, messages))
 
     # Proxy calculates output budget from post-trim input (authoritative)
     # Goose's max_tokens is based on pre-trim input - ignore it
@@ -1423,16 +1756,57 @@ async def chat_completions(request: Request):
     else:
         return await forward_to_vllm(vllm_body, input_tokens, session_key)
 
+
+async def _vllm_health_loop():
+    """Ping vLLM /models every 60s to track availability."""
+    global vllm_alive
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(VLLM_URL + "/models")
+                if resp.status_code == 200:
+                    if not vllm_alive:
+                        log.info("vLLM is BACK (was dead)")
+                    vllm_alive = True
+                else:
+                    if vllm_alive:
+                        log.warning("vLLM returned %d - marking dead", resp.status_code)
+                    vllm_alive = False
+        except Exception as e:
+            if vllm_alive:
+                log.warning("vLLM unreachable: %s - marking dead", e)
+            vllm_alive = False
+        await asyncio.sleep(60)
+
 async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
     global metrics
+    if not vllm_alive:
+        metrics["requests_error"] += 1
+        log.warning("vLLM is down - rejecting request early")
+        return JSONResponse({"error": {"message": "vLLM is not available (health check failed). Start vLLM and retry."}}, status_code=503)
     try:
         async with httpx.AsyncClient(timeout=300) as client:
             resp = await client.post(VLLM_URL + "/chat/completions", json=vllm_body)
             if resp.status_code != 200:
-                metrics["requests_error"] += 1
-                log.error("vLLM error %d: %s", resp.status_code, resp.text[:500])
-                _record_call(session_key, input_tokens, 0, f"vllm_{resp.status_code}", VLLM_MODEL, False, resp.text[:300])
-                return JSONResponse({"error": {"message": "vLLM " + str(resp.status_code), "explanation": explain_status(f"vllm_{resp.status_code}", resp.text[:300])}}, status_code=resp.status_code)
+                # BUG 4 fix: on 400 (context too long), re-trim more aggressively and retry once
+                if resp.status_code == 400 and "context" in resp.text.lower():
+                    log.warning("vLLM 400 (context length) - re-trimming and retrying")
+                    reduced_limit = int(input_tokens * 0.8)
+                    vllm_body["messages"] = trim_context(vllm_body["messages"], reduced_limit)
+                    new_input_tokens = count_messages_tokens(vllm_body["messages"])
+                    vllm_body["max_tokens"] = min(MAX_OUTPUT, MAX_CONTEXT - new_input_tokens - SAFETY_MARGIN)
+                    input_tokens = new_input_tokens
+                    resp = await client.post(VLLM_URL + "/chat/completions", json=vllm_body)
+                    if resp.status_code != 200:
+                        metrics["requests_error"] += 1
+                        log.error("vLLM retry also failed %d: %s", resp.status_code, resp.text[:500])
+                        _record_call(session_key, input_tokens, 0, f"vllm_{resp.status_code}", VLLM_MODEL, False, resp.text[:300])
+                        return JSONResponse({"error": {"message": "vLLM " + str(resp.status_code), "explanation": explain_status(f"vllm_{resp.status_code}", resp.text[:300])}}, status_code=resp.status_code)
+                else:
+                    metrics["requests_error"] += 1
+                    log.error("vLLM error %d: %s", resp.status_code, resp.text[:500])
+                    _record_call(session_key, input_tokens, 0, f"vllm_{resp.status_code}", VLLM_MODEL, False, resp.text[:300])
+                    return JSONResponse({"error": {"message": "vLLM " + str(resp.status_code), "explanation": explain_status(f"vllm_{resp.status_code}", resp.text[:300])}}, status_code=resp.status_code)
             data = resp.json()
             choices = data.get("choices", [])
             for choice in choices:
@@ -1471,8 +1845,15 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                 cont_msgs = list(vllm_body.get("messages", []))
                 cont_msgs.append({"role": "assistant", "content": partial})
                 cont_msgs.append({"role": "user", "content": "Continue from exactly where you left off. Do not repeat any content already provided. Resume the next word/sentence/code line."})
+                # Re-trim: messages grew with assistant response
+                cont_tokens = count_messages_tokens(cont_msgs)
+                if cont_tokens > MAX_INPUT:
+                    cont_msgs = trim_context(cont_msgs, MAX_INPUT)
+                    cont_tokens = count_messages_tokens(cont_msgs)
+                    log.info("Non-stream cont: re-trimmed to %d msgs (%d tok)", len(cont_msgs), cont_tokens)
                 cont_body = dict(vllm_body)
                 cont_body["messages"] = cont_msgs
+                cont_body["max_tokens"] = min(MAX_OUTPUT, MAX_CONTEXT - cont_tokens - SAFETY_MARGIN)
                 resp = await client.post(VLLM_URL + "/chat/completions", json=cont_body)
                 if resp.status_code != 200:
                     break
@@ -1635,7 +2016,16 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                         else:
                             cont_messages.append({"role": "assistant", "content": full_content or "(in progress)"})
                             cont_messages.append({"role": "user", "content": "You were interrupted before producing your answer. Now produce your complete final answer directly. Skip thinking and just give the response."})
+                        # Re-trim: messages grew with assistant response
+                        cont_tokens = count_messages_tokens(cont_messages)
+                        if cont_tokens > MAX_INPUT:
+                            cont_messages = trim_context(cont_messages, MAX_INPUT)
+                            cont_tokens = count_messages_tokens(cont_messages)
+                            log.info("Stream cont: re-trimmed to %d msgs (%d tok)", len(cont_messages), cont_tokens)
                         current_body = dict(vllm_body)
+                        current_body["messages"] = cont_messages
+                        current_body["max_tokens"] = min(MAX_OUTPUT, MAX_CONTEXT - cont_tokens - SAFETY_MARGIN)
+                        continue
                         current_body["messages"] = cont_messages
                         current_body["max_tokens"] = MAX_OUTPUT
                         continue
@@ -1670,6 +2060,56 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             _record_call(session_key, input_tokens, total_output_tokens, "error", VLLM_MODEL, True, str(e)[:300])
             yield "data: [DONE]\n\n"
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+async def _get_goose_session_id() -> str:
+    """Read the most recent active session ID from Goose sessions SQLite DB (persistent connection)."""
+    global sqlite_conn
+    try:
+        if sqlite_conn is None:
+            sqlite_conn = await aiosqlite.connect(GOOSE_SESSIONS_DB)
+        cursor = await sqlite_conn.execute(
+            "SELECT id FROM sessions WHERE archived_at IS NULL ORDER BY updated_at DESC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row:
+            return row[0]
+    except Exception as e:
+        log.debug("Goose session lookup failed: %s", e)
+        try:
+            if sqlite_conn:
+                await sqlite_conn.close()
+            sqlite_conn = None
+        except Exception:
+            pass
+    return "unknown"
+
+async def _get_goose_session_info(session_id: str) -> Optional[dict]:
+    """Fetch full session metadata from Goose SQLite DB by session ID.
+    
+    Returns dict with: id, name, session_type, working_dir, provider_name
+    or None if not found.
+    """
+    try:
+        db = await aiosqlite.connect(GOOSE_SESSIONS_DB)
+        cursor = await db.execute(
+            "SELECT id, name, session_type, working_dir, provider_name FROM sessions WHERE id = $1",
+            (session_id,)
+        )
+        row = await cursor.fetchone()
+        await db.close()
+        if row:
+            return {
+                "id": row[0],
+                "name": row[1] or "",
+                "session_type": row[2] or "",
+                "working_dir": row[3] or "",
+                "provider_name": row[4] or "",
+            }
+    except Exception as e:
+        log.debug("Goose session info lookup failed for %s: %s", session_id, e)
+    return None
 
 async def _enqueue_memory_job(session_id, user_content):
     if os.environ.get("CTXGATE_MEMORY_WORKER", "1") == "0":
@@ -1707,14 +2147,37 @@ async def _enqueue_memory_job(session_id, user_content):
     except Exception as e:
         log.warning('Memory job enqueue failed %s: %s', session_id, e)
 async def _resolve_task(task_ref: str, create: bool = False):
-    row = await pool.fetchrow("SELECT id FROM proxy.tasks WHERE session_id = $1", task_ref)
+    """Resolve or create a proxy task, enriching with Goose DB session metadata.
+    
+    Uses exact columns from Goose sessions DB: id, name, session_type, working_dir, provider_name.
+    This ensures each Goose session gets its own properly-named proxy task.
+    """
+    row = await pool.fetchrow("SELECT id, name FROM proxy.tasks WHERE session_id = $1", task_ref)
     if row:
+        # Update metadata if it's missing (lazy enrichment)
+        if not row["name"]:
+            info = await _get_goose_session_info(task_ref)
+            if info:
+                await pool.execute(
+                    "UPDATE proxy.tasks SET name=$2, session_type=$3, working_dir=$4, provider_name=$5, updated_at=now() WHERE id=$1",
+                    row["id"], info["name"], info["session_type"], info["working_dir"], info["provider_name"]
+                )
         return str(row["id"])
     if not create:
         return None
+    # Fetch Goose DB metadata for enrichment
+    info = await _get_goose_session_info(task_ref)
+    name = info["name"] if info else ""
+    session_type = info["session_type"] if info else ""
+    working_dir = info["working_dir"] if info else ""
+    provider_name = info["provider_name"] if info else ""
     await pool.execute(
-        "INSERT INTO proxy.tasks (session_id) VALUES ($1) ON CONFLICT (session_id) DO UPDATE SET updated_at = now()",
-        task_ref,
+        "INSERT INTO proxy.tasks (session_id, name, session_type, working_dir, provider_name) VALUES ($1,$2,$3,$4,$5) "
+        "ON CONFLICT (session_id) DO UPDATE SET name=COALESCE(EXCLUDED.name, proxy.tasks.name), "
+        "session_type=COALESCE(EXCLUDED.session_type, proxy.tasks.session_type), "
+        "working_dir=COALESCE(EXCLUDED.working_dir, proxy.tasks.working_dir), "
+        "provider_name=COALESCE(EXCLUDED.provider_name, proxy.tasks.provider_name), updated_at=now()",
+        task_ref, name, session_type, working_dir, provider_name,
     )
     row = await pool.fetchrow("SELECT id FROM proxy.tasks WHERE session_id = $1", task_ref)
     return str(row["id"])
@@ -2159,7 +2622,7 @@ select { background: var(--surface2); color: var(--text); border: 1px solid var(
     <h2>Recent Calls</h2>
     <div style="max-height: 250px; overflow-y: auto;">
       <table id="calls-table">
-        <thead><tr><th>Time</th><th>Session</th><th>In</th><th>Out</th><th>Status</th><th>Stream</th></tr></thead>
+        <thead><tr><th>Time</th><th>Session</th><th>In</th><th>Out</th><th>Lat</th><th>Status</th><th>Stream</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -2171,7 +2634,7 @@ select { background: var(--surface2); color: var(--text); border: 1px solid var(
     <h2>Sessions</h2>
     <div style="max-height: 300px; overflow-y: auto;">
       <table id="sessions-table">
-        <thead><tr><th>Key</th><th>Provider</th><th>Req</th><th>Tokens In</th><th>Tokens Out</th><th>Max Ctx</th></tr></thead>
+        <thead><tr><th>Session</th><th>Req</th><th>In</th><th>Out</th><th>AvgOut</th><th>MaxCtx</th><th>Last</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -2301,7 +2764,7 @@ async function refresh() {
     const cards = [
       { label: 'Requests', value: m.requests_total, sub: m.requests_ok + ' ok / ' + m.requests_error + ' err', cls: 'blue' },
       { label: 'Tokens In', value: fmtNum(m.tokens_in_total), sub: 'max ctx: ' + fmtNum(m.max_context_seen), cls: '' },
-      { label: 'Tokens Out', value: fmtNum(m.tokens_out_total), sub: 'total generated', cls: 'green' },
+      { label: 'Tokens Out', value: fmtNum(m.tokens_out_total), sub: 'avg ' + fmtNum(m.requests_total ? Math.round(m.tokens_out_total/m.requests_total) : 0) + '/req', cls: 'green' },
       { label: 'Trim Events', value: m.trim_events, sub: 'prefix inv: ' + m.prefix_invalidations, cls: m.trim_events > 0 ? 'yellow' : '' },
       { label: 'Sessions', value: sessions.length, sub: 'active tracked', cls: 'blue' },
       { label: 'Uptime', value: m.uptime_human, sub: 'since ' + m.started_human, cls: '' },
@@ -2310,7 +2773,7 @@ async function refresh() {
       '<div class="card ' + c.cls + '"><div class="label">' + c.label + '</div><div class="value">' + c.value + '</div><div class="sub">' + c.sub + '</div></div>'
     ).join('');
 
-    const labels = calls.map(c => c.ts_human);
+    const labels = calls.slice(0, 10).map(c => c.ts_human);
     const inData = calls.map(c => c.in);
     const outData = calls.map(c => c.out);
     setChart('tokenChart', {
@@ -2328,7 +2791,7 @@ async function refresh() {
       '<tr><td>' + c.ts_human + '</td><td>' + esc(c.session) + '</td><td>' + fmtNum(c.in) + '</td><td>' + fmtNum(c.out) + '</td><td>' + badge(c.status) + '</td><td>' + (c.stream ? 'yes' : 'no') + '</td></tr>'
     ).join('');
 
-    document.querySelector('#sessions-table tbody').innerHTML = sessions.map(s =>
+    document.querySelector('#sessions-table tbody').innerHTML = sessions.slice(0, 10).map(s =>
       '<tr><td>' + esc(s.key) + '</td><td>' + esc(s.provider) + '</td><td>' + s.requests + '</td><td>' + fmtNum(s.tokens_in) + '</td><td>' + fmtNum(s.tokens_out) + '</td><td>' + fmtNum(s.max_context) + '</td></tr>'
     ).join('') || '<tr><td colspan="6" style="color:var(--text2)">No sessions yet</td></tr>';
 
@@ -2459,7 +2922,7 @@ function renderMemories(a) {
   const recent = mem.recent || [];
   const sel = document.createElement('select');
   sel.id = 'mem-session';
-  sel.innerHTML = '<option value="">All sessions</option>' + (a.sessions || []).map(s => '<option value="' + esc(s) + '">' + esc(s) + '</option>').join('');
+  sel.innerHTML = '<option value="">All sessions</option>' + Object.keys(a.sessions || {}).map(s => '<option value="' + esc(s) + '">' + esc(s) + '</option>').join('');
   el.innerHTML =
     '<div class="mini-grid" style="margin-bottom:12px">' +
       '<div class="mini-card blue"><div class="label">Total</div><div class="value">' + (mem.total || 0) + '</div></div>' +
