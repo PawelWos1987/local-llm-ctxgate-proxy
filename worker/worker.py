@@ -38,12 +38,25 @@ MAX_ATTEMPTS = int(os.environ.get("CTXGATE_WORKER_MAX_ATTEMPTS", "3"))
 # Outage TTL: how long to keep retrying before marking jobs failed (seconds)
 OUTAGE_TTL = float(os.environ.get("CTXGATE_WORKER_OUTAGE_TTL", "1800"))
 # Base URL for model management endpoints (derived from LM_URL by default)
-BASE_URL = os.environ.get("CTXGATE_LM_BASE", LM_URL.rsplit("/v1/", 1)[0])
+# Derive base URL: strip /v1/chat/completions or /v1 suffix
+if "CTXGATE_LM_BASE" in os.environ:
+    BASE_URL = os.environ["CTXGATE_LM_BASE"]
+else:
+    _u = LM_URL
+    if _u.endswith("/chat/completions"):
+        _u = _u[:-len("/chat/completions")]
+    if _u.endswith("/v1"):
+        _u = _u[:-len("/v1")]
+    BASE_URL = _u
 # Section 18 generation settings (established for this 4B deployment)
 TEMP = 0.7
 MIN_P = 0.05
 TOP_P = 0.9
 MAX_TOKENS = int(os.environ.get("CTXGATE_WORKER_MAX_TOKENS", "512"))
+# Quality-check settings (self-review loop)
+QC_TEMP = 0.1
+QC_MAX_TOKENS = 256
+QC_MAX_RETRIES = 1  # 1 retry after initial generation; if bad again -> discard
 # Compact payload budget (section 8: ~500-2000 input tokens)
 EVENT_EXCERPT_CHARS = 2500
 WM_EXCERPT_CHARS = 1500
@@ -61,17 +74,18 @@ LOCK_TTL = float(os.environ.get("CTXGATE_WORKER_LOCK_TTL", "30"))  # heartbeat s
 # --- Section 15: LM Studio SYSTEM PROMPT (configured once; sent as system role) ---
 SYSTEM_PROMPT = (
     "You are the durable-memory worker for a long-running software engineering agent.\n\n"
-    "Your only job is to extract and maintain information that the main 27B agent will need "
-    "after the current conversation context is no longer available.\n\n"
-    "Read the current task state and the new event. Preserve only durable, useful information: "
+    "Your job is to extract and maintain information that the main 27B agent will need "
+    "after the current conversation context is trimmed away by the rolling window.\n\n"
+    "Read the current task state and the new event. Extract ALL of the following when present: "
     "confirmed decisions, important findings, failed approaches, constraints, important TODOs, "
-    "important files, state changes, and stable facts. Do not solve the task, do not execute tools, "
-    "do not invent information, and do not repeat information that is already known unless the new "
-    "event corrects or supersedes it.\n\n"
-    "Prefer precise factual statements over summaries or explanations. Never guess. Only use "
-    "information explicitly present in the input. When a new fact contradicts an existing memory, "
-    "mark the old information as superseded through the requested memory action. When nothing "
-    "important changed, return no memory changes.\n\n"
+    "file paths being worked on, state changes, config values, architecture facts, and stable facts. "
+    "ALWAYS extract the current state and subtask. If the event mentions a file, tool, or command, "
+    "record it as a FILE or FACT memory. If the event shows progress on a task, record it as STATE.\n\n"
+    "Rules: Do not solve the task. Do not execute tools. Do not invent information not in the input. "
+    "Do not repeat information already in the working memory unless corrected. "
+    "When a new fact contradicts an existing memory, use SUPERSEDE. "
+    "Prefer MORE extraction over too little - the agent loses context and needs recovery data. "
+    "Only return empty memory_actions if the event is truly trivial (e.g. a greeting with no content).\n\n"
     "Return only the JSON structure defined by the configured output schema. No Markdown. No "
     "commentary. No explanation outside the JSON."
 )
@@ -267,8 +281,54 @@ async def call_4b(payload: str) -> dict:
     if r.status_code != 200:
         raise RuntimeError("LM Studio HTTP %d: %s" % (r.status_code, r.text[:200]))
     data = r.json()
+    if "choices" not in data or not data["choices"]:
+        raise RuntimeError("LM Studio response missing choices: %s" % str(data)[:200])
     content = data["choices"][0]["message"]["content"]
+    if not content:
+        raise RuntimeError("LM Studio returned empty content")
     return json.loads(content)
+
+
+# --- Quality check: 4B self-reviews its own output ---
+QUALITY_CHECK_PROMPT = (
+    "You are a strict quality reviewer for memory entries.\n"
+    "Evaluate the given memory actions for: factual accuracy, specificity, usefulness, no hallucination, no redundancy.\n"
+    "If ANY entry is vague, invented, redundant, or unhelpful, mark quality as bad.\n"
+    "Return only the JSON object. No commentary.\n"
+)
+
+QUALITY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["quality", "reason"],
+    "properties": {
+        "quality": {"type": "string", "enum": ["good", "bad"]},
+        "reason": {"type": "string"},
+    },
+}
+
+
+async def call_4b_quality_check(memory_actions: list) -> dict:
+    """Ask the 4B to self-review its generated memory entries."""
+    payload = "Evaluate these memory entries for quality:\n" + json.dumps(memory_actions, indent=2)
+    body = {
+        "model": LM_MODEL,
+        "messages": [
+            {"role": "system", "content": QUALITY_CHECK_PROMPT},
+            {"role": "user", "content": payload},
+        ],
+        "temperature": QC_TEMP,
+        "top_p": 0.9,
+        "max_tokens": QC_MAX_TOKENS,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "quality_check", "strict": True, "schema": QUALITY_SCHEMA},
+        },
+    }
+    r = await client.post(LM_URL, json=body, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError("Quality check HTTP %d: %s" % (r.status_code, r.text[:200]))
+    return json.loads(r.json()["choices"][0]["message"]["content"])
 
 
 # --- Deterministic dedupe / UPDATE / SUPERSEDE (section 12) ---
@@ -430,6 +490,26 @@ async def process_job(job) -> None:
         resp = await call_4b(payload)
         # Success: reset outage tracker
         outage_since = None
+
+        # --- Quality-check loop: self-review, retry once, discard if bad again ---
+        acts = resp.get("memory_actions", [])
+        if acts:  # only check if there are entries to review
+            for qc_attempt in range(QC_MAX_RETRIES + 1):  # 0=initial check, 1=retry check
+                qc = await call_4b_quality_check(acts)
+                if qc.get("quality") == "good":
+                    log.info("Quality check PASSED (attempt %d): %s", qc_attempt + 1, qc.get("reason", ""))
+                    break
+                log.warning("Quality check FAILED (attempt %d/%d): %s", qc_attempt + 1, QC_MAX_RETRIES + 1, qc.get("reason", ""))
+                if qc_attempt < QC_MAX_RETRIES:
+                    # Regenerate
+                    resp = await call_4b(payload)
+                    acts = resp.get("memory_actions", [])
+                else:
+                    # Bad again -> discard all entries
+                    log.info("Quality check failed twice -> discarding all memory entries")
+                    resp = {"memory_actions": [], "state_update": resp.get("state_update", {"changed": False, "current_state": None, "current_subtask": None})}
+                    acts = []
+
         if not validate_response(resp):
             raise ValueError("4B response failed schema validation")
         applied = await apply_memories(task_id, event_id or jid, resp)
@@ -606,6 +686,12 @@ async def main():
     _sd_notify("READY=1")
     pool = await asyncpg.create_pool(DSN, min_size=1, max_size=3)
     client = httpx.AsyncClient()
+    # Recover stuck 'processing' jobs (from previous crash/restart)
+    recovered = await pool.fetch(
+        "UPDATE proxy.memory_jobs SET status='pending', started_at=NULL WHERE status='processing' RETURNING id"
+    )
+    if recovered:
+        log.info("Recovered %d stuck 'processing' jobs back to 'pending'", len(recovered))
     log.info("4B memory worker started (model=%s, poll=%.1fs, max_attempts=%d, outage_ttl=%.0fs, concurrency=%d)",
              LM_MODEL, POLL, MAX_ATTEMPTS, OUTAGE_TTL, CONCURRENCY)
     try:

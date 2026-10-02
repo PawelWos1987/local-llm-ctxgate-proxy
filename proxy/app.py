@@ -626,7 +626,18 @@ def validate_config() -> None:
 async def lifespan(app: FastAPI):
     global pool, enc
     validate_config()
-    pool = await asyncpg.create_pool(DB_DSN, min_size=2, max_size=10)
+    # Retry DB connection (service starts independently, waits for PG)
+    import time as _time
+    for _attempt in range(60):
+        try:
+            pool = await asyncpg.create_pool(DB_DSN, min_size=2, max_size=10)
+            break
+        except Exception as _e:
+            log.warning("DB not ready (attempt %d/60): %s - retrying in 2s", _attempt + 1, _e)
+            await asyncio.sleep(2)
+            if _attempt == 59:
+                raise RuntimeError("Cannot connect to PostgreSQL after 120s") from _e
+    log.info("DB pool connected")
     tok_name = "cl100k_base (fallback)"
     try:
         enc = tokenizers.Tokenizer.from_file(QWEN_TOKENIZER_PATH)
@@ -1679,18 +1690,26 @@ async def chat_completions(request: Request):
     except Exception:
         pass
     
+    _t0 = time.monotonic()
     built = await build_context(messages, task_uuid=task_uuid, session_key=session_key)
+    _dt = (time.monotonic() - _t0) * 1000
+    if _dt > 50:
+        log.warning("SLOW: build_context %.0fms (msgs=%d)", _dt, len(messages))
 
     # Safe defaults: guard _record_injection against a fetch exception leaving tm/kn unset
     tm = ""
     kn = ""
 
     # --- Knowledge + memory injection (parallel) ---
+    _t0 = time.monotonic()
     kn, tm = await asyncio.gather(
         fetch_relevant_knowledge(messages, max_items=5, max_tokens=400),
         fetch_task_memory(x_sid, messages, task_uuid=task_uuid),
         return_exceptions=True
     )
+    _dt = (time.monotonic() - _t0) * 1000
+    if _dt > 50:
+        log.warning("SLOW: knowledge+memory fetch %.0fms", _dt)
     if isinstance(kn, Exception):
         log.warning("Knowledge injection failed: %s", kn)
         kn = ""
@@ -1725,7 +1744,11 @@ async def chat_completions(request: Request):
     session_fingerprints[session_key] = fp
 
     # Token tracking
+    _t0 = time.monotonic()
     input_tokens = count_messages_tokens(built)
+    _dt = (time.monotonic() - _t0) * 1000
+    if _dt > 50:
+        log.warning("SLOW: count_messages_tokens %.0fms (tokens=%d)", _dt, input_tokens)
     metrics["max_context_seen"] = max(metrics.get("max_context_seen", 0), input_tokens)
     metrics["tokens_in_total"] += input_tokens
     _track_session_tokens(session_key, input_tokens)
@@ -1751,10 +1774,15 @@ async def chat_completions(request: Request):
     if body.get("tool_choice"):
         vllm_body["tool_choice"] = body["tool_choice"]
 
+    _t0 = time.monotonic()
     if stream:
-        return await stream_to_vllm(vllm_body, input_tokens, session_key)
+        result = await stream_to_vllm(vllm_body, input_tokens, session_key)
     else:
-        return await forward_to_vllm(vllm_body, input_tokens, session_key)
+        result = await forward_to_vllm(vllm_body, input_tokens, session_key)
+    _dt = (time.monotonic() - _t0) * 1000
+    if _dt > 50:
+        log.warning("SLOW: vllm_call %.0fms (in=%d out=%d stream=%s)", _dt, input_tokens, 0, stream)
+    return result
 
 
 async def _vllm_health_loop():
@@ -1874,6 +1902,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             _record_call(session_key, input_tokens, output_tokens, "ok", VLLM_MODEL, False)
             data["usage"]["completion_tokens"] = output_tokens
             data["usage"]["total_tokens"] = input_tokens + output_tokens
+            data["usage"]["prompt_tokens"] = input_tokens
             # Normalize reasoning field: vLLM may use 'reasoning' instead of 'reasoning_content'
             for ch in data.get("choices", []):
                 msg = ch.get("message", {})
@@ -1915,6 +1944,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
     async def generate():
         global metrics
         total_output_tokens = 0
+        seg_cached_tokens = 0
         BUFFER_SIZE = 300
         buf = ""
         full_content = ""
@@ -1949,6 +1979,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                     if usage:
                                         if usage.get("completion_tokens"):
                                             seg_output_tokens = usage["completion_tokens"]
+                                        seg_cached_tokens = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
                                         usage["prompt_tokens"] = input_tokens
                                         usage["total_tokens"] = input_tokens + (usage.get("completion_tokens") or 0)
                                     choices = chunk.get("choices", [])
@@ -1982,6 +2013,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                 except (json.JSONDecodeError, ValueError):
                                     yield "data: " + data_str + "\n\n"
                     total_output_tokens += seg_output_tokens
+                    seg_cached_tokens = 0
                     if seg_content and full_content:
                         tail = full_content[-100:]
                         overlap = 0
@@ -2040,7 +2072,10 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                 yield "data: " + json.dumps(out_chunk) + "\n\n"
             final_chunk = {"id": "gen", "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason if finish_reason else "stop"}]}
             if total_output_tokens:
-                final_chunk["usage"] = {"prompt_tokens": input_tokens, "completion_tokens": total_output_tokens, "total_tokens": input_tokens + total_output_tokens}
+                _usage = {"prompt_tokens": input_tokens, "completion_tokens": total_output_tokens, "total_tokens": input_tokens + total_output_tokens}
+                _usage["prompt_tokens_details"] = {"cached_tokens": seg_cached_tokens}
+
+                final_chunk["usage"] = _usage
             yield "data: " + json.dumps(final_chunk) + "\n\n"
             yield "data: [DONE]\n\n"
             metrics["requests_ok"] += 1
@@ -2997,4 +3032,15 @@ setInterval(refresh, 5000);
 
 if __name__ == "__main__":
     import uvicorn
+    import socket as _sock
+
+    # Port-lock guard: if port is already bound, exit cleanly (no crash loop)
+    _s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+    try:
+        _s.bind(("127.0.0.1", PROXY_PORT))
+        _s.close()
+    except OSError:
+        log.error("Port %d already in use - another instance is running. Exiting cleanly.", PROXY_PORT)
+        sys.exit(0)
+
     uvicorn.run(app, host="127.0.0.1", port=PROXY_PORT, log_level="info", timeout_graceful_shutdown=30)
