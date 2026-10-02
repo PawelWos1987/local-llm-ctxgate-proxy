@@ -1275,8 +1275,7 @@ async def chat_completions(request: Request):
 
     # Proxy calculates output budget from post-trim input (authoritative)
     # Goose's max_tokens is based on pre-trim input - ignore it
-    vllm_window = 131072
-    max_tokens = min(MAX_OUTPUT, vllm_window - input_tokens - 512)
+    max_tokens = min(MAX_OUTPUT, MAX_CONTEXT - input_tokens - SAFETY_MARGIN)
     stream = body.get("stream", False)
     vllm_body = {
         "model": VLLM_MODEL,
