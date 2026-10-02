@@ -70,6 +70,8 @@ MEMORY_TTL_DAYS = int(os.environ.get("CTXGATE_MEMORY_TTL_DAYS", "90"))
 # so a replacement can take over. See acquire_single_instance_lock().
 LOCK_FILE = os.environ.get("CTXGATE_WORKER_LOCK", "/home/user/ctxproxy/worker/.worker.lock")
 LOCK_TTL = float(os.environ.get("CTXGATE_WORKER_LOCK_TTL", "30"))  # heartbeat staleness threshold (s)
+# --- Worker status file (lag + heartbeat) read by proxy + dashboard ---
+STATUS_FILE = os.environ.get("CTXGATE_WORKER_STATUS", "/home/user/ctxproxy/worker/.worker_status.json")
 
 # --- Section 15: LM Studio SYSTEM PROMPT (configured once; sent as system role) ---
 SYSTEM_PROMPT = (
@@ -142,6 +144,9 @@ running = True
 # Outage tracking
 outage_since: Optional[float] = None  # timestamp when outage started
 model_loaded: bool = False  # whether we've confirmed the model is loaded this session
+# Lag / completion tracking (source of the worker_lag_seconds metric)
+last_completion: Optional[float] = None  # time.time() of the last successful job
+jobs_done_total: int = 0
 
 
 def _sig(s, f):
@@ -462,7 +467,7 @@ async def process_job(job) -> None:
     - If past OUTAGE_TTL: mark as failed
     On other errors: use standard MAX_ATTEMPTS bounded retry
     """
-    global outage_since
+    global outage_since, last_completion, jobs_done_total
     jid, task_id, event_id = str(job["id"]), str(job["task_id"]), str(job["event_id"]) if job["event_id"] else None
     await pool.execute("UPDATE proxy.memory_jobs SET status='processing',started_at=now() WHERE id=$1", jid)
     try:
@@ -519,6 +524,9 @@ async def process_job(job) -> None:
             json.dumps(resp), int(job.get("attempts") or 0) + 1, jid,
         )
         log.info("JOB done %s (applied=%d)", jid, applied)
+        last_completion = time.time()
+        jobs_done_total += 1
+        _write_status()
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.PoolTimeout) as e:
         # LM Studio unreachable/outage - use TTL-based backoff
         now = time.time()
@@ -596,12 +604,38 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
+def _atomic_write(path: str, text: str) -> None:
+    """Atomic write: temp file + os.replace so readers never see a torn file."""
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError as e:
+        log.warning("atomic write failed for %s", path, e)
+
+
 def _write_lock(pid: int, ts: float) -> None:
     try:
-        with open(LOCK_FILE, "w") as f:
-            f.write("pid=%d\nheartbeat=%.3f\n" % (pid, ts))
+        _atomic_write(LOCK_FILE, "pid=%d\nheartbeat=%.3f\n" % (pid, ts))
     except OSError as e:
         log.warning("could not write lock file: %s", e)
+
+
+def _write_status() -> None:
+    """Write a machine-readable status file (lag + heartbeat) for proxy + dashboard."""
+    now = time.time()
+    lag = (now - last_completion) if last_completion else 0.0
+    data = {
+        "pid": os.getpid(),
+        "heartbeat": now,
+        "lag_seconds": round(lag, 2),
+        "last_completion": last_completion,
+        "jobs_done": jobs_done_total,
+    }
+    _atomic_write(STATUS_FILE, json.dumps(data))
 
 
 def _read_lock():
@@ -631,9 +665,17 @@ def _sd_notify(msg: str) -> None:
 
 
 def _heartbeat() -> None:
-    if lock_fd is not None:
-        _write_lock(os.getpid(), time.time())
-        _sd_notify("WATCHDOG=1")
+    global running
+    if lock_fd is None:
+        return
+    _write_lock(os.getpid(), time.time())
+    _write_status()
+    _sd_notify("WATCHDOG=1")
+    # Harden: if the lock file now shows a DIFFERENT live pid, we lost it (stale takeover).
+    lp, _ = _read_lock()
+    if lp is not None and lp != os.getpid():
+        log.error("lost single-instance lock (now held by pid %d); shutting down to avoid double-poll", lp)
+        running = False
 
 
 def acquire_single_instance_lock() -> bool:
@@ -686,6 +728,7 @@ async def main():
     _sd_notify("READY=1")
     pool = await asyncpg.create_pool(DSN, min_size=1, max_size=3)
     client = httpx.AsyncClient()
+    _write_status()
     # Recover stuck 'processing' jobs (from previous crash/restart)
     recovered = await pool.fetch(
         "UPDATE proxy.memory_jobs SET status='pending', started_at=NULL WHERE status='processing' RETURNING id"

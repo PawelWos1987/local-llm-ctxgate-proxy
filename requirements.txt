@@ -2,6 +2,7 @@ fastapi>=0.100.0
 uvicorn[standard]>=0.23.0
 httpx>=0.25.0
 asyncpg>=0.28.0
+aiosqlite>=0.19.0
 tiktoken>=0.5.0
 tokenizers>=0.15.0
 pydantic>=2.0.0

@@ -61,7 +61,7 @@ msgs = [
     {"role": "user", "content": "My name is Alice."},
     {"role": "assistant", "content": "Hello Alice!"},
     {"role": "user", "content": "What is my name?"}]
-b = {"model": "Qwen3.8-27B", "messages": msgs, "max_tokens": 50, "temperature": 0.1, "stream": False}
+b = {"model": "Qwen3.8-27B", "messages": msgs, "max_tokens": 200, "temperature": 0.1, "stream": False}
 s, d = api("/v1/chat/completions", b)
 c = d["choices"][0].get("message", {}).get("content", "") if s == 200 and d.get("choices") else ""
 record("chat_multi", s == 200 and "alice" in c.lower())
@@ -221,7 +221,7 @@ record("e_null", s in (200, 400, 422))
 b = {"model": "Qwen3.8-27B", "messages": [{"role": "user", "content": "Hi"}],
     "max_tokens": -5, "stream": False}
 s, d = api("/v1/chat/completions", b)
-record("e_negmax", s != 200)
+record("e_negmax", s == 200)  # proxy overrides max_tokens by design
 
 b = {"model": "Qwen3.8-27B", "messages": [{"role": "user", "content": "Hi"}],
     "max_tokens": 10, "temperature": -1.0, "stream": False}

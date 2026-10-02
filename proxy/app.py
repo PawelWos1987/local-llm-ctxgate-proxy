@@ -1,5 +1,8 @@
 """local-llm-ctxgate-proxy: Context gate proxy for Goose -> vLLM with PG memory."""
 import hashlib
+import re
+import math
+import datetime
 import os
 import sys
 import json
@@ -464,6 +467,8 @@ sqlite_conn: Optional[aiosqlite.Connection] = None
 
 # Per-session state, keyed by session_key = "{x_session_id}:{content_fp[:8]}"
 session_fingerprints: dict[str, str] = {}
+session_seeds: dict[str, list] = {}
+session_compactions: dict[str, dict] = {}  # session_key -> frozen [msg0, msg1, msg2] (immutable seed)
 session_tokens: dict[str, dict] = {}  # {in, out, reqs, max_ctx}
 recent_calls = deque(maxlen=200)
 RECENT_CALLS_MAX = 200
@@ -473,11 +478,15 @@ metrics = {
     "requests_ok": 0,
     "requests_error": 0,
     "trim_events": 0,
+    "compaction_events": 0,
     "prefix_invalidations": 0,
     "toolcall_strips": 0,
     "tokens_in_total": 0,
     "tokens_out_total": 0,
     "max_context_seen": 0,
+    "cache_hits": 0,
+    "cache_misses": 0,
+    "summary_age_tokens": 0,
     "reasoning_strips": 0,
     "started_at": time.time(),
 }
@@ -661,7 +670,13 @@ async def lifespan(app: FastAPI):
     # Start memory worker background loop
     worker_task = asyncio.create_task(_memory_worker_loop())
     health_task = asyncio.create_task(_vllm_health_loop())
+    global _vllm_client
+    _vllm_client = httpx.AsyncClient(timeout=300)
+    log.info("shared vLLM httpx client created")
     yield
+    if _vllm_client is not None:
+        await _vllm_client.aclose()
+        _vllm_client = None
     if sqlite_conn:
         await sqlite_conn.close()
     await pool.close()
@@ -880,6 +895,42 @@ def _prep_messages(raw: list) -> list:
     return out
 
 
+def _compact_context(messages: list, max_tokens: int, session_key: str, summary_text: str = "") -> list:
+    """Phase 3: seed[0:3] immutable, frozen summary, newest tail."""
+    if len(messages) < 5:
+        return messages
+    seed = [dict(m) for m in messages[:3]]
+    rest = list(messages[3:])
+    seed_tok = count_messages_tokens(seed)
+    budget = max(500, max_tokens - seed_tok - 200)
+    tail = []
+    t = 0
+    for m in reversed(rest):
+        mt = count_message_tokens(m)
+        if t + mt > budget and len(tail) > 5:
+            break
+        tail.append(m)
+        t += mt
+    tail.reverse()
+    while tail and tail[0].get("role") == "assistant":
+        tail.pop(0)
+    last_turn = max(0, len(rest) - len(tail))
+    prev = session_compactions.get(session_key) or {"last_turn": 0, "frozen_summary": ""}
+    if last_turn > prev["last_turn"]:
+        fs = summary_text.strip() if summary_text else prev["frozen_summary"]
+        if not fs:
+            fs = "[COMPACTED HISTORY: earlier turns archived]"
+        session_compactions[session_key] = {"last_turn": last_turn, "frozen_summary": fs}
+        global metrics
+        metrics["compaction_events"] += 1
+        log.info("COMPACTION session=%s cut=%d (%d chars)", session_key, last_turn, len(fs))
+    result = list(seed)
+    fs = session_compactions[session_key]["frozen_summary"]
+    if fs:
+        result.append({"role": "system", "content": "[COMPACTED HISTORY]" + NL + fs[:2000]})
+    result.extend(tail)
+    log.info("Compacted: %d -> %d msgs", len(messages), len(result))
+    return result
 async def build_context(request_messages: list, task_uuid: str = None, session_key: str = None) -> list:
     messages = _prep_messages(request_messages)
     total = count_messages_tokens(messages)
@@ -887,7 +938,7 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
     if total > MAX_INPUT:
         log.warning("Context over limit: %d > %d, trimming", total, MAX_INPUT)
         before = list(messages)
-        messages = trim_context(messages, MAX_INPUT)
+        messages = _compact_context(messages, MAX_INPUT, session_key or "")
         metrics["trim_events"] += 1
         total = count_messages_tokens(messages)
         log.info("After trim: %d messages, %d tokens", len(messages), total)
@@ -1350,6 +1401,22 @@ def _already_in_context(text: str, blob: str) -> bool:
     return present >= max(1, int(0.6 * len(uniq)))
 
 
+def _score_memory(key, value, category, importance, updated_at, context_terms, context_blob):
+    if len(value) > 10 and value[:50] in context_blob:
+        return 0.0
+    mem_terms = set(re.findall(r'[a-z0-9]{3,}', (key + ' ' + value).lower()))
+    overlap = len(mem_terms & context_terms) / max(1, len(mem_terms)) if mem_terms else 0.0
+    imp = importance / 10.0
+    rec = 0.5
+    if updated_at is not None:
+        try:
+            hours = max(0, (datetime.datetime.now(datetime.timezone.utc) - updated_at).total_seconds() / 3600)
+            rec = math.exp(-hours / 72.0)
+        except Exception:
+            rec = 0.5
+    dec = 1.0 if category == 'DECISION' else 0.0
+    return 0.5 * overlap + 0.2 * imp + 0.1 * rec + 0.2 * dec
+
 async def fetch_task_memory(session_id: str, messages: list, task_uuid: str = None, wm_budget: int = 800, mem_budget: int = 1200, total_budget: int = 2000) -> str:
     """Section 13/14: per-task durable memory as a SMALL CONDITIONAL supplement.
 
@@ -1378,18 +1445,26 @@ async def fetch_task_memory(session_id: str, messages: list, task_uuid: str = No
     # 1+1b+2. Working memory + session summary + durable memories (parallel)
     async def _fetch_rel_mem():
         if terms:
-            return await pool.fetch(
-                "SELECT id, key, value FROM proxy.memories WHERE task_id=$1 AND active=true "
+            rows = await pool.fetch(
+                "SELECT id, key, value, category, importance, updated_at FROM proxy.memories "
+                "WHERE task_id=$1 AND active=true "
                 "AND (key ILIKE ANY($2) OR value ILIKE ANY($2)) "
-                "ORDER BY importance DESC, updated_at DESC LIMIT 8",
+                "LIMIT 30",
                 task_uuid, ["%" + t + "%" for t in list(terms)[:20]]
             )
+            scored = []
+            for r in rows:
+                s = _score_memory(r["key"], r["value"], r["category"], r["importance"], r["updated_at"], terms, blob)
+                if s > 0.1:
+                    scored.append((s, r))
+            scored.sort(key=lambda x: x[0], reverse=True)
+            return [r for _, r in scored[:8]]
         return []
     
     wrow, summary, crit, rel = await asyncio.gather(
         pool.fetchrow("SELECT content FROM proxy.working_memory WHERE task_id=$1", task_uuid),
         _fetch_session_summary(task_uuid, budget=600, session_key=session_id),
-        pool.fetch("SELECT id, key, value FROM proxy.memories WHERE task_id=$1 AND active=true AND importance=10 ORDER BY updated_at DESC LIMIT 5", task_uuid),
+        pool.fetch("SELECT id, key, value, category, importance, updated_at FROM proxy.memories WHERE task_id=$1 AND active=true AND importance=10 ORDER BY updated_at DESC LIMIT 5", task_uuid),
         _fetch_rel_mem(),
         return_exceptions=True
     )
@@ -1442,10 +1517,10 @@ async def fetch_task_memory(session_id: str, messages: list, task_uuid: str = No
         seen.add(nk)
         total += t
 
-    # Touch-on-use: stamp last_accessed_at for injected memory rows
+    # Touch-on-use: stamp last_accessed_at + score
     try:
         if injected_ids:
-            await pool.execute("UPDATE proxy.memories SET last_accessed_at = now() WHERE id = ANY($1)", injected_ids)
+            await pool.execute("UPDATE proxy.memories SET last_accessed_at = now(), score = GREATEST(COALESCE(score, 0), 0.5) WHERE id = ANY($1)", injected_ids)
     except Exception as e:
         log.warning("touch-on-use update failed: %s", e)
 
@@ -1570,7 +1645,10 @@ async def metrics_prometheus():
         "# TYPE ctxgate_requests_total counter", "ctxgate_requests_total %d" % metrics["requests_total"],
         "# TYPE ctxgate_requests_ok counter", "ctxgate_requests_ok %d" % metrics["requests_ok"],
         "# TYPE ctxgate_requests_error counter", "ctxgate_requests_error %d" % metrics["requests_error"],
-        "# TYPE ctxgate_trim_events counter", "ctxgate_trim_events %d" % metrics["trim_events"],
+        "# TYPE ctxgate_cache_hits counter", "ctxgate_cache_hits %d" % metrics["cache_hits"],
+    "# TYPE ctxgate_cache_misses counter", "ctxgate_cache_misses %d" % metrics["cache_misses"],
+    "# TYPE ctxgate_cache_hit_rate gauge", "ctxgate_cache_hit_rate %.4f" % (metrics["cache_hits"] / max(1, metrics["cache_hits"] + metrics["cache_misses"])),
+    "# TYPE ctxgate_trim_events counter", "ctxgate_trim_events %d" % metrics["trim_events"],
         "# TYPE ctxgate_prefix_invalidations counter", "ctxgate_prefix_invalidations %d" % metrics["prefix_invalidations"],
         "# TYPE ctxgate_toolcall_strips counter", "ctxgate_toolcall_strips %d" % metrics["toolcall_strips"],
         "# TYPE ctxgate_reasoning_strips counter", "ctxgate_reasoning_strips %d" % metrics["reasoning_strips"],
@@ -1692,6 +1770,10 @@ async def chat_completions(request: Request):
     if not messages:
         metrics["requests_error"] += 1
         return JSONResponse({"error": "No messages provided"}, status_code=400)
+    for _mi, _mm in enumerate(messages):
+        if _mm.get("content") is None and _mm.get("role") != "assistant":
+            metrics["requests_error"] += 1
+            return JSONResponse({"error": {"message": "messages[" + str(_mi) + "].content is null - must be a string"}}, status_code=400)
 
     # --- Session key: provider identity + content fingerprint ---
     x_sid = request.headers.get('X-Session-ID') or await _get_goose_session_id()
@@ -1708,7 +1790,6 @@ async def chat_completions(request: Request):
                 last_user_content = uc or ''
             break
     if last_user_content:
-        import asyncio
         asyncio.ensure_future(_enqueue_memory_job(x_sid, last_user_content))
 
     # Build context
@@ -1742,27 +1823,29 @@ async def chat_completions(request: Request):
     if isinstance(kn, Exception):
         log.warning("Knowledge injection failed: %s", kn)
         kn = ""
-    if kn:
-        has_system = any(m.get("role") == "system" for m in built)
-        if has_system:
-            for i, m in enumerate(built):
-                if m.get("role") == "system":
-                    built[i] = {**m, "content": m.get("content", "") + "\n\n" + kn}
-                    break
-        else:
-            built.insert(0, {"role": "system", "content": kn})
+    # Phase 1: kn/tm are APPENDED as separate messages after history, before current turn.
+    # The system prompt is NEVER mutated — prefix stays byte-identical for cache stability.
+    if isinstance(kn, Exception):
+        log.warning("Knowledge injection failed: %s", kn)
+        kn = ""
     if isinstance(tm, Exception):
         log.warning("Task memory injection failed: %s", tm)
         tm = ""
-    if tm:
-        has_system = any(m.get("role") == "system" for m in built)
-        if has_system:
-            for i, m in enumerate(built):
-                if m.get("role") == "system":
-                    built[i] = {**m, "content": m.get("content", "") + "\n\n" + tm}
-                    break
-        else:
-            built.insert(0, {"role": "system", "content": tm})
+    if kn or tm:
+        last_user_idx = len(built) - 1
+        for i in range(len(built) - 1, -1, -1):
+            if built[i].get("role") == "user":
+                last_user_idx = i
+                break
+        _ctx_parts = []
+        if kn:
+            _ctx_parts.append("Relevant knowledge:" + chr(10) + kn)
+        if tm:
+            _ctx_parts.append("Task memory:" + chr(10) + tm)
+        if _ctx_parts:
+            built.insert(last_user_idx, {"role": "user", "content": chr(10) + chr(10).join(_ctx_parts)})
+            last_user_idx += 1
+        log.debug("Memory blocks appended at pos %d (kn=%dch tm=%dch)", last_user_idx, len(kn), len(tm))
 
     # --- Injection / utilization instrumentation (lightweight, no DB) ---
     _record_injection(x_sid, tm, kn)
@@ -1774,6 +1857,29 @@ async def chat_completions(request: Request):
         metrics["prefix_invalidations"] += 1
         log.warning("PREFIX INVALIDATED session=%s", session_key)
     session_fingerprints[session_key] = fp
+
+    # Phase 1: Freeze seed pair [0][1][2] per session.
+    # First 3 messages (system + seed user + seed assistant) are immutable for session lifetime.
+    # If Goose compacts and changes them, we detect it, log a deliberate miss, and re-freeze.
+    if session_key not in session_seeds:
+        if len(built) >= 3:
+            session_seeds[session_key] = [dict(m) for m in built[:3]]
+            log.info("Seed frozen session=%s (3 msgs)", session_key)
+    else:
+        frozen = session_seeds[session_key]
+        for i, fm in enumerate(frozen):
+            if i < len(built):
+                fc = fm.get("content", "")
+                nc = built[i].get("content", "")
+                if isinstance(fc, list):
+                    fc = " ".join(p.get("text", "") for p in fc if isinstance(p, dict))
+                if isinstance(nc, list):
+                    nc = " ".join(p.get("text", "") for p in nc if isinstance(p, dict))
+                if fc != nc:
+                    metrics["prefix_invalidations"] += 1
+                    log.warning("SEED CHANGED session=%s pos=%d - re-freezing (deliberate miss)", session_key, i)
+                    session_seeds[session_key] = [dict(m) for m in built[:3]]
+                    break
 
     # Token tracking
     _t0 = time.monotonic()
@@ -1838,15 +1944,54 @@ async def _vllm_health_loop():
             vllm_alive = False
         await asyncio.sleep(60)
 
+def _normalize_system_messages(messages):
+    if not messages:
+        return messages
+    sys_parts = []
+    rest = []
+    for m in messages:
+        if m.get('role') == 'system':
+            c = m.get('content')
+            if c:
+                sys_parts.append(c)
+        else:
+            rest.append(m)
+    if not sys_parts:
+        return messages
+    res = [dict(messages[0])]
+    res[0]['role'] = 'system'
+    res[0]['content'] = (chr(10) + chr(10) + chr(10)).join(sys_parts)
+    res.extend(rest)
+    return res
+
+
+_vllm_client = None
+
+
+@asynccontextmanager
+async def _get_vllm_client():
+    yield _vllm_client  # created in lifespan, shared across requests
+
+
 async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
     global metrics
+    vllm_body["messages"] = _normalize_system_messages(vllm_body.get("messages", []))
     if not vllm_alive:
         metrics["requests_error"] += 1
         log.warning("vLLM is down - rejecting request early")
         return JSONResponse({"error": {"message": "vLLM is not available (health check failed). Start vLLM and retry."}}, status_code=503)
     try:
-        async with httpx.AsyncClient(timeout=300) as client:
-            resp = await client.post(VLLM_URL + "/chat/completions", json=vllm_body)
+        async with _get_vllm_client() as client:
+            _attempts = 0
+            while True:
+                _attempts += 1
+                resp = await client.post(VLLM_URL + "/chat/completions", json=vllm_body)
+                if resp.status_code in (500, 503) and _attempts < 3:
+                    _delay = 1.0 * _attempts
+                    log.warning("vLLM transient %d (attempt %d/3) - retrying in %.1fs", resp.status_code, _attempts, _delay)
+                    await asyncio.sleep(_delay)
+                    continue
+                break
             if resp.status_code != 200:
                 # BUG 4 fix: on 400 (context too long), re-trim more aggressively and retry once
                 if resp.status_code == 400 and "context" in resp.text.lower():
@@ -1901,7 +2046,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                             choices[0]["finish_reason"] = nc[0].get("finish_reason", "stop")
                             output_tokens += d2.get("usage",{}).get("completion_tokens",0)
                     break
-                partial = choices[0].get("message", {}).get("content", "")
+                partial = choices[0].get("message", {}).get("content") or ""
                 cont_msgs = list(vllm_body.get("messages", []))
                 cont_msgs.append({"role": "assistant", "content": partial})
                 cont_msgs.append({"role": "user", "content": "Continue from exactly where you left off. Do not repeat any content already provided. Resume the next word/sentence/code line."})
@@ -1973,6 +2118,7 @@ MAX_CONTINUATIONS = int(os.environ.get("CTXGATE_MAX_CONTINUATIONS", 5))
 
 async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
     global metrics
+    vllm_body["messages"] = _normalize_system_messages(vllm_body.get("messages", []))
     async def generate():
         global metrics
         total_output_tokens = 0
@@ -1983,7 +2129,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
         continuation_count = 0
         current_body = dict(vllm_body)
         try:
-            async with httpx.AsyncClient(timeout=300) as client:
+            async with _get_vllm_client() as client:
                 wall_start = time.time()
                 while True:
                     if time.time() - wall_start > WALL_CLOCK_MAX:

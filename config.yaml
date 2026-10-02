@@ -1,40 +1,57 @@
-# ctxgate-proxy — single source of truth for ALL runtime parameters.
-# Edit via GUI (Settings button) or directly in this file.
-# Changes are hot-reloaded by the dashboard (polls mtime every 5s).
-
+control:
+  ctxgate_proxy:
+    health_url: http://127.0.0.1:9200/health
+    kind: http
+    port: 9200
+    unit: ctxproxy-proxy.service
+  worker:
+    kind: file
+    lock_path: /home/user/ctxproxy/worker/.worker.lock
+    unit: ctxproxy-worker.service
 dashboard:
-  port: 9201
   poll_interval: 3.0
+  port: 9201
   watchdog_timeout: 30
-
+db:
+  dsn: postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy
+proxy:
+  api_key: ''
+  goose_sessions_db: /home/user/.local/share/goose/sessions/sessions.db
+  health_poll_fast: 2
+  health_poll_slow: 30
+  lm_studio_model: qwen3-4b-instruct-2507
+  lm_studio_timeout: 120
+  lm_studio_url: http://127.0.0.1:1234/v1
+  max_body_bytes: 20971520
+  max_context: 84000
+  max_continuations: 5
+  max_input: 64000
+  max_output: 18000
+  memory_ttl_days: 90
+  worker_backpressure: 20
+  safety_margin: 2000
+  stream_read_stall: 120
+  vllm_connect_timeout: 10
+  vllm_model: Qwen3.8-27B
+  vllm_pool_timeout: 10
+  vllm_read_timeout: 300
+  vllm_url: http://127.0.0.1:29000/v1
+  vllm_write_timeout: 60
+  wall_clock_max: 1800
 services:
-  postgresql:
-    type: tcp
-    host: 127.0.0.1
-    port: 5432
-  vllm:
-    type: http
-    url: http://127.0.0.1:29000/v1/models
-  lm_studio:
-    type: http
-    url: http://127.0.0.1:1234/v1/models
   ctxgate_proxy:
     type: http
     url: http://127.0.0.1:9200/health
+  lm_studio:
+    type: http
+    url: http://127.0.0.1:1234/v1/models
+  postgresql:
+    host: 127.0.0.1
+    port: 5432
+    type: tcp
+  vllm:
+    type: http
+    url: http://127.0.0.1:29000/v1/models
   worker:
-    type: file
     path: /home/user/ctxproxy/worker/.worker.lock
-
-db:
-  dsn: postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy
-
-control:
-  ctxgate_proxy:
-    unit: ctxproxy-proxy.service
-    port: 9200
-    health_url: http://127.0.0.1:9200/health
-    kind: http
-  worker:
-    unit: ctxproxy-worker.service
-    lock_path: /home/user/ctxproxy/worker/.worker.lock
-    kind: file
+    type: file
