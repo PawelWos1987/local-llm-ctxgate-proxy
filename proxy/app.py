@@ -5,6 +5,7 @@ import sys
 import json
 import logging
 import time
+import asyncio
 import uuid
 from typing import Any, Optional
 from contextlib import asynccontextmanager
@@ -28,6 +29,196 @@ def _env_int(name: str, default: int) -> int:
     except (ValueError, TypeError) as e:
         log.warning("env %s=%r is not a valid int; using default %d (%s)", name, raw, default, e)
         return default
+
+
+LM_STUDIO_URL = os.environ.get("CTXGATE_LM_URL", "http://127.0.0.1:1234/v1")
+LM_STUDIO_MODEL = os.environ.get("CTXGATE_LM_MODEL", "qwen3-4b-instruct-2507")
+LM_STUDIO_TIMEOUT = _env_int("CTXGATE_LM_TIMEOUT", 30)
+
+_MEMORY_SYSTEM_PROMPT = "You are the durable-memory worker for a long-running software engineering agent. Your only job is to extract and maintain information that the main 27B agent will need after the current conversation context is no longer available. Read the current task state and the new event. Preserve only durable, useful information: confirmed decisions, important findings, failed approaches, constraints, important TODOs, important files, state changes, and stable facts. Do not solve the task, do not execute tools, do not invent information, and do not repeat information that is already known unless the new event corrects or supersedes it. Prefer precise factual statements over summaries or explanations. Never guess. Only use information explicitly present in the input. When a new fact contradicts an existing memory, mark the old information as superseded through the requested memory action. When nothing important changed, return no memory changes. Return only the JSON structure defined by the configured output schema. No Markdown. No commentary. No explanation outside the JSON."
+
+_IMPORTANCE_MAP = {"CRITICAL": 10, "HIGH": 8, "NORMAL": 5, "LOW": 3}
+
+
+async def _call_4b(messages, max_tokens=2000, json_mode=True):
+    try:
+        async with httpx.AsyncClient(timeout=LM_STUDIO_TIMEOUT) as client:
+            body = {"model": LM_STUDIO_MODEL, "messages": messages, "max_tokens": max_tokens, "temperature": 0}
+            if json_mode:
+                body["response_format"] = {"type": "json_object"}
+            resp = await client.post(LM_STUDIO_URL + "/chat/completions", json=body)
+            if resp.status_code != 200:
+                log.warning("4B model error %d: %s", resp.status_code, resp.text[:200])
+                return {}
+            data = resp.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if not content:
+                return {}
+            if not json_mode:
+                return content.strip()
+            content = content.strip()
+            if content.startswith("```"):
+                segs = content.split("\n")
+                content = "\n".join(segs[1:])
+                if content.endswith("```"):
+                    content = content[:-3]
+                content = content.strip()
+            return json.loads(content)
+    except Exception as e:
+        log.warning("4B model call failed: %s", e)
+        return {}
+
+
+async def _store_memory_actions(task_uuid, actions, source_event_id):
+    if not pool or not actions:
+        return
+    stored = 0
+    for act in actions:
+        action = act.get("action", "NEW")
+        if action in ("NO_CHANGE", "DUPLICATE"):
+            continue
+        mtype = act.get("type", "FACT")
+        importance = _IMPORTANCE_MAP.get(act.get("importance", "NORMAL"), 5)
+        title = act.get("title", "")[:200]
+        content = act.get("content", "")[:2000]
+        if not title or not content:
+            continue
+        if action == "NEW":
+            await pool.execute("INSERT INTO proxy.memories (task_id, key, value, category, importance, active, source_event_id, status, model_name) VALUES ($1,$2,$3,$4,$5,true,$6,'active',$7)", task_uuid, title, content, mtype, importance, source_event_id, LM_STUDIO_MODEL)
+            stored += 1
+        elif action == "UPDATE":
+            row = await pool.fetchrow("SELECT id FROM proxy.memories WHERE task_id=$1 AND key=$2 AND active=true LIMIT 1", task_uuid, title)
+            if row:
+                await pool.execute("UPDATE proxy.memories SET value=$3, importance=$4, updated_at=now() WHERE id=$5", content, importance, row["id"])
+            else:
+                await pool.execute("INSERT INTO proxy.memories (task_id, key, value, category, importance, active, source_event_id, status, model_name) VALUES ($1,$2,$3,$4,$5,true,$6,'active',$7)", task_uuid, title, content, mtype, importance, source_event_id, LM_STUDIO_MODEL)
+            stored += 1
+        elif action == "SUPERSEDE":
+            old = await pool.fetchrow("SELECT id FROM proxy.memories WHERE task_id=$1 AND key=$2 AND active=true LIMIT 1", task_uuid, title)
+            new_id = await pool.fetchval("INSERT INTO proxy.memories (task_id, key, value, category, importance, active, source_event_id, status, model_name) VALUES ($1,$2,$3,$4,$5,true,$6,'active',$7) RETURNING id", task_uuid, title, content, mtype, importance, source_event_id, LM_STUDIO_MODEL)
+            if old:
+                await pool.execute("UPDATE proxy.memories SET active=false, superseded_by=$2, updated_at=now() WHERE id=$1", old["id"], new_id)
+            stored += 1
+    if stored:
+        log.info("Stored %d memory actions for task %s", stored, task_uuid)
+
+
+async def _update_working_memory(task_uuid, state_update):
+    if not pool or not state_update:
+        return
+    if not state_update.get("changed", False):
+        return
+    state = state_update.get("current_state")
+    subtask = state_update.get("current_subtask")
+    if not state and not subtask:
+        return
+    content = "STATE: " + (state or "unknown") + " | SUBTASK: " + (subtask or "none")
+    await pool.execute("INSERT INTO proxy.working_memory (task_id, content, updated_at) VALUES ($1,$2,now()) ON CONFLICT (task_id) DO UPDATE SET content=$2, updated_at=now()", task_uuid, content)
+    log.info("Working memory updated: %s", content[:100])
+
+
+async def _process_memory_job(job_id, task_uuid, event_id):
+    if not pool:
+        return
+    try:
+        event = await pool.fetchrow("SELECT content FROM proxy.events WHERE id=$1", event_id)
+        if not event:
+            await pool.execute("UPDATE proxy.memory_jobs SET status='done' WHERE id=$1", job_id)
+            return
+        wm = await pool.fetchrow("SELECT content FROM proxy.working_memory WHERE task_id=$1", task_uuid)
+        current_state = wm["content"] if wm and wm["content"] else "No prior state"
+        recent_mems = await pool.fetch("SELECT key, value FROM proxy.memories WHERE task_id=$1 AND active=true ORDER BY updated_at DESC LIMIT 10", task_uuid)
+        mem_context = ""
+        if recent_mems:
+            parts = []
+            for r in recent_mems:
+                parts.append("- " + r["key"] + ": " + r["value"][:100])
+            mem_context = "\nKnown memories:\n" + "\n".join(parts)
+        user_msg = "Current task state: " + current_state + "\n" + mem_context + "\n\nNew event:\n" + event["content"][:3000] + "\n\nExtract durable memories and update state."
+        result = await _call_4b([{"role": "system", "content": _MEMORY_SYSTEM_PROMPT}, {"role": "user", "content": user_msg}], max_tokens=2000, json_mode=True)
+        if result:
+            await _store_memory_actions(task_uuid, result.get("memory_actions", []), event_id)
+            await _update_working_memory(task_uuid, result.get("state_update", {}))
+        await pool.execute("UPDATE proxy.memory_jobs SET status='done' WHERE id=$1", job_id)
+        log.info("Memory job %s processed", job_id)
+    except Exception as e:
+        log.warning("Memory job %s failed: %s", job_id, e)
+        try:
+            await pool.execute("UPDATE proxy.memory_jobs SET status='error' WHERE id=$1", job_id)
+        except Exception:
+            pass
+
+
+async def _memory_worker_loop():
+    log.info("Memory worker loop started (model=%s, url=%s)", LM_STUDIO_MODEL, LM_STUDIO_URL)
+    while True:
+        try:
+            await asyncio.sleep(5)
+            if not pool:
+                continue
+            jobs = await pool.fetch("SELECT mj.id, mj.task_id, mj.event_id FROM proxy.memory_jobs mj WHERE mj.status='pending' ORDER BY mj.created_at ASC LIMIT 5")
+            for job in jobs:
+                await pool.execute("UPDATE proxy.memory_jobs SET status='processing' WHERE id=$1", job["id"])
+                await _process_memory_job(str(job["id"]), str(job["task_id"]), str(job["event_id"]))
+        except asyncio.CancelledError:
+            log.info("Memory worker loop cancelled")
+            break
+        except Exception as e:
+            log.warning("Memory worker loop error: %s", e)
+            await asyncio.sleep(10)
+
+
+async def _summarize_trimmed_messages(task_uuid, session_key, trimmed_messages):
+    if not pool or not trimmed_messages:
+        return
+    try:
+        compact = []
+        for m in trimmed_messages:
+            role = m.get("role", "?")
+            content = m.get("content", "")
+            if isinstance(content, list):
+                parts = []
+                for p in content:
+                    if isinstance(p, dict):
+                        parts.append(p.get("text", ""))
+                content = " ".join(parts)
+            if content:
+                compact.append(role + ": " + content[:500])
+        if not compact:
+            return
+        trimmed_text = "\n".join(compact)
+        trimmed_tokens = count_tokens(trimmed_text)
+        existing = await pool.fetchrow("SELECT summary FROM proxy.session_summaries WHERE task_id=$1 ORDER BY created_at DESC LIMIT 1", task_uuid)
+        prior_summary = existing["summary"] if existing else "No prior summary."
+        user_msg = "Prior summary:\n" + prior_summary + "\n\nCut messages:\n" + trimmed_text[:4000] + "\n\nUpdate summary. Format: GOAL: ... | DECISIONS: ... | CONSTRAINTS: ... | FILES: ... | PROGRESS: ... | NEXT: ..."
+        summary_text = await _call_4b([
+            {"role": "system", "content": "You maintain a running summary of a software engineering session. Keep it under 500 words. Format: GOAL: ... | DECISIONS: ... | CONSTRAINTS: ... | FILES: ... | PROGRESS: ... | NEXT: ..."},
+            {"role": "user", "content": user_msg}
+        ], max_tokens=1500, json_mode=False)
+        if not summary_text or not isinstance(summary_text, str):
+            log.warning("Trim summarization produced no output")
+            return
+        await pool.execute("INSERT INTO proxy.session_summaries (task_id, session_key, summary, trimmed_msg_count, trimmed_tokens) VALUES ($1,$2,$3,$4,$5)", task_uuid, session_key, summary_text[:3000], len(trimmed_messages), trimmed_tokens)
+        log.info("Trim summary stored: %d msgs, %d tokens", len(trimmed_messages), trimmed_tokens)
+    except Exception as e:
+        log.warning("Trim summarization failed: %s", e)
+
+
+async def _fetch_session_summary(task_uuid, budget=800):
+    if not pool:
+        return ""
+    try:
+        row = await pool.fetchrow("SELECT summary FROM proxy.session_summaries WHERE task_id=$1 ORDER BY created_at DESC LIMIT 1", task_uuid)
+        if row and row["summary"]:
+            s = row["summary"].strip()
+            t = count_tokens(s)
+            if t <= budget:
+                return s
+            return s[:budget * 4]
+    except Exception as e:
+        log.warning("Session summary fetch failed: %s", e)
+    return ""
+
 
 # --- Constants ---
 VLLM_URL = os.environ.get("CTXGATE_VLLM_URL", "http://127.0.0.1:29000/v1")
@@ -228,9 +419,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         enc = tiktoken.get_encoding("cl100k_base")
         log.warning("ctxgate-proxy: Qwen tokenizer load FAILED (%s), falling back to cl100k_base", e)
+
+    # Start memory worker background loop
+    worker_task = asyncio.create_task(_memory_worker_loop())
     yield
     await pool.close()
     log.info("ctxgate-proxy shutdown complete (graceful: pool drained)")
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
 
 app = FastAPI(title="local-llm-ctxgate-proxy", version="0.2.0", lifespan=lifespan)
 
@@ -407,7 +606,7 @@ def sanitize_for_vllm(messages: list) -> list:
                 break
         out.append({"role": "user", "content": sysc or "Please proceed."})
     return out
-async def build_context(request_messages: list) -> list:
+async def build_context(request_messages: list, task_uuid: str = None, session_key: str = None) -> list:
     messages = strip_reasoning([m.copy() for m in sanitize_for_vllm(request_messages)])
     sanitized = []
     for m in messages:
@@ -418,10 +617,17 @@ async def build_context(request_messages: list) -> list:
     log.info("Context: %d messages, %d tokens (limit %d)", len(messages), total, MAX_INPUT)
     if total > MAX_INPUT:
         log.warning("Context over limit: %d > %d, trimming", total, MAX_INPUT)
+        before = list(messages)
         messages = trim_context(messages, MAX_INPUT)
         metrics["trim_events"] += 1
         total = count_messages_tokens(messages)
         log.info("After trim: %d messages, %d tokens", len(messages), total)
+        # Fire-and-forget: summarize dropped messages
+        if task_uuid and session_key and len(before) > len(messages):
+            after_ids = set(id(m) for m in messages)
+            dropped = [m for m in before if id(m) not in after_ids]
+            if dropped:
+                asyncio.ensure_future(_summarize_trimmed_messages(task_uuid, session_key, dropped))
     return messages
 
 def trim_context(messages: list, max_tokens: int) -> list:
@@ -637,6 +843,15 @@ async def fetch_task_memory(session_id: str, messages: list, wm_budget: int = 80
         line = "WORKING MEMORY: " + wm_text
         t = count_tokens(line)
         if t <= wm_budget and total + t <= total_budget:
+            parts.append(line)
+            total += t
+
+    # 1b. Session summary (from trimmed context) - inject if not already in context
+    summary = await _fetch_session_summary(task_uuid, budget=600)
+    if summary and not _already_in_context(summary, blob):
+        line = "SESSION SUMMARY: " + summary
+        t = count_tokens(line)
+        if t <= 600 and total + t <= total_budget:
             parts.append(line)
             total += t
 
@@ -938,7 +1153,14 @@ async def chat_completions(request: Request):
         asyncio.ensure_future(_enqueue_memory_job(x_sid, last_user_content))
 
     # Build context
-    built = await build_context(messages)
+    # Resolve task for memory/summary purposes
+    task_uuid = None
+    try:
+        task_uuid = await _resolve_task(x_sid, create=True)
+    except Exception:
+        pass
+    
+    built = await build_context(messages, task_uuid=task_uuid, session_key=session_key)
 
     # Safe defaults: guard _record_injection against a fetch exception leaving tm/kn unset
     tm = ""

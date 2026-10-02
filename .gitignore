@@ -28,6 +28,11 @@ Thumbs.db
 # Test artifacts
 test_output/
 .pytest_cache/
+tests/*_results.json
+tests/test_results.json
+tests/mock_vllm.py
+tests/run_selfcontained.py
+tests/test_tools_only.py
 
 # Internal planning docs (not for public)
 REVISED_PLAN.md
@@ -53,3 +58,12 @@ injection_metrics.json
 
 # Backup files
 *.bak
+*.bak-*
+
+# Probe artifacts (scratch scripts, results, patches)
+probes/*.txt
+probes/p[0-9]*.py
+probes/patch*.py
+probes/PROBE_RESULTS.md
+probes/_handler*.txt
+probes/chat_template.jinja
