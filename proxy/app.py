@@ -175,47 +175,81 @@ async def _summarize_trimmed_messages(task_uuid, session_key, trimmed_messages):
         compact = []
         for m in trimmed_messages:
             role = m.get("role", "?")
-            content = m.get("content", "")
-            if isinstance(content, list):
+            mcontent = m.get("content", "")
+            if isinstance(mcontent, list):
                 parts = []
-                for p in content:
+                for p in mcontent:
                     if isinstance(p, dict):
                         parts.append(p.get("text", ""))
-                content = " ".join(parts)
-            if content:
-                compact.append(role + ": " + content[:500])
+                mcontent = " ".join(parts)
+            if mcontent:
+                compact.append(role + ": " + mcontent[:500])
         if not compact:
             return
         trimmed_text = "\n".join(compact)
         trimmed_tokens = count_tokens(trimmed_text)
         existing = await pool.fetchrow("SELECT summary FROM proxy.session_summaries WHERE task_id=$1 ORDER BY created_at DESC LIMIT 1", task_uuid)
         prior_summary = existing["summary"] if existing else "No prior summary."
-        user_msg = "Prior summary:\n" + prior_summary + "\n\nCut messages:\n" + trimmed_text[:4000] + "\n\nUpdate summary. Format: GOAL: ... | DECISIONS: ... | CONSTRAINTS: ... | FILES: ... | PROGRESS: ... | NEXT: ..."
-        summary_text = await _call_4b([
-            {"role": "system", "content": "You maintain a running summary of a software engineering session. Keep it under 500 words. Return PLAIN TEXT ONLY, not JSON. Format: GOAL: ... | DECISIONS: ... | CONSTRAINTS: ... | FILES: ... | PROGRESS: ... | NEXT: ..."},
+        user_msg = "Prior summary:\n" + prior_summary + "\n\nCut messages:\n" + trimmed_text[:4000] + "\n\nSummarize the above. Format: GOAL: ... | DECISIONS: ... | CONSTRAINTS: ... | FILES: ... | PROGRESS: ... | NEXT: ..."
+        # Use json_mode=True because 4B ALWAYS returns JSON regardless of instructions
+        result = await _call_4b([
+            {"role": "system", "content": "You are a summarizer. Summarize the session context. Keep it under 300 words."},
             {"role": "user", "content": user_msg}
         ], max_tokens=1500, json_mode=False)
-        if not summary_text or not isinstance(summary_text, str):
-            log.warning("Trim summarization produced no output")
+        
+        summary_text = ""
+        if isinstance(result, str) and result.strip():
+            stripped = result.strip()
+            # Check if it's JSON (4B persona override)
+            if stripped.startswith('{'):
+                try:
+                    import json as _json
+                    parsed = _json.loads(stripped)
+                    if isinstance(parsed, dict):
+                        # Build summary from memory_actions
+                        actions = parsed.get('memory_actions', [])
+                        parts = []
+                        for a in actions:
+                            if isinstance(a, dict):
+                                t = a.get('title', '')
+                                c = a.get('content', '')
+                                if t and c:
+                                    parts.append(t + ': ' + c)
+                                elif t:
+                                    parts.append(t)
+                        su = parsed.get('state_update', {})
+                        if isinstance(su, dict) and su.get('current_state'):
+                            parts.insert(0, "STATE: ' + su['current_state']")
+                        summary_text = ' | ' .join(parts) if parts else ''
+                    else:
+                        summary_text = str(parsed)
+                except Exception:
+                    summary_text = stripped
+            else:
+                summary_text = stripped
+        elif isinstance(result, dict):
+            # _call_4b returned parsed JSON (json_mode=True path)
+            actions = result.get('memory_actions', [])
+            parts = []
+            for a in actions:
+                if isinstance(a, dict):
+                    t = a.get('title', '')
+                    c = a.get('content', '')
+                    if t and c:
+                        parts.append(t + ': ' + c)
+                    elif t:
+                        parts.append(t)
+            su = result.get('state_update', {})
+            if isinstance(su, dict) and su.get('current_state'):
+                parts.insert(0, "STATE: ' + su['current_state']")
+            summary_text = ' | ' .join(parts) if parts else ''
+        
+        if not summary_text:
+            log.warning("Trim summarization produced no usable text")
             return
-        # 4B model sometimes returns JSON despite plain-text instruction - extract text
-        stripped = summary_text.strip()
-        if stripped.startswith('{'):
-            try:
-                import json as _json
-                parsed = _json.loads(stripped)
-                # Try to extract a text field from the JSON
-                if isinstance(parsed, dict):
-                    summary_text = parsed.get('summary') or parsed.get('content') or parsed.get('text') or ''.join(str(v) for v in parsed.values() if isinstance(v, str))
-                else:
-                    summary_text = str(parsed)
-            except Exception:
-                pass  # keep as-is if not valid JSON
-            if not summary_text:
-                log.warning("Trim summarization JSON had no extractable text")
-                return
+        
         await pool.execute("INSERT INTO proxy.session_summaries (task_id, session_key, summary, trimmed_msg_count, trimmed_tokens) VALUES ($1,$2,$3,$4,$5)", task_uuid, session_key, summary_text[:3000], len(trimmed_messages), trimmed_tokens)
-        log.info("Trim summary stored: %d msgs, %d tokens", len(trimmed_messages), trimmed_tokens)
+        log.info("Trim summary stored: %d msgs, %d tokens, summary=%d chars", len(trimmed_messages), trimmed_tokens, len(summary_text))
     except Exception as e:
         log.warning("Trim summarization failed: %s", e)
 
@@ -1235,8 +1269,10 @@ async def chat_completions(request: Request):
     except Exception as e:
         log.warning("Knowledge extraction failed: %s", e)
 
-    max_tokens = body.get("max_tokens", MAX_OUTPUT)
-    max_tokens = min(max_tokens, MAX_OUTPUT)
+    # Proxy calculates output budget from post-trim input (authoritative)
+    # Goose's max_tokens is based on pre-trim input - ignore it
+    vllm_window = 131072
+    max_tokens = min(MAX_OUTPUT, vllm_window - input_tokens - 512)
     stream = body.get("stream", False)
     vllm_body = {
         "model": VLLM_MODEL,
