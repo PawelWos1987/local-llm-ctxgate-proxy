@@ -14,15 +14,25 @@ import os
 import re
 import signal
 import time
+import logging
+import logging.handlers
 import threading
 import yaml
+from contextlib import asynccontextmanager
 from typing import Optional
+
+# --- Logging with rotation (10MB x 5 backups) ---
+_LOG_PATH = os.environ.get("CTXGATE_LOG", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "dashboard.log"))
+_log_handler = logging.handlers.RotatingFileHandler(_LOG_PATH, maxBytes=10*1024*1024, backupCount=5)
+_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+_log = logging.getLogger("dashboard")
+_log.setLevel(logging.INFO)
+_log.addHandler(_log_handler)
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 import socket
-import struct
 
 def _sd_notify(msg: str) -> None:
     """Send sd_notify message to systemd (watchdog keepalive)."""
@@ -42,8 +52,10 @@ def _sd_notify(msg: str) -> None:
 def _watchdog_loop():
     # Fixed 10s ping, independent of POLL_INTERVAL (unit has WatchdogSec=30).
     interval = 10.0
-    while True:
-        time.sleep(interval)
+    while not _shutdown_event.is_set():
+        _shutdown_event.wait(interval)
+        if _shutdown_event.is_set():
+            break
         _sd_notify("WATCHDOG=1")
 
 # --- Configuration (config.yaml = single source of truth) ---
@@ -117,8 +129,9 @@ SERVICES = build_services(_cfg)
 DB_DSN = os.environ.get("CTXGATE_DB_DSN") or os.environ.get("CTXPROXY_DB_DSN") or _get(_cfg, "db", "dsn", default=None) or "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy"
 SVC_MAP = build_svc_map(_cfg)
 
-from contextlib import asynccontextmanager
 _pg_pool = None
+_last_config_write = 0.0
+_shutdown_event = threading.Event()
 HOST = os.environ.get("CTXGATE_DASHBOARD_HOST", "127.0.0.1")
 DASH_TOKEN = os.environ.get("CTXGATE_DASHBOARD_TOKEN", "")
 
@@ -140,6 +153,7 @@ async def _lifespan(_app):
         print("PG pool init failed:", e, flush=True)
     asyncio.create_task(poll_health())
     yield
+    _shutdown_event.set()
     if _pg_pool is not None:
         try:
             await _pg_pool.close()
@@ -165,6 +179,7 @@ def _touch_config_mtime():
     except OSError:
         _config_mtime = 0.0
 
+    _last_config_write = time.time()
 _touch_config_mtime()
 
 def _maybe_reload_config():
@@ -181,7 +196,10 @@ def _maybe_reload_config():
     _config_mtime = m
     globals()["SERVICES"] = build_services(new_cfg)
     globals()["SVC_MAP"] = build_svc_map(new_cfg)
-    globals()["DB_DSN"] = os.environ.get("CTXGATE_DB_DSN") or os.environ.get("CTXPROXY_DB_DSN") or _get(new_cfg, "db", "dsn", default=None) or "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy"
+    new_dsn = os.environ.get("CTXGATE_DB_DSN") or os.environ.get("CTXPROXY_DB_DSN") or _get(new_cfg, "db", "dsn", default=None) or "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy"
+    if new_dsn != globals().get("DB_DSN"):
+        print("WARNING: DSN changed - pool will use new DSN on next restart. Hot-reload of DB pool not supported.", flush=True)
+    globals()["DB_DSN"] = new_dsn
     globals()["POLL_INTERVAL"] = float(_get(new_cfg, "dashboard", "poll_interval", default=POLL_INTERVAL) or POLL_INTERVAL)
     print("config.yaml reloaded:", CONFIG_PATH, flush=True)
 
@@ -543,6 +561,8 @@ async def get_config():
 async def put_config(request: Request):
     if not _auth_ok(request):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    if time.time() - _last_config_write < 5.0:
+        return JSONResponse({"ok": False, "error": "rate limited (min 5s between writes)"}, status_code=429)
     data = await request.json()
     text = data.get("text")
     if not isinstance(text, str) or not text.strip():
@@ -562,8 +582,12 @@ async def put_config(request: Request):
     except Exception:
         pass
     try:
-        with open(CONFIG_PATH, "w") as f:
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w") as f:
             f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_PATH)
     except Exception as e:
         return JSONResponse({"ok": False, "error": "write failed: " + str(e)}, status_code=400)
     _touch_config_mtime()
@@ -701,6 +725,7 @@ body{font-family:'Consolas','Courier New',monospace;background:var(--bg);color:v
 </div>
 <div class="main" id="topology">
 <!-- Animated fiber-optic paths -->
+<!-- static positions; tuned for the default layout -->
 <svg class="fiber-svg" id="fibers" viewBox="0 0 1000 600" preserveAspectRatio="none">
 <!-- PG to Proxy (input to proxy = RED) -->
 <path id="f-pg-proxy" class="fiber-in" d="M 160,150 C 220,100 300,100 370,150"/>
@@ -737,7 +762,7 @@ body{font-family:'Consolas','Courier New',monospace;background:var(--bg);color:v
 <div class="box box-proxy" id="box-proxy">
 <div class="title"><span class="led"></span>CTXGATE PROXY</div>
 <div class="metrics">
-<div class="metric-row"><span>Port</span><span class="val">:9202</span></div>
+<div class="metric-row"><span>Port</span><span class="val">:9201</span></div>
 <div class="metric-row"><span>Status</span><span class="val" id="px-status">--</span></div>
 <div class="metric-row"><span>Latency</span><span class="val big" id="px-lat">--</span></div>
 </div>
@@ -954,7 +979,6 @@ function loadLog(){
 </script>
 </body>
 </html>"""
-
 
 if __name__ == "__main__":
     import uvicorn

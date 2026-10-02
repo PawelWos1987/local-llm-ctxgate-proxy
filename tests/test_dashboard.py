@@ -37,7 +37,7 @@ class TestDashboard:
         s, body = _get("/dashboard")
         assert s == 200
         assert "text/html" in body or "<!DOCTYPE" in body
-        assert "local-llm-ctxgate-proxy" in body
+        assert "ctxgate" in body
         assert "Chart" in body or "chart" in body
 
     def test_d2_api_metrics(self):

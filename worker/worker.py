@@ -34,7 +34,6 @@ LM_URL = os.environ.get("CTXGATE_LM_URL", "http://127.0.0.1:1234/v1/chat/complet
 LM_MODEL = os.environ.get("CTXGATE_LM_MODEL", "qwen3-4b-instruct-2507")
 DSN = os.environ.get("CTXGATE_DB_DSN") or os.environ.get("CTXPROXY_DB_DSN") or "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy"
 POLL = float(os.environ.get("CTXGATE_WORKER_POLL", "2.0"))
-CONCURRENCY = int(os.environ.get("CTXGATE_WORKER_CONCURRENCY", "1"))
 MAX_ATTEMPTS = int(os.environ.get("CTXGATE_WORKER_MAX_ATTEMPTS", "3"))
 # Outage TTL: how long to keep retrying before marking jobs failed (seconds)
 OUTAGE_TTL = float(os.environ.get("CTXGATE_WORKER_OUTAGE_TTL", "1800"))
@@ -146,23 +145,21 @@ running = True
 # Outage tracking
 outage_since: Optional[float] = None  # timestamp when outage started
 model_loaded: bool = False
+consecutive_lm_failures: int = 0
 _last_status_write = 0.0  # whether we've confirmed the model is loaded this session
 # Lag / completion tracking (source of the worker_lag_seconds metric)
 last_completion: Optional[float] = None  # time.time() of the last successful job
 jobs_done_total: int = 0
 
-
 def _sig(s, f):
     global running
     running = False
-
 
 def _norm(s: str) -> str:
     """Normalize a title/key for deterministic matching (case/whitespace/punct)."""
     s = (s or "").lower()
     s = re.sub(r"[^a-z0-9]+", " ", s).strip()
     return re.sub(r"\s+", " ", s)
-
 
 # --- Structural validation (section 16: validate before touching PostgreSQL) ---
 def validate_response(obj: Any) -> bool:
@@ -195,7 +192,6 @@ def validate_response(obj: Any) -> bool:
         return False
     return True
 
-
 # --- Compact payload builder (section 8) ---
 def build_payload(task_desc: str, wm: str, event: dict) -> str:
     role = event.get("role", "user")
@@ -216,7 +212,6 @@ def build_payload(task_desc: str, wm: str, event: dict) -> str:
         + ("CHANGED FILES: " + changed + "\n" if changed else "")
         + "source_event_id: " + str(event.get("id", ""))
     )
-
 
 # --- Pre-load: ensure model is loaded before first completion ---
 async def ensure_model_loaded() -> bool:
@@ -268,7 +263,6 @@ async def ensure_model_loaded() -> bool:
         log.warning("ensure_model_loaded: LM Studio unreachable: %s (reset model_loaded for retry)", e)
         return False
 
-
 # --- LM Studio call (json_schema enforced, no reasoning) ---
 async def call_4b(payload: str) -> dict:
     body = {
@@ -297,7 +291,6 @@ async def call_4b(payload: str) -> dict:
         raise RuntimeError("LM Studio returned empty content")
     return json.loads(content)
 
-
 # --- Quality check: 4B self-reviews its own output ---
 QUALITY_CHECK_PROMPT = (
     "You are a strict quality reviewer for memory entries.\n"
@@ -315,7 +308,6 @@ QUALITY_SCHEMA: dict[str, Any] = {
         "reason": {"type": "string"},
     },
 }
-
 
 async def call_4b_quality_check(memory_actions: list) -> dict:
     """Ask the 4B to self-review its generated memory entries."""
@@ -339,7 +331,6 @@ async def call_4b_quality_check(memory_actions: list) -> dict:
         raise RuntimeError("Quality check HTTP %d: %s" % (r.status_code, r.text[:200]))
     return json.loads(r.json()["choices"][0]["message"]["content"])
 
-
 # --- Deterministic dedupe / UPDATE / SUPERSEDE (section 12) ---
 async def apply_memories(task_id: str, event_id: str, resp: dict) -> int:
     applied = 0
@@ -357,15 +348,15 @@ async def apply_memories(task_id: str, event_id: str, resp: dict) -> int:
         # Find an existing ACTIVE memory of the same type+title for this task
         row = await pool.fetchrow(
             "SELECT id FROM proxy.memories WHERE task_id=$1 AND active=true AND category=$2 "
-            "AND trim(regexp_replace(regexp_replace(lower(key),'[^a-z0-9]+',' ','g'),'[[:space:]]+',' ','g'))=$3 LIMIT 1",
+            "AND key_norm = $3 LIMIT 1",
             task_id, category, mkey,
         )
         if action == "SUPERSEDE":
             if row:
                 nid = await pool.fetchval(
-                    "INSERT INTO proxy.memories(task_id,key,value,category,importance,source_event_id,status,model_name) "
-                    "VALUES($1,$2,$3,$4,$5,$6,'active',$7) RETURNING id",
-                    task_id, title, content, category, imp, event_id, LM_MODEL,
+                    "INSERT INTO proxy.memories(task_id,key,value,category,importance,source_event_id,status,model_name,key_norm) "
+                    "VALUES($1,$2,$3,$4,$5,$6,'active',$7,$8) RETURNING id",
+                    task_id, title, content, category, imp, event_id, LM_MODEL, mkey,
                 )
                 await pool.execute(
                     "UPDATE proxy.memories SET active=false,status='superseded',superseded_by=$1,updated_at=now() WHERE id=$2",
@@ -374,9 +365,9 @@ async def apply_memories(task_id: str, event_id: str, resp: dict) -> int:
                 log.info("SUPERSEDE %s (old=%s new=%s)", title, row["id"], nid)
             else:
                 await pool.execute(
-                    "INSERT INTO proxy.memories(task_id,key,value,category,importance,source_event_id,status,model_name) "
-                    "VALUES($1,$2,$3,$4,$5,$6,'active',$7)",
-                    task_id, title, content, category, imp, event_id, LM_MODEL,
+                    "INSERT INTO proxy.memories(task_id,key,value,category,importance,source_event_id,status,model_name,key_norm) "
+                    "VALUES($1,$2,$3,$4,$5,$6,'active',$7,$8)",
+                    task_id, title, content, category, imp, event_id, LM_MODEL, mkey,
                 )
                 log.info("SUPERSEDE(no-old) -> INSERT %s", title)
             applied += 1
@@ -389,9 +380,9 @@ async def apply_memories(task_id: str, event_id: str, resp: dict) -> int:
                 log.info("UPDATE %s", title)
             else:
                 await pool.execute(
-                    "INSERT INTO proxy.memories(task_id,key,value,category,importance,source_event_id,status,model_name) "
-                    "VALUES($1,$2,$3,$4,$5,$6,'active',$7)",
-                    task_id, title, content, category, imp, event_id, LM_MODEL,
+                    "INSERT INTO proxy.memories(task_id,key,value,category,importance,source_event_id,status,model_name,key_norm) "
+                    "VALUES($1,$2,$3,$4,$5,$6,'active',$7,$8)",
+                    task_id, title, content, category, imp, event_id, LM_MODEL, mkey,
                 )
                 log.info("UPDATE(no-old) -> INSERT %s", title)
             applied += 1
@@ -405,14 +396,13 @@ async def apply_memories(task_id: str, event_id: str, resp: dict) -> int:
                 log.info("NEW(dup) -> refresh %s", title)
             else:
                 await pool.execute(
-                    "INSERT INTO proxy.memories(task_id,key,value,category,importance,source_event_id,status,model_name) "
-                    "VALUES($1,$2,$3,$4,$5,$6,'active',$7)",
-                    task_id, title, content, category, imp, event_id, LM_MODEL,
+                    "INSERT INTO proxy.memories(task_id,key,value,category,importance,source_event_id,status,model_name,key_norm) "
+                    "VALUES($1,$2,$3,$4,$5,$6,'active',$7,$8)",
+                    task_id, title, content, category, imp, event_id, LM_MODEL, mkey,
                 )
                 log.info("NEW %s imp=%d", title, imp)
             applied += 1
     return applied
-
 
 async def update_working_memory(task_id: str, su: dict):
     # Refresh WM for every substantive turn - not just when 'changed' is true.
@@ -454,14 +444,12 @@ async def prune_memories(pool) -> None:
     except Exception as e:
         log.warning("memory prune failed (non-fatal): %s", e)
 
-
 async def claim_job():
     """Claim exactly ONE pending job (parallelism=1) with row locking."""
     return await pool.fetchrow(
         "SELECT id, task_id, event_id, attempts FROM proxy.memory_jobs "
         "WHERE status='pending' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED"
     )
-
 
 async def process_job(job) -> None:
     """Process a single memory job with outage-aware retry logic.
@@ -471,7 +459,7 @@ async def process_job(job) -> None:
     - If past OUTAGE_TTL: mark as failed
     On other errors: use standard MAX_ATTEMPTS bounded retry
     """
-    global outage_since, last_completion, jobs_done_total
+    global outage_since, last_completion, jobs_done_total, consecutive_lm_failures
     jid, task_id, event_id = str(job["id"]), str(job["task_id"]), str(job["event_id"]) if job["event_id"] else None
     await pool.execute("UPDATE proxy.memory_jobs SET status='processing',started_at=now() WHERE id=$1", jid)
     try:
@@ -499,6 +487,7 @@ async def process_job(job) -> None:
         resp = await call_4b(payload)
         # Success: reset outage tracker
         outage_since = None
+        consecutive_lm_failures = 0
 
         # --- Quality-check loop: self-review, retry once, discard if bad again ---
         acts = resp.get("memory_actions", [])
@@ -534,6 +523,11 @@ async def process_job(job) -> None:
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.PoolTimeout) as e:
         # LM Studio unreachable/outage - use TTL-based backoff
         now = time.time()
+        consecutive_lm_failures += 1
+        if consecutive_lm_failures >= 3:
+            model_loaded = False
+            consecutive_lm_failures = 0
+            log.warning("3 consecutive LM failures - resetting model_loaded")
         if outage_since is None:
             outage_since = now
             log.warning("LM Studio outage STARTED (job %s): %s", jid, e)
@@ -559,6 +553,11 @@ async def process_job(job) -> None:
             outage_since = None
     except Exception as e:
         # Non-outage error: standard bounded retry
+        consecutive_lm_failures += 1
+        if consecutive_lm_failures >= 3:
+            model_loaded = False
+            consecutive_lm_failures = 0
+            log.warning("3 consecutive LM failures - resetting model_loaded")
         attempts = int(job.get("attempts") or 0) + 1
         log.warning("JOB %s failed (attempt %d/%d): %s", jid, attempts, MAX_ATTEMPTS, e)
         if attempts >= MAX_ATTEMPTS:
@@ -572,7 +571,6 @@ async def process_job(job) -> None:
                 "UPDATE proxy.memory_jobs SET status='pending',attempts=$1,error=$2 WHERE id=$3",
                 attempts, str(e)[:500], jid,
             )
-
 
 async def poll():
     """Main poll loop with pre-load before first completion in a batch."""
@@ -597,7 +595,6 @@ async def poll():
             log.exception("poll loop: %s", e)
             await asyncio.sleep(5)
 
-
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -606,7 +603,6 @@ def _pid_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
-
 
 def _atomic_write(path: str, text: str) -> None:
     """Atomic write: temp file + os.replace so readers never see a torn file."""
@@ -620,22 +616,19 @@ def _atomic_write(path: str, text: str) -> None:
     except OSError as e:
         log.warning("atomic write failed for %s", path, e)
 
-
 def _write_lock(pid: int, ts: float) -> None:
     try:
         _atomic_write(LOCK_FILE, "pid=%d\nheartbeat=%.3f\n" % (pid, ts))
     except OSError as e:
         log.warning("could not write lock file: %s", e)
 
-
 def _write_status(force: bool = False) -> None:
-    global _last_status_write
-    _now = time.time()
-    if not force and (_now - _last_status_write) < 5.0:
-        return
-    _last_status_write = _now
     """Write a machine-readable status file (lag + heartbeat) for proxy + dashboard."""
+    global _last_status_write
     now = time.time()
+    if not force and (now - _last_status_write) < 5.0:
+        return
+    _last_status_write = now
     lag = (now - last_completion) if last_completion else 0.0
     data = {
         "pid": os.getpid(),
@@ -646,7 +639,6 @@ def _write_status(force: bool = False) -> None:
     }
     _atomic_write(STATUS_FILE, json.dumps(data))
 
-
 def _read_lock():
     try:
         with open(LOCK_FILE) as f:
@@ -656,7 +648,6 @@ def _read_lock():
         return pid, hb
     except (OSError, AttributeError, ValueError):
         return None, None
-
 
 def _sd_notify(msg: str) -> None:
     addr = os.environ.get("NOTIFY_SOCKET")
@@ -672,7 +663,6 @@ def _sd_notify(msg: str) -> None:
     except OSError:
         pass
 
-
 def _heartbeat() -> None:
     global running
     if lock_fd is None:
@@ -685,7 +675,6 @@ def _heartbeat() -> None:
     if lp is not None and lp != os.getpid():
         log.error("lost single-instance lock (now held by pid %d); shutting down to avoid double-poll", lp)
         running = False
-
 
 def acquire_single_instance_lock() -> bool:
     """Acquire the single-instance lock. Returns False if another healthy
@@ -716,7 +705,6 @@ def acquire_single_instance_lock() -> bool:
     log.info("single-instance lock acquired (pid %d, lock %s)", pid, LOCK_FILE)
     return True
 
-
 def release_single_instance_lock() -> None:
     global lock_fd
     if lock_fd is not None:
@@ -726,7 +714,6 @@ def release_single_instance_lock() -> None:
         except OSError:
             pass
         lock_fd = None
-
 
 async def main():
     global pool, client, lock_fd
@@ -745,8 +732,8 @@ async def main():
     )
     if recovered:
         log.info("Recovered %d stuck 'processing' jobs back to 'pending'", len(recovered))
-    log.info("4B memory worker started (model=%s, poll=%.1fs, max_attempts=%d, outage_ttl=%.0fs, concurrency=%d)",
-             LM_MODEL, POLL, MAX_ATTEMPTS, OUTAGE_TTL, CONCURRENCY)
+    log.info("4B memory worker started (model=%s, poll=%.1fs, max_attempts=%d, outage_ttl=%.0fs)",
+             LM_MODEL, POLL, MAX_ATTEMPTS, OUTAGE_TTL)
     try:
         await poll()
     finally:
@@ -754,7 +741,6 @@ async def main():
         await pool.close()
         release_single_instance_lock()
         log.info("4B memory worker stopped")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
