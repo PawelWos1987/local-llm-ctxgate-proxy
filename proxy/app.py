@@ -192,12 +192,28 @@ async def _summarize_trimmed_messages(task_uuid, session_key, trimmed_messages):
         prior_summary = existing["summary"] if existing else "No prior summary."
         user_msg = "Prior summary:\n" + prior_summary + "\n\nCut messages:\n" + trimmed_text[:4000] + "\n\nUpdate summary. Format: GOAL: ... | DECISIONS: ... | CONSTRAINTS: ... | FILES: ... | PROGRESS: ... | NEXT: ..."
         summary_text = await _call_4b([
-            {"role": "system", "content": "You maintain a running summary of a software engineering session. Keep it under 500 words. Format: GOAL: ... | DECISIONS: ... | CONSTRAINTS: ... | FILES: ... | PROGRESS: ... | NEXT: ..."},
+            {"role": "system", "content": "You maintain a running summary of a software engineering session. Keep it under 500 words. Return PLAIN TEXT ONLY, not JSON. Format: GOAL: ... | DECISIONS: ... | CONSTRAINTS: ... | FILES: ... | PROGRESS: ... | NEXT: ..."},
             {"role": "user", "content": user_msg}
         ], max_tokens=1500, json_mode=False)
         if not summary_text or not isinstance(summary_text, str):
             log.warning("Trim summarization produced no output")
             return
+        # 4B model sometimes returns JSON despite plain-text instruction - extract text
+        stripped = summary_text.strip()
+        if stripped.startswith('{'):
+            try:
+                import json as _json
+                parsed = _json.loads(stripped)
+                # Try to extract a text field from the JSON
+                if isinstance(parsed, dict):
+                    summary_text = parsed.get('summary') or parsed.get('content') or parsed.get('text') or ''.join(str(v) for v in parsed.values() if isinstance(v, str))
+                else:
+                    summary_text = str(parsed)
+            except Exception:
+                pass  # keep as-is if not valid JSON
+            if not summary_text:
+                log.warning("Trim summarization JSON had no extractable text")
+                return
         await pool.execute("INSERT INTO proxy.session_summaries (task_id, session_key, summary, trimmed_msg_count, trimmed_tokens) VALUES ($1,$2,$3,$4,$5)", task_uuid, session_key, summary_text[:3000], len(trimmed_messages), trimmed_tokens)
         log.info("Trim summary stored: %d msgs, %d tokens", len(trimmed_messages), trimmed_tokens)
     except Exception as e:
@@ -1311,6 +1327,11 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             _record_call(session_key, input_tokens, output_tokens, "ok", VLLM_MODEL, False)
             data["usage"]["completion_tokens"] = output_tokens
             data["usage"]["total_tokens"] = input_tokens + output_tokens
+            # Normalize reasoning field: vLLM may use 'reasoning' instead of 'reasoning_content'
+            for ch in data.get("choices", []):
+                msg = ch.get("message", {})
+                if "reasoning" in msg and "reasoning_content" not in msg:
+                    msg["reasoning_content"] = msg.pop("reasoning")
             return JSONResponse(data)
     except httpx.TimeoutException:
         metrics["requests_error"] += 1
@@ -1389,7 +1410,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                         if fr:
                                             finish_reason = fr
                                         delta = choices[0].get("delta", {})
-                                        reasoning_piece = delta.get("reasoning_content", "")
+                                        reasoning_piece = delta.get("reasoning_content", "") or delta.get("reasoning", "")
                                         tool_calls_piece = delta.get("tool_calls")
                                         if reasoning_piece:
                                             rc = {"id": chunk.get("id","gen"),"object":"chat.completion.chunk","created":chunk.get("created",0),"model":VLLM_MODEL,"choices":[{"index":0,"delta":{"reasoning_content":reasoning_piece},"finish_reason":None}]}
@@ -1407,7 +1428,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                                 out_chunk = {"id": chunk.get("id", "gen"), "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": chunk.get("model", VLLM_MODEL), "choices": [{"index": 0, "delta": {"content": flush_part}, "finish_reason": None}]}
                                                 yield "data: " + json.dumps(out_chunk) + "\n\n"
                                             else:
-                                                non_content = {k: v for k, v in delta.items() if k != "content"}
+                                                non_content = {k: v for k, v in delta.items() if k not in ("content", "reasoning_content", "tool_calls")}
                                                 if non_content:
                                                     out_chunk = {"id": chunk.get("id", "gen"), "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": chunk.get("model", VLLM_MODEL), "choices": [{"index": 0, "delta": non_content, "finish_reason": None}]}
                                                     yield "data: " + json.dumps(out_chunk) + "\n\n"
