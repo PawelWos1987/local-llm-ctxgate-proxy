@@ -1282,6 +1282,14 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                     if fr:
                                         finish_reason = fr
                                     delta = choices[0].get("delta", {})
+                                    reasoning_piece = delta.get("reasoning_content", "")
+                                    tool_calls_piece = delta.get("tool_calls")
+                                    if reasoning_piece:
+                                        rc = {"id": chunk.get("id","gen"),"object":"chat.completion.chunk","created":chunk.get("created",0),"model":VLLM_MODEL,"choices":[{"index":0,"delta":{"reasoning_content":reasoning_piece},"finish_reason":None}]}
+                                        yield "data: " + json.dumps(rc) + chr(10) + chr(10)
+                                    if tool_calls_piece:
+                                        tc2 = {"id": chunk.get("id","gen"),"object":"chat.completion.chunk","created":chunk.get("created",0),"model":VLLM_MODEL,"choices":[{"index":0,"delta":{"tool_calls":tool_calls_piece},"finish_reason":None}]}
+                                        yield "data: " + json.dumps(tc2) + chr(10) + chr(10)
                                     content_piece = delta.get("content", "")
                                     if content_piece:
                                         buf += content_piece
