@@ -3,6 +3,7 @@ import hashlib
 import os
 import sys
 import json
+from collections import deque
 import logging
 import time
 import asyncio
@@ -464,7 +465,7 @@ sqlite_conn: Optional[aiosqlite.Connection] = None
 # Per-session state, keyed by session_key = "{x_session_id}:{content_fp[:8]}"
 session_fingerprints: dict[str, str] = {}
 session_tokens: dict[str, dict] = {}  # {in, out, reqs, max_ctx}
-recent_calls: list[dict] = []        # ring buffer, max 200
+recent_calls = deque(maxlen=200)
 RECENT_CALLS_MAX = 200
 
 metrics = {
@@ -510,7 +511,12 @@ def _load_injection_metrics() -> dict:
     except Exception:
         return _default_injection_metrics()
 
+_last_metrics_save = 0.0
+
 def _save_injection_metrics() -> None:
+    global _last_metrics_save
+    if time.monotonic() - _last_metrics_save < 5.0: return
+    _last_metrics_save = time.monotonic()
     try:
         with open(INJECTION_METRICS_PATH, "w") as f:
             json.dump(injection_metrics, f)
@@ -695,22 +701,27 @@ def count_message_tokens(msg: dict) -> int:
     return tokens
 
 def count_messages_tokens(messages: list) -> int:
-    total = 0
+    if not messages:
+        return 0
+    parts = []
     for m in messages:
-        total += count_message_tokens(m)
-    total += len(messages) * 12  # Qwen3 chat template: ~12 tokens per message (role tags + separators)
-    return total
-
+        r = m.get("role", "")
+        c = m.get("content") or ""
+        if isinstance(c, list):
+            c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+        parts.append("\n" + r + " " + c)
+        tc = m.get("tool_calls")
+        if tc: parts.append(" " + json.dumps(tc))
+        if m.get("tool_call_id"): parts.append(" " + m["tool_call_id"])
+    full = " ".join(parts)
+    if not enc:
+        return len(full) // 4 + len(messages) * 12
+    try:
+        return len(enc.encode(full).ids) + len(messages) * 12
+    except AttributeError:
+        return len(enc.encode(full)) + len(messages) * 12
 # --- Session key (D11 per-session) ---
-def make_session_key(x_session_id: str, messages: list) -> str:
-    """Derive a unique session key from provider identity + content fingerprint.
-    
-    x_session_id: static per provider (from X-Session-ID header)
-    content_fp:   derived from system prompt + first user message
-    Result: same provider + same conversation topic = same key
-            same provider + different topic = different key
-            different provider = different key
-    """
+def _prefix_raw(messages: list) -> str:
     parts = []
     for m in messages:
         role = m.get("role", "")
@@ -725,28 +736,15 @@ def make_session_key(x_session_id: str, messages: list) -> str:
                 c = ' '.join(p.get("text", "") for p in c if isinstance(p, dict))
             parts.append(c or "")
             break
-    raw = "\x00".join(parts)
-    fp = hashlib.sha256(raw.encode()).hexdigest()[:8]
+    return "\x00".join(parts)
+
+def make_session_key(x_session_id: str, messages: list) -> str:
+    fp = hashlib.sha256(_prefix_raw(messages).encode()).hexdigest()[:8]
     return f"{x_session_id}:{fp}"
 
 # --- Prefix fingerprint (per-session) ---
 def compute_prefix_fingerprint(messages: list) -> str:
-    parts = []
-    for m in messages:
-        role = m.get("role", "")
-        if role == "system":
-            c = m.get("content", "")
-            if isinstance(c, list):
-                c = ' '.join(p.get("text", "") for p in c if isinstance(p, dict))
-            parts.append(c or "")
-        elif role == "user" and len(parts) > 0:
-            c = m.get("content", "")
-            if isinstance(c, list):
-                c = ' '.join(p.get("text", "") for p in c if isinstance(p, dict))
-            parts.append(c or "")
-            break
-    raw = "\x00".join(parts)
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    return hashlib.sha256(_prefix_raw(messages).encode()).hexdigest()[:16]
 
 def check_prefix(session_key: str, messages: list) -> None:
     """Log WARNING if prefix fingerprint changes for this session. Per-session state."""
@@ -846,13 +844,44 @@ def sanitize_for_vllm(messages: list) -> list:
                 break
         out.append({"role": "user", "content": sysc or "Please proceed."})
     return out
+def _prep_messages(raw: list) -> list:
+    out = []
+    for m in raw:
+        if m.get("role") == "assistant" and "reasoning_content" in m:
+            m = {k: v for k, v in m.items() if k != "reasoning_content"}
+        else:
+            m = dict(m)
+        if m.get("content") is None:
+            m["content"] = ""
+        tc = m.get("tool_calls")
+        if tc:
+            valid = True
+            for t in tc:
+                if not isinstance(t, dict) or "id" not in t or "type" not in t or "function" not in t:
+                    valid = False; break
+                fn = t.get("function", {})
+                if "name" not in fn or "arguments" not in fn:
+                    valid = False; break
+                a = fn["arguments"]
+                if isinstance(a, str):
+                    try:
+                        json.loads(a)
+                    except (json.JSONDecodeError, ValueError):
+                        valid = False; break
+                elif not isinstance(a, dict):
+                    valid = False; break
+            if not valid:
+                m = {k: v for k, v in m.items() if k != "tool_calls"}
+                if not m.get("content"): m["content"] = ""
+                metrics["toolcall_strips"] += 1
+        out.append(m)
+    if not any(m.get("role") == "user" for m in out):
+        out.append({"role": "user", "content": "Please proceed."})
+    return out
+
+
 async def build_context(request_messages: list, task_uuid: str = None, session_key: str = None) -> list:
-    messages = strip_reasoning([m.copy() for m in sanitize_for_vllm(request_messages)])
-    sanitized = []
-    for m in messages:
-        m, stripped = sanitize_tool_calls(m)
-        sanitized.append(m)
-    messages = sanitized
+    messages = _prep_messages(request_messages)
     total = count_messages_tokens(messages)
     log.info("Context: %d messages, %d tokens (limit %d)", len(messages), total, MAX_INPUT)
     if total > MAX_INPUT:
@@ -961,7 +990,7 @@ def trim_context(messages: list, max_tokens: int) -> list:
                 truncated = _truncate_message_content(m, char_budget)
                 tmt = count_message_tokens(truncated)
                 if tmt <= remaining:
-                    tail.insert(0, truncated)
+                    tail.append( truncated)
                     tail_tokens += tmt
                     log.info("Trimmed older message to fit (was %d, now %d tokens, remaining=%d)", mt, tmt, remaining)
                 else:
@@ -970,12 +999,13 @@ def trim_context(messages: list, max_tokens: int) -> list:
                     truncated = _truncate_message_content(m, char_budget)
                     tmt = count_message_tokens(truncated)
                     if tmt <= remaining:
-                        tail.insert(0, truncated)
+                        tail.append( truncated)
                         tail_tokens += tmt
                         log.info("Force-trimmed older message (was %d, now %d tokens)", mt, tmt)
             break
-        tail.insert(0, m)
+        tail.append( m)
         tail_tokens += mt
+    tail.reverse()
 
     # Strip leading assistant messages from tail (orphaned after trim -
     # an assistant msg with no preceding user msg breaks the chat template)
@@ -1304,8 +1334,8 @@ def _context_blob(messages: list) -> str:
         if isinstance(c, list):
             c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
         if c:
-            parts.append(c)
-    return " ".join(parts).lower()
+            parts.append(c.lower())
+    return " ".join(parts)
 
 
 def _already_in_context(text: str, blob: str) -> bool:
@@ -1486,8 +1516,6 @@ def _record_call(session_key: str, input_tokens: int, output_tokens: int, status
         "explanation": explain_status(status, detail),
     }
     recent_calls.append(entry)
-    if len(recent_calls) > RECENT_CALLS_MAX:
-        recent_calls.pop(0)
 
 # --- Health endpoint ---
 @app.get("/health")
@@ -1588,7 +1616,8 @@ async def api_sessions():
 @app.get("/api/recent-calls")
 async def api_recent_calls(n: int = 50):
     """Recent call ring buffer."""
-    return list(reversed(recent_calls[-n:]))
+    items = list(recent_calls)
+    return list(reversed(items[-n:]))
 
 @app.get("/api/errors")
 async def api_errors(n: int = 20):
@@ -1738,9 +1767,12 @@ async def chat_completions(request: Request):
     # --- Injection / utilization instrumentation (lightweight, no DB) ---
     _record_injection(x_sid, tm, kn)
 
-    # Per-session prefix check
-    check_prefix(session_key, built)
-    fp = compute_prefix_fingerprint(built)
+    # Per-session prefix check (single hash)
+    fp = hashlib.sha256(_prefix_raw(built).encode()).hexdigest()[:16]
+    prev_fp = session_fingerprints.get(session_key)
+    if prev_fp is not None and fp != prev_fp:
+        metrics["prefix_invalidations"] += 1
+        log.warning("PREFIX INVALIDATED session=%s", session_key)
     session_fingerprints[session_key] = fp
 
     # Token tracking
