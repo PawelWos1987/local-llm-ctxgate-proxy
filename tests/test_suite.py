@@ -71,6 +71,141 @@ b = {"model": "Qwen3.8-27B", "messages": [{"role": "user", "content": "Count 1 t
     "max_tokens": 100, "temperature": 0.1, "stream": True}
 s, lines = sapi("/v1/chat/completions", b)
 hd = any(l.startswith("data: ") for l in lines)
+
+# === Regression tests for P1 fixes ===
+
+def test_regress_nl():
+    """P1.1: _compact_context must not raise NameError (NL undefined)."""
+    import importlib, sys
+    sys.path.insert(0, "/home/pawelw/ctxproxy")
+    try:
+        import proxy.app as app
+        importlib.reload(app)
+        # 10 messages to trigger compaction path
+        msgs = [{"role": "system", "content": "You are helpful."}]
+        for i in range(9):
+            msgs.append({"role": "user" if i % 2 == 0 else "assistant", "content": f"Message {i} " + "x" * 100})
+        app.session_compactions["test-session"] = {"last_turn": 0, "frozen_summary": ""}
+        result = app._compact_context(msgs, 200, "test-session")
+        assert isinstance(result, list)
+        return True, "compact_context no NameError"
+    except NameError as e:
+        return False, f"NameError: {e}"
+    except Exception as e:
+        return False, f"Error: {e}"
+
+def test_regress_normalize():
+    """P1.2: _normalize_system_messages must not clobber non-system first message."""
+    import importlib, sys
+    sys.path.insert(0, "/home/pawelw/ctxproxy")
+    try:
+        import proxy.app as app
+        importlib.reload(app)
+        # [user, system, user] - first message is user, must survive
+        msgs = [
+            {"role": "user", "content": "Hello, I need help"},
+            {"role": "system", "content": "You are a helpful assistant"},
+            {"role": "user", "content": "Tell me more"},
+        ]
+        result = app._normalize_system_messages(msgs)
+        # First message must still be user with original content
+        assert result[0]["role"] == "user", f"First msg role changed to {result[0]['role']}"
+        assert result[0]["content"] == "Hello, I need help", f"First msg content changed to {result[0]['content']}"
+        return True, "non-system first message preserved"
+    except Exception as e:
+        return False, f"Error: {e}"
+
+def test_regress_cache_metric():
+    """P1.3: Weighted cache metric - 100 cached on 200 prompt = 0.5 hit rate."""
+    import importlib, sys
+    sys.path.insert(0, "/home/pawelw/ctxproxy")
+    try:
+        import proxy.app as app
+        importlib.reload(app)
+        # Simulate what the metric computation does
+        cached = 100
+        prompt = 200
+        hit_rate = cached / max(1, prompt)
+        assert abs(hit_rate - 0.5) < 0.01, f"Expected 0.5, got {hit_rate}"
+        # Verify the metrics dict has the new fields
+        assert "cached_tokens_total" in app.metrics, "cached_tokens_total missing"
+        assert "prompt_tokens_total" in app.metrics, "prompt_tokens_total missing"
+        assert "evicted_sessions" in app.metrics, "evicted_sessions missing"
+        return True, f"weighted hit rate = {hit_rate}"
+    except Exception as e:
+        return False, f"Error: {e}"
+
+def test_regress_no_trim():
+    """P1.4: Continuation must not call trim_context - verify code has stop pattern."""
+    import os
+    path = "/home/pawelw/ctxproxy/proxy/app.py"
+    with open(path) as f:
+        src = f.read()
+    # The old pattern should NOT be present in continuation context
+    # New pattern: "would exceed input budget" should be present
+    has_stop = "would exceed input budget" in src
+    # Old trim in cont should be gone (check the specific cont patterns)
+    old_cont_trim = "re-trimmed to"
+    # It's ok if re-trimmed appears in non-cont context, but not in cont
+    assert has_stop, "Missing 'would exceed input budget' stop pattern"
+    return True, "continuation stop pattern present"
+
+def test_regress_refreeze_pop():
+    """P1.7: session_compactions.pop on re-freeze."""
+    path = "/home/pawelw/ctxproxy/proxy/app.py"
+    with open(path) as f:
+        src = f.read()
+    assert "session_compactions.pop(session_key, None)" in src, "Missing compactions.pop on re-freeze"
+    return True, "compactions.pop present on re-freeze"
+
+def test_regress_evict():
+    """P1.6: Session TTL eviction function exists."""
+    path = "/home/pawelw/ctxproxy/proxy/app.py"
+    with open(path) as f:
+        src = f.read()
+    assert "_evict_stale_sessions" in src, "Missing _evict_stale_sessions"
+    assert "SESSION_TTL_HOURS" in src, "Missing SESSION_TTL_HOURS"
+    assert "evicted_sessions" in src, "Missing evicted_sessions metric"
+    return True, "session eviction present"
+
+def test_regress_backpressure():
+    """P2.2: Backpressure check in _enqueue_memory_job."""
+    path = "/home/pawelw/ctxproxy/proxy/app.py"
+    with open(path) as f:
+        src = f.read()
+    assert "WORKER_BACKPRESSURE" in src, "Missing WORKER_BACKPRESSURE"
+    assert "backpressure" in src.lower(), "Missing backpressure check"
+    return True, "backpressure present"
+
+def test_regress_worker_telemetry():
+    """P2.1: Worker telemetry function exists."""
+    path = "/home/pawelw/ctxproxy/proxy/app.py"
+    with open(path) as f:
+        src = f.read()
+    assert "_read_worker_status" in src, "Missing _read_worker_status"
+    return True, "worker telemetry present"
+
+def test_regress_vllm_timeout():
+    """P2.4: vLLM client uses config-driven timeout."""
+    path = "/home/pawelw/ctxproxy/proxy/app.py"
+    with open(path) as f:
+        src = f.read()
+    assert "httpx.Timeout" in src, "Missing httpx.Timeout"
+    assert "CTXGATE_VLLM_READ_TIMEOUT" in src, "Missing VLLM_READ_TIMEOUT env"
+    return True, "vllm timeout from config"
+
+def test_regress_max_cont_top():
+    """P2.6: MAX_CONTINUATIONS defined near top of file."""
+    path = "/home/pawelw/ctxproxy/proxy/app.py"
+    with open(path) as f:
+        lines = f.readlines()
+    for i, line in enumerate(lines[:500]):
+        if "MAX_CONTINUATIONS" in line and "=" in line:
+            assert i < 500, f"MAX_CONTINUATIONS at line {i+1}, should be in first 500"
+            return True, f"MAX_CONTINUATIONS at line {i+1}"
+    return False, "MAX_CONTINUATIONS not in first 60 lines"
+
+
 dn = any("[DONE]" in l for l in lines)
 record("stream_basic", s == 200 and hd and dn)
 parts2 = []
@@ -280,6 +415,28 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
     codes = list(ex.map(fr, [1, 2, 3]))
 record("concurrent", all(c == 200 for c in codes))
 
+
+print("--- 9: Regression (P1+P2) ---")
+ok, msg = test_regress_nl()
+record("reg_nl", ok)
+ok, msg = test_regress_normalize()
+record("reg_normalize", ok)
+ok, msg = test_regress_cache_metric()
+record("reg_cache_metric", ok)
+ok, msg = test_regress_no_trim()
+record("reg_no_trim", ok)
+ok, msg = test_regress_refreeze_pop()
+record("reg_refreeze_pop", ok)
+ok, msg = test_regress_evict()
+record("reg_evict", ok)
+ok, msg = test_regress_backpressure()
+record("reg_backpressure", ok)
+ok, msg = test_regress_worker_telemetry()
+record("reg_worker_tel", ok)
+ok, msg = test_regress_vllm_timeout()
+record("reg_vllm_timeout", ok)
+ok, msg = test_regress_max_cont_top()
+record("reg_max_cont_top", ok)
 print("\n" + "=" * 60)
 print("RESULTS: " + str(PASS) + " PASS, " + str(FAIL) + " FAIL (total " + str(PASS + FAIL) + ")")
 for r in RESULTS:

@@ -24,6 +24,7 @@ from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("ctxgate-proxy")
+NL = "\n"  # newline constant for string building
 
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
@@ -451,6 +452,7 @@ MAX_INPUT = _env_int("CTXGATE_MAX_INPUT", 64000)
 MAX_OUTPUT = _env_int("CTXGATE_MAX_OUTPUT", 18000)
 SAFETY_MARGIN = _env_int("CTXGATE_SAFETY_MARGIN", 2000)
 WALL_CLOCK_MAX = _env_int("CTXGATE_WALL_CLOCK_MAX", 1800)  # 30 min - large contexts need more time
+MAX_CONTINUATIONS = int(os.environ.get("CTXGATE_MAX_CONTINUATIONS", 5))
 MEMORY_TTL_DAYS = _env_int("CTXGATE_MEMORY_TTL_DAYS", 90)
 DB_DSN = os.environ.get("CTXGATE_DB_DSN") or os.environ.get("CTXPROXY_DB_DSN") or "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy"
 PROXY_PORT = _env_int("CTXGATE_PROXY_PORT", 9201)
@@ -486,6 +488,9 @@ metrics = {
     "max_context_seen": 0,
     "cache_hits": 0,
     "cache_misses": 0,
+    "cached_tokens_total": 0,
+    "prompt_tokens_total": 0,
+    "evicted_sessions": 0,
     "summary_age_tokens": 0,
     "reasoning_strips": 0,
     "started_at": time.time(),
@@ -671,8 +676,14 @@ async def lifespan(app: FastAPI):
     worker_task = asyncio.create_task(_memory_worker_loop())
     health_task = asyncio.create_task(_vllm_health_loop())
     global _vllm_client
-    _vllm_client = httpx.AsyncClient(timeout=300)
-    log.info("shared vLLM httpx client created")
+    _vllm_timeout = httpx.Timeout(
+        _env_int("CTXGATE_VLLM_READ_TIMEOUT", 300),
+        connect=_env_int("CTXGATE_VLLM_CONNECT_TIMEOUT", 10),
+        write=_env_int("CTXGATE_VLLM_WRITE_TIMEOUT", 120),
+        pool=_env_int("CTXGATE_VLLM_POOL_TIMEOUT", 30),
+    )
+    _vllm_client = httpx.AsyncClient(timeout=_vllm_timeout)
+    log.info("shared vLLM httpx client created (timeout=%s)", _vllm_timeout)
     yield
     if _vllm_client is not None:
         await _vllm_client.aclose()
@@ -1087,6 +1098,8 @@ def trim_context(messages: list, max_tokens: int) -> list:
     return result
 
 def _track_session_tokens(session_key: str, input_tokens: int, output_tokens: int = 0, count_req: bool = True):
+    global SESSION_LAST_ACTIVE
+    SESSION_LAST_ACTIVE[session_key] = time.time()
     """Update per-session token counters. count_req=False for output-only updates."""
     if session_key not in session_tokens:
         session_tokens[session_key] = {"in": 0, "out": 0, "reqs": 0, "max_ctx": 0}
@@ -1239,14 +1252,17 @@ async def _regenerate_knowledge_item(item: dict, context: str) -> dict | None:
         return None
 
 
+_EXTRACT_SEM = asyncio.Semaphore(2)
+
 async def _fire_and_forget_extract(session_id: str, session_key: str, messages: list):
     """Background knowledge extraction - never blocks the request path."""
-    try:
-        k_items = await extract_knowledge(session_id, session_key, messages)
-        if k_items:
-            await store_knowledge(k_items, session_id, session_key)
-    except Exception as e:
-        log.warning("Knowledge extraction (background) failed: %s", e)
+    async with _EXTRACT_SEM:
+        try:
+            k_items = await extract_knowledge(session_id, session_key, messages)
+            if k_items:
+                await store_knowledge(k_items, session_id, session_key)
+        except Exception as e:
+            log.warning("Knowledge extraction (background) failed: %s", e)
 
 async def extract_knowledge(session_id: str, session_key: str, messages: list) -> list:
     """Async 4B-based knowledge extraction with quality orchestration.
@@ -1576,7 +1592,7 @@ async def fetch_relevant_knowledge(messages: list, max_items: int = 5, max_token
     return "[Shared Knowledge]\n" + "\n".join(parts)
 
 
-def _record_call(session_key: str, input_tokens: int, output_tokens: int, status: str, model: str, stream: bool, detail: str = ""):
+def _record_call(session_key: str, input_tokens: int, output_tokens: int, status: str, model: str, stream: bool, detail: str = "", cached_tokens: int = 0):
     """Add to ring buffer of recent calls."""
     entry = {
         "ts": time.time(),
@@ -1584,6 +1600,8 @@ def _record_call(session_key: str, input_tokens: int, output_tokens: int, status
         "session": session_key,
         "in": input_tokens,
         "out": output_tokens,
+        "cached": cached_tokens,
+        "cached_pct": round(100 * cached_tokens / max(1, input_tokens), 1),
         "status": status,
         "model": model,
         "stream": stream,
@@ -1647,7 +1665,11 @@ async def metrics_prometheus():
         "# TYPE ctxgate_requests_error counter", "ctxgate_requests_error %d" % metrics["requests_error"],
         "# TYPE ctxgate_cache_hits counter", "ctxgate_cache_hits %d" % metrics["cache_hits"],
     "# TYPE ctxgate_cache_misses counter", "ctxgate_cache_misses %d" % metrics["cache_misses"],
-    "# TYPE ctxgate_cache_hit_rate gauge", "ctxgate_cache_hit_rate %.4f" % (metrics["cache_hits"] / max(1, metrics["cache_hits"] + metrics["cache_misses"])),
+    "# TYPE ctxgate_cached_tokens_total counter", "ctxgate_cached_tokens_total %d" % metrics["cached_tokens_total"],
+    "# TYPE ctxgate_prompt_tokens_total counter", "ctxgate_prompt_tokens_total %d" % metrics["prompt_tokens_total"],
+    "# TYPE ctxgate_cache_hit_rate gauge", "ctxgate_cache_hit_rate %.4f" % (metrics["cached_tokens_total"] / max(1, metrics["prompt_tokens_total"])),
+    "# TYPE ctxgate_effective_prefill_per_request gauge", "ctxgate_effective_prefill_per_request %.1f" % ((metrics["prompt_tokens_total"] - metrics["cached_tokens_total"]) / max(1, metrics["requests_ok"])),
+    "# TYPE ctxgate_evicted_sessions_total counter", "ctxgate_evicted_sessions_total %d" % metrics["evicted_sessions"],
     "# TYPE ctxgate_trim_events counter", "ctxgate_trim_events %d" % metrics["trim_events"],
         "# TYPE ctxgate_prefix_invalidations counter", "ctxgate_prefix_invalidations %d" % metrics["prefix_invalidations"],
         "# TYPE ctxgate_toolcall_strips counter", "ctxgate_toolcall_strips %d" % metrics["toolcall_strips"],
@@ -1657,6 +1679,9 @@ async def metrics_prometheus():
         "# TYPE ctxgate_max_context_seen gauge", "ctxgate_max_context_seen %d" % metrics["max_context_seen"],
         "# TYPE ctxgate_active_sessions gauge", "ctxgate_active_sessions %d" % len(session_fingerprints),
         "# TYPE ctxgate_uptime_seconds gauge", "ctxgate_uptime_seconds %.1f" % uptime,
+        "# TYPE ctxgate_extract_queue_depth gauge", "ctxgate_extract_queue_depth %d" % (2 - _EXTRACT_SEM._value),
+        "# TYPE ctxgate_worker_lag_seconds gauge", "ctxgate_worker_lag_seconds %.1f" % _read_worker_status().get("lag_seconds", 0),
+        "# TYPE ctxgate_worker_pending gauge", "ctxgate_worker_pending %d" % _read_worker_status().get("pending", 0),
     ]
     return Response("\n".join(lines) + "\n", media_type="text/plain")
 
@@ -1664,12 +1689,17 @@ async def metrics_prometheus():
 async def api_metrics():
     """Structured metrics for dashboard (JSON)."""
     uptime = time.time() - metrics["started_at"]
+    _hit_rate = metrics["cached_tokens_total"] / max(1, metrics["prompt_tokens_total"])
+    _eff_prefill = (metrics["prompt_tokens_total"] - metrics["cached_tokens_total"]) / max(1, metrics["requests_ok"])
     return {
         **metrics,
+        "cache_hit_rate": round(_hit_rate, 4),
+        "effective_prefill_per_request": round(_eff_prefill, 1),
         "uptime_sec": round(uptime, 1),
         "uptime_human": _human_time(uptime),
         "started_human": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(metrics["started_at"])),
         "active_sessions": len(session_fingerprints),
+        "worker": _read_worker_status(),
     }
 
 @app.get("/api/sessions")
@@ -1879,6 +1909,7 @@ async def chat_completions(request: Request):
                     metrics["prefix_invalidations"] += 1
                     log.warning("SEED CHANGED session=%s pos=%d - re-freezing (deliberate miss)", session_key, i)
                     session_seeds[session_key] = [dict(m) for m in built[:3]]
+                    session_compactions.pop(session_key, None)
                     break
 
     # Token tracking
@@ -1923,6 +1954,38 @@ async def chat_completions(request: Request):
     return result
 
 
+SESSION_TTL_HOURS = _env_int("CTXGATE_SESSION_TTL_HOURS", 12)
+SESSION_LAST_ACTIVE: dict[str, float] = {}
+
+def _read_worker_status() -> dict:
+    """Read worker/.worker_status.json if it exists."""
+    import json as _json
+    path = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "worker", ".worker_status.json"))
+    try:
+        with open(path, "r") as f:
+            return _json.load(f)
+    except (FileNotFoundError, _json.JSONDecodeError, OSError):
+        return {"alive": False, "lag_seconds": 0, "pending": 0, "heartbeat": ""}
+
+
+
+def _evict_stale_sessions():
+    """Evict session state older than SESSION_TTL_HOURS."""
+    now = time.time()
+    ttl_sec = SESSION_TTL_HOURS * 3600
+    global metrics
+    stale = [k for k, ts in SESSION_LAST_ACTIVE.items() if now - ts > ttl_sec]
+    for k in stale:
+        session_fingerprints.pop(k, None)
+        session_seeds.pop(k, None)
+        session_compactions.pop(k, None)
+        session_tokens.pop(k, None)
+        SESSION_LAST_ACTIVE.pop(k, None)
+    if stale:
+        metrics["evicted_sessions"] += len(stale)
+        log.info("Evicted %d stale sessions (TTL %dh)", len(stale), SESSION_TTL_HOURS)
+
+
 async def _vllm_health_loop():
     """Ping vLLM /models every 60s to track availability."""
     global vllm_alive
@@ -1942,10 +2005,14 @@ async def _vllm_health_loop():
             if vllm_alive:
                 log.warning("vLLM unreachable: %s - marking dead", e)
             vllm_alive = False
+        _evict_stale_sessions()
         await asyncio.sleep(60)
 
 def _normalize_system_messages(messages):
     if not messages:
+        return messages
+    # Never convert a non-system slot into a system one.
+    if messages[0].get("role") != "system":
         return messages
     sys_parts = []
     rest = []
@@ -1968,11 +2035,6 @@ def _normalize_system_messages(messages):
 _vllm_client = None
 
 
-@asynccontextmanager
-async def _get_vllm_client():
-    yield _vllm_client  # created in lifespan, shared across requests
-
-
 async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
     global metrics
     vllm_body["messages"] = _normalize_system_messages(vllm_body.get("messages", []))
@@ -1981,111 +2043,113 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
         log.warning("vLLM is down - rejecting request early")
         return JSONResponse({"error": {"message": "vLLM is not available (health check failed). Start vLLM and retry."}}, status_code=503)
     try:
-        async with _get_vllm_client() as client:
-            _attempts = 0
-            while True:
-                _attempts += 1
+        client = _vllm_client
+        _attempts = 0
+        while True:
+            _attempts += 1
+            resp = await client.post(VLLM_URL + "/chat/completions", json=vllm_body)
+            if resp.status_code in (500, 503) and _attempts < 3:
+                _delay = 1.0 * _attempts
+                log.warning("vLLM transient %d (attempt %d/3) - retrying in %.1fs", resp.status_code, _attempts, _delay)
+                await asyncio.sleep(_delay)
+                continue
+            break
+        if resp.status_code != 200:
+            # BUG 4 fix: on 400 (context too long), re-trim more aggressively and retry once
+            if resp.status_code == 400 and "context" in resp.text.lower():
+                log.warning("vLLM 400 (context length) - re-trimming and retrying")
+                reduced_limit = int(input_tokens * 0.8)
+                vllm_body["messages"] = trim_context(vllm_body["messages"], reduced_limit)
+                new_input_tokens = count_messages_tokens(vllm_body["messages"])
+                vllm_body["max_tokens"] = min(MAX_OUTPUT, MAX_CONTEXT - new_input_tokens - SAFETY_MARGIN)
+                input_tokens = new_input_tokens
                 resp = await client.post(VLLM_URL + "/chat/completions", json=vllm_body)
-                if resp.status_code in (500, 503) and _attempts < 3:
-                    _delay = 1.0 * _attempts
-                    log.warning("vLLM transient %d (attempt %d/3) - retrying in %.1fs", resp.status_code, _attempts, _delay)
-                    await asyncio.sleep(_delay)
-                    continue
-                break
-            if resp.status_code != 200:
-                # BUG 4 fix: on 400 (context too long), re-trim more aggressively and retry once
-                if resp.status_code == 400 and "context" in resp.text.lower():
-                    log.warning("vLLM 400 (context length) - re-trimming and retrying")
-                    reduced_limit = int(input_tokens * 0.8)
-                    vllm_body["messages"] = trim_context(vllm_body["messages"], reduced_limit)
-                    new_input_tokens = count_messages_tokens(vllm_body["messages"])
-                    vllm_body["max_tokens"] = min(MAX_OUTPUT, MAX_CONTEXT - new_input_tokens - SAFETY_MARGIN)
-                    input_tokens = new_input_tokens
-                    resp = await client.post(VLLM_URL + "/chat/completions", json=vllm_body)
-                    if resp.status_code != 200:
-                        metrics["requests_error"] += 1
-                        log.error("vLLM retry also failed %d: %s", resp.status_code, resp.text[:500])
-                        _record_call(session_key, input_tokens, 0, f"vllm_{resp.status_code}", VLLM_MODEL, False, resp.text[:300])
-                        return JSONResponse({"error": {"message": "vLLM " + str(resp.status_code), "explanation": explain_status(f"vllm_{resp.status_code}", resp.text[:300])}}, status_code=resp.status_code)
-                else:
+                if resp.status_code != 200:
                     metrics["requests_error"] += 1
-                    log.error("vLLM error %d: %s", resp.status_code, resp.text[:500])
+                    log.error("vLLM retry also failed %d: %s", resp.status_code, resp.text[:500])
                     _record_call(session_key, input_tokens, 0, f"vllm_{resp.status_code}", VLLM_MODEL, False, resp.text[:300])
                     return JSONResponse({"error": {"message": "vLLM " + str(resp.status_code), "explanation": explain_status(f"vllm_{resp.status_code}", resp.text[:300])}}, status_code=resp.status_code)
+            else:
+                metrics["requests_error"] += 1
+                log.error("vLLM error %d: %s", resp.status_code, resp.text[:500])
+                _record_call(session_key, input_tokens, 0, f"vllm_{resp.status_code}", VLLM_MODEL, False, resp.text[:300])
+                return JSONResponse({"error": {"message": "vLLM " + str(resp.status_code), "explanation": explain_status(f"vllm_{resp.status_code}", resp.text[:300])}}, status_code=resp.status_code)
+        data = resp.json()
+        choices = data.get("choices", [])
+        for choice in choices:
+            msg = choice.get("message", {})
+            if msg.get("tool_calls"):
+                cleaned, stripped = sanitize_tool_calls(msg)
+                if stripped:
+                    metrics["toolcall_strips"] += 1
+                    choice["message"]["tool_calls"] = None
+                    choice["finish_reason"] = "stop"
+        output_tokens = data.get("usage", {}).get("completion_tokens", 0)
+        # Auto-continuation: if vLLM hit max_tokens, keep going
+        ns_wall_start = time.time()
+        cont_count = 0
+        while choices and choices[0].get("finish_reason") == "length" and cont_count < MAX_CONTINUATIONS:
+            if time.time() - ns_wall_start > WALL_CLOCK_MAX:
+                log.warning("Wall clock %ds exceeded - stopping non-stream", WALL_CLOCK_MAX)
+                break
+            cont_count += 1
+            log.info("Non-stream: auto-continuing (%d/%d)", cont_count, MAX_CONTINUATIONS)
+            msg_c = choices[0].get("message", {})
+            trunc_type = _classify_truncation("length", msg_c.get("content",""), msg_c.get("reasoning_content",""), msg_c.get("tool_calls"))
+            if trunc_type == "reasoning_overflow":
+                cb = dict(vllm_body)
+                cb["chat_template_kwargs"] = {"enable_thinking": False}
+                r2 = await client.post(VLLM_URL + "/chat/completions", json=cb)
+                if r2.status_code == 200:
+                    d2 = r2.json()
+                    nc = d2.get("choices", [])
+                    if nc and nc[0].get("message",{}).get("content"):
+                        choices[0]["message"]["content"] = (msg_c.get("content","") or "") + nc[0]["message"]["content"]
+                        choices[0]["finish_reason"] = nc[0].get("finish_reason", "stop")
+                        output_tokens += d2.get("usage",{}).get("completion_tokens",0)
+                break
+            partial = choices[0].get("message", {}).get("content") or ""
+            cont_msgs = list(vllm_body.get("messages", []))
+            cont_msgs.append({"role": "assistant", "content": partial})
+            cont_msgs.append({"role": "user", "content": "Continue from exactly where you left off. Do not repeat any content already provided. Resume the next word/sentence/code line."})
+            # Re-trim: messages grew with assistant response
+            cont_tokens = count_messages_tokens(cont_msgs)
+            if cont_tokens > MAX_INPUT:
+                log.info("Non-stream cont: would exceed input budget (%d > %d) - stopping", cont_tokens, MAX_INPUT)
+                break
+            cont_body = dict(vllm_body)
+            cont_body["messages"] = cont_msgs
+            cont_body["max_tokens"] = min(MAX_OUTPUT, MAX_CONTEXT - cont_tokens - SAFETY_MARGIN)
+            resp = await client.post(VLLM_URL + "/chat/completions", json=cont_body)
+            if resp.status_code != 200:
+                break
             data = resp.json()
             choices = data.get("choices", [])
-            for choice in choices:
-                msg = choice.get("message", {})
-                if msg.get("tool_calls"):
-                    cleaned, stripped = sanitize_tool_calls(msg)
-                    if stripped:
-                        metrics["toolcall_strips"] += 1
-                        choice["message"]["tool_calls"] = None
-                        choice["finish_reason"] = "stop"
-            output_tokens = data.get("usage", {}).get("completion_tokens", 0)
-            # Auto-continuation: if vLLM hit max_tokens, keep going
-            ns_wall_start = time.time()
-            cont_count = 0
-            while choices and choices[0].get("finish_reason") == "length" and cont_count < MAX_CONTINUATIONS:
-                if time.time() - ns_wall_start > WALL_CLOCK_MAX:
-                    log.warning("Wall clock %ds exceeded - stopping non-stream", WALL_CLOCK_MAX)
-                    break
-                cont_count += 1
-                log.info("Non-stream: auto-continuing (%d/%d)", cont_count, MAX_CONTINUATIONS)
-                msg_c = choices[0].get("message", {})
-                trunc_type = _classify_truncation("length", msg_c.get("content",""), msg_c.get("reasoning_content",""), msg_c.get("tool_calls"))
-                if trunc_type == "reasoning_overflow":
-                    cb = dict(vllm_body)
-                    cb["chat_template_kwargs"] = {"enable_thinking": False}
-                    r2 = await client.post(VLLM_URL + "/chat/completions", json=cb)
-                    if r2.status_code == 200:
-                        d2 = r2.json()
-                        nc = d2.get("choices", [])
-                        if nc and nc[0].get("message",{}).get("content"):
-                            choices[0]["message"]["content"] = (msg_c.get("content","") or "") + nc[0]["message"]["content"]
-                            choices[0]["finish_reason"] = nc[0].get("finish_reason", "stop")
-                            output_tokens += d2.get("usage",{}).get("completion_tokens",0)
-                    break
-                partial = choices[0].get("message", {}).get("content") or ""
-                cont_msgs = list(vllm_body.get("messages", []))
-                cont_msgs.append({"role": "assistant", "content": partial})
-                cont_msgs.append({"role": "user", "content": "Continue from exactly where you left off. Do not repeat any content already provided. Resume the next word/sentence/code line."})
-                # Re-trim: messages grew with assistant response
-                cont_tokens = count_messages_tokens(cont_msgs)
-                if cont_tokens > MAX_INPUT:
-                    cont_msgs = trim_context(cont_msgs, MAX_INPUT)
-                    cont_tokens = count_messages_tokens(cont_msgs)
-                    log.info("Non-stream cont: re-trimmed to %d msgs (%d tok)", len(cont_msgs), cont_tokens)
-                cont_body = dict(vllm_body)
-                cont_body["messages"] = cont_msgs
-                cont_body["max_tokens"] = min(MAX_OUTPUT, MAX_CONTEXT - cont_tokens - SAFETY_MARGIN)
-                resp = await client.post(VLLM_URL + "/chat/completions", json=cont_body)
-                if resp.status_code != 200:
-                    break
-                data = resp.json()
-                choices = data.get("choices", [])
-                if choices:
-                    new_c = choices[0].get("message", {}).get("content", "")
-                    if new_c:
-                        choices[0]["message"]["content"] = partial + new_c
-                    output_tokens += data.get("usage", {}).get("completion_tokens", 0)
-            for choice in choices:
-                if choice.get("finish_reason") == "length" and choice.get("message", {}).get("content"):
-                    choice["message"]["content"] = _safe_truncate(choice["message"]["content"])
-                    choice["finish_reason"] = "stop"
-            metrics["tokens_out_total"] += output_tokens
-            metrics["requests_ok"] += 1
-            _track_session_tokens(session_key, 0, output_tokens, count_req=False)
-            _record_call(session_key, input_tokens, output_tokens, "ok", VLLM_MODEL, False)
-            data["usage"]["completion_tokens"] = output_tokens
-            data["usage"]["total_tokens"] = input_tokens + output_tokens
-            data["usage"]["prompt_tokens"] = input_tokens
-            # Normalize reasoning field: vLLM may use 'reasoning' instead of 'reasoning_content'
-            for ch in data.get("choices", []):
-                msg = ch.get("message", {})
-                if "reasoning" in msg and "reasoning_content" not in msg:
-                    msg["reasoning_content"] = msg.pop("reasoning")
-            return JSONResponse(data)
+            if choices:
+                new_c = choices[0].get("message", {}).get("content", "")
+                if new_c:
+                    choices[0]["message"]["content"] = partial + new_c
+                output_tokens += data.get("usage", {}).get("completion_tokens", 0)
+        for choice in choices:
+            if choice.get("finish_reason") == "length" and choice.get("message", {}).get("content"):
+                choice["message"]["content"] = _safe_truncate(choice["message"]["content"])
+                choice["finish_reason"] = "stop"
+        metrics["tokens_out_total"] += output_tokens
+        metrics["requests_ok"] += 1
+        _ns_cached = data.get("usage", {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
+        metrics["cached_tokens_total"] += _ns_cached
+        metrics["prompt_tokens_total"] += input_tokens
+        _track_session_tokens(session_key, 0, output_tokens, count_req=False)
+        _record_call(session_key, input_tokens, output_tokens, "ok", VLLM_MODEL, False, cached_tokens=_ns_cached)
+        data["usage"]["completion_tokens"] = output_tokens
+        data["usage"]["total_tokens"] = input_tokens + output_tokens
+        data["usage"]["prompt_tokens"] = input_tokens
+        # Normalize reasoning field: vLLM may use 'reasoning' instead of 'reasoning_content'
+        for ch in data.get("choices", []):
+            msg = ch.get("message", {})
+            if "reasoning" in msg and "reasoning_content" not in msg:
+                msg["reasoning_content"] = msg.pop("reasoning")
+        return JSONResponse(data)
     except httpx.TimeoutException:
         metrics["requests_error"] += 1
         _record_call(session_key, input_tokens, 0, "timeout", VLLM_MODEL, False, "vLLM 300s timeout")
@@ -2112,7 +2176,7 @@ def _safe_truncate(text):
     return text
 
 
-MAX_CONTINUATIONS = int(os.environ.get("CTXGATE_MAX_CONTINUATIONS", 5))
+
 
 
 
@@ -2123,128 +2187,130 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
         global metrics
         total_output_tokens = 0
         seg_cached_tokens = 0
+        total_cached_tokens = 0
         BUFFER_SIZE = 300
         buf = ""
         full_content = ""
         continuation_count = 0
         current_body = dict(vllm_body)
         try:
-            async with _get_vllm_client() as client:
-                wall_start = time.time()
-                while True:
-                    if time.time() - wall_start > WALL_CLOCK_MAX:
-                        log.warning("Wall clock %ds exceeded - stopping stream", WALL_CLOCK_MAX)
-                        break
-                    finish_reason = "stop"
-                    seg_output_tokens = 0
-                    seg_content = ""
-                    async with client.stream("POST", VLLM_URL + "/chat/completions", json=current_body) as resp:
-                        if resp.status_code != 200:
-                            body_bytes = await resp.aread()
-                            metrics["requests_error"] += 1
-                            _record_call(session_key, input_tokens, 0, "vllm_" + str(resp.status_code), VLLM_MODEL, True, body_bytes[:300].decode("utf-8", errors="replace"))
-                            yield "data: " + json.dumps({"error": body_bytes[:200].decode("utf-8", errors="replace")}) + "\n\n"
-                            yield "data: [DONE]\n\n"
-                            return
-                        async for line in resp.aiter_lines():
-                            if line.startswith("data: "):
-                                data_str = line[6:]
-                                if data_str == "[DONE]":
-                                    break
-                                try:
-                                    chunk = json.loads(data_str)
-                                    usage = chunk.get("usage")
-                                    if usage:
-                                        if usage.get("completion_tokens"):
-                                            seg_output_tokens = usage["completion_tokens"]
-                                        seg_cached_tokens = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
-                                        usage["prompt_tokens"] = input_tokens
-                                        usage["total_tokens"] = input_tokens + (usage.get("completion_tokens") or 0)
-                                    choices = chunk.get("choices", [])
-                                    if choices:
-                                        fr = choices[0].get("finish_reason")
-                                        if fr:
-                                            finish_reason = fr
-                                        delta = choices[0].get("delta", {})
-                                        reasoning_piece = delta.get("reasoning_content", "") or delta.get("reasoning", "")
-                                        tool_calls_piece = delta.get("tool_calls")
-                                        if reasoning_piece:
-                                            rc = {"id": chunk.get("id","gen"),"object":"chat.completion.chunk","created":chunk.get("created",0),"model":VLLM_MODEL,"choices":[{"index":0,"delta":{"reasoning_content":reasoning_piece},"finish_reason":None}]}
-                                            yield "data: " + json.dumps(rc) + chr(10) + chr(10)
-                                        if tool_calls_piece:
-                                            tc2 = {"id": chunk.get("id","gen"),"object":"chat.completion.chunk","created":chunk.get("created",0),"model":VLLM_MODEL,"choices":[{"index":0,"delta":{"tool_calls":tool_calls_piece},"finish_reason":None}]}
-                                            yield "data: " + json.dumps(tc2) + chr(10) + chr(10)
-                                        content_piece = delta.get("content", "")
-                                        if content_piece:
-                                            seg_content += content_piece
-                                            buf += content_piece
-                                            if len(buf) > BUFFER_SIZE:
-                                                flush_part = buf[:-BUFFER_SIZE]
-                                                buf = buf[-BUFFER_SIZE:]
-                                                out_chunk = {"id": chunk.get("id", "gen"), "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": chunk.get("model", VLLM_MODEL), "choices": [{"index": 0, "delta": {"content": flush_part}, "finish_reason": None}]}
-                                                yield "data: " + json.dumps(out_chunk) + "\n\n"
-                                            else:
-                                                non_content = {k: v for k, v in delta.items() if k not in ("content", "reasoning_content", "tool_calls")}
-                                                if non_content:
-                                                    out_chunk = {"id": chunk.get("id", "gen"), "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": chunk.get("model", VLLM_MODEL), "choices": [{"index": 0, "delta": non_content, "finish_reason": None}]}
-                                                    yield "data: " + json.dumps(out_chunk) + "\n\n"
-                                except (json.JSONDecodeError, ValueError):
-                                    yield "data: " + data_str + "\n\n"
-                    total_output_tokens += seg_output_tokens
-                    seg_cached_tokens = 0
-                    if seg_content and full_content:
-                        tail = full_content[-100:]
-                        overlap = 0
-                        for j in range(min(len(tail), len(seg_content)), 0, -1):
-                            if seg_content[:j] == tail[-j:]:
-                                overlap = j
-                                break
-                        if overlap > 10:
-                            log.info("Seam dedup: trimmed %d overlapping chars", overlap)
-                            seg_content = seg_content[overlap:]
-                    full_content += seg_content
-                    if finish_reason == "length" and _is_repeating(full_content):
-                        log.warning("Repetition detected - stopping stream")
-                        finish_reason = "stop"
-                        break
-                    if finish_reason == "length" and continuation_count < MAX_CONTINUATIONS:
-                        continuation_count += 1
-                        log.info("vLLM hit max_tokens(%d) - auto-continuing (%d/%d)", MAX_OUTPUT, continuation_count, MAX_CONTINUATIONS)
-                        safe_buf = _safe_truncate(buf)
-                        if len(buf) != len(safe_buf):
-                            log.info("Trimmed %d chars before continuation", len(buf) - len(safe_buf))
-                        buf = safe_buf
-                        if buf:
-                            out_chunk = {"id": "gen", "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]}
-                            yield "data: " + json.dumps(out_chunk) + "\n\n"
-                            buf = ""
-                        orig_messages = vllm_body.get("messages", [])
-                        cont_messages = list(orig_messages)
-                        if len(full_content) > 50:
-                            cont_messages.append({"role": "assistant", "content": full_content})
-                            cont_messages.append({"role": "user", "content": "Your response was cut off. Continue writing from where it stopped. Do not repeat content. Resume the next word, sentence, or code line."})
-                        else:
-                            cont_messages.append({"role": "assistant", "content": full_content or "(in progress)"})
-                            cont_messages.append({"role": "user", "content": "You were interrupted before producing your answer. Now produce your complete final answer directly. Skip thinking and just give the response."})
-                        # Re-trim: messages grew with assistant response
-                        cont_tokens = count_messages_tokens(cont_messages)
-                        if cont_tokens > MAX_INPUT:
-                            cont_messages = trim_context(cont_messages, MAX_INPUT)
-                            cont_tokens = count_messages_tokens(cont_messages)
-                            log.info("Stream cont: re-trimmed to %d msgs (%d tok)", len(cont_messages), cont_tokens)
-                        current_body = dict(vllm_body)
-                        current_body["messages"] = cont_messages
-                        current_body["max_tokens"] = min(MAX_OUTPUT, MAX_CONTEXT - cont_tokens - SAFETY_MARGIN)
-                        continue
-                        current_body["messages"] = cont_messages
-                        current_body["max_tokens"] = MAX_OUTPUT
-                        continue
-                    elif finish_reason == "length":
-                        log.warning("Max continuations (%d) reached - stopping", MAX_CONTINUATIONS)
-                        safe_buf = _safe_truncate(buf)
-                        buf = safe_buf
-                        finish_reason = "stop"
+            client = _vllm_client
+            wall_start = time.time()
+            while True:
+                if time.time() - wall_start > WALL_CLOCK_MAX:
+                    log.warning("Wall clock %ds exceeded - stopping stream", WALL_CLOCK_MAX)
                     break
+                finish_reason = "stop"
+                seg_output_tokens = 0
+                seg_content = ""
+                async with client.stream("POST", VLLM_URL + "/chat/completions", json=current_body) as resp:
+                    if resp.status_code != 200:
+                        body_bytes = await resp.aread()
+                        metrics["requests_error"] += 1
+                        _record_call(session_key, input_tokens, 0, "vllm_" + str(resp.status_code), VLLM_MODEL, True, body_bytes[:300].decode("utf-8", errors="replace"))
+                        yield "data: " + json.dumps({"error": body_bytes[:200].decode("utf-8", errors="replace")}) + "\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    async for line in resp.aiter_lines():
+                        if line.startswith("data: "):
+                            data_str = line[6:]
+                            if data_str == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(data_str)
+                                usage = chunk.get("usage")
+                                if usage:
+                                    if usage.get("completion_tokens"):
+                                        seg_output_tokens = usage["completion_tokens"]
+                                    seg_cached_tokens = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
+                                    total_cached_tokens += seg_cached_tokens
+                                    usage["prompt_tokens"] = input_tokens
+                                    usage["total_tokens"] = input_tokens + (usage.get("completion_tokens") or 0)
+                                choices = chunk.get("choices", [])
+                                if choices:
+                                    fr = choices[0].get("finish_reason")
+                                    if fr:
+                                        finish_reason = fr
+                                    delta = choices[0].get("delta", {})
+                                    reasoning_piece = delta.get("reasoning_content", "") or delta.get("reasoning", "")
+                                    tool_calls_piece = delta.get("tool_calls")
+                                    if reasoning_piece:
+                                        rc = {"id": chunk.get("id","gen"),"object":"chat.completion.chunk","created":chunk.get("created",0),"model":VLLM_MODEL,"choices":[{"index":0,"delta":{"reasoning_content":reasoning_piece},"finish_reason":None}]}
+                                        yield "data: " + json.dumps(rc) + chr(10) + chr(10)
+                                    if tool_calls_piece:
+                                        tc2 = {"id": chunk.get("id","gen"),"object":"chat.completion.chunk","created":chunk.get("created",0),"model":VLLM_MODEL,"choices":[{"index":0,"delta":{"tool_calls":tool_calls_piece},"finish_reason":None}]}
+                                        yield "data: " + json.dumps(tc2) + chr(10) + chr(10)
+                                    content_piece = delta.get("content", "")
+                                    if content_piece:
+                                        seg_content += content_piece
+                                        buf += content_piece
+                                        if len(buf) > BUFFER_SIZE:
+                                            flush_part = buf[:-BUFFER_SIZE]
+                                            buf = buf[-BUFFER_SIZE:]
+                                            out_chunk = {"id": chunk.get("id", "gen"), "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": chunk.get("model", VLLM_MODEL), "choices": [{"index": 0, "delta": {"content": flush_part}, "finish_reason": None}]}
+                                            yield "data: " + json.dumps(out_chunk) + "\n\n"
+                                        else:
+                                            non_content = {k: v for k, v in delta.items() if k not in ("content", "reasoning_content", "tool_calls")}
+                                            if non_content:
+                                                out_chunk = {"id": chunk.get("id", "gen"), "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": chunk.get("model", VLLM_MODEL), "choices": [{"index": 0, "delta": non_content, "finish_reason": None}]}
+                                                yield "data: " + json.dumps(out_chunk) + "\n\n"
+                            except (json.JSONDecodeError, ValueError):
+                                yield "data: " + data_str + "\n\n"
+                total_output_tokens += seg_output_tokens
+                seg_cached_tokens = 0
+                if seg_content and full_content:
+                    tail = full_content[-100:]
+                    overlap = 0
+                    for j in range(min(len(tail), len(seg_content)), 0, -1):
+                        if seg_content[:j] == tail[-j:]:
+                            overlap = j
+                            break
+                    if overlap > 10:
+                        log.info("Seam dedup: trimmed %d overlapping chars", overlap)
+                        seg_content = seg_content[overlap:]
+                full_content += seg_content
+                if finish_reason == "length" and _is_repeating(full_content):
+                    log.warning("Repetition detected - stopping stream")
+                    finish_reason = "stop"
+                    break
+                if finish_reason == "length" and continuation_count < MAX_CONTINUATIONS:
+                    continuation_count += 1
+                    log.info("vLLM hit max_tokens(%d) - auto-continuing (%d/%d)", MAX_OUTPUT, continuation_count, MAX_CONTINUATIONS)
+                    safe_buf = _safe_truncate(buf)
+                    if len(buf) != len(safe_buf):
+                        log.info("Trimmed %d chars before continuation", len(buf) - len(safe_buf))
+                    buf = safe_buf
+                    if buf:
+                        out_chunk = {"id": "gen", "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]}
+                        yield "data: " + json.dumps(out_chunk) + "\n\n"
+                        buf = ""
+                    orig_messages = vllm_body.get("messages", [])
+                    cont_messages = list(orig_messages)
+                    if len(full_content) > 50:
+                        cont_messages.append({"role": "assistant", "content": full_content})
+                        cont_messages.append({"role": "user", "content": "Your response was cut off. Continue writing from where it stopped. Do not repeat content. Resume the next word, sentence, or code line."})
+                    else:
+                        cont_messages.append({"role": "assistant", "content": full_content or "(in progress)"})
+                        cont_messages.append({"role": "user", "content": "You were interrupted before producing your answer. Now produce your complete final answer directly. Skip thinking and just give the response."})
+                    # Re-trim: messages grew with assistant response
+                    cont_tokens = count_messages_tokens(cont_messages)
+                    if cont_tokens > MAX_INPUT:
+                        log.info("Stream cont: would exceed input budget (%d > %d) - stopping", cont_tokens, MAX_INPUT)
+                        finish_reason = "stop"
+                        break
+                    current_body = dict(vllm_body)
+                    current_body["messages"] = cont_messages
+                    current_body["max_tokens"] = min(MAX_OUTPUT, MAX_CONTEXT - cont_tokens - SAFETY_MARGIN)
+                    continue
+                    current_body["messages"] = cont_messages
+                    current_body["max_tokens"] = MAX_OUTPUT
+                    continue
+                elif finish_reason == "length":
+                    log.warning("Max continuations (%d) reached - stopping", MAX_CONTINUATIONS)
+                    safe_buf = _safe_truncate(buf)
+                    buf = safe_buf
+                    finish_reason = "stop"
+                break
             if buf:
                 out_chunk = {"id": "gen", "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]}
                 yield "data: " + json.dumps(out_chunk) + "\n\n"
@@ -2257,10 +2323,12 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             yield "data: " + json.dumps(final_chunk) + "\n\n"
             yield "data: [DONE]\n\n"
             metrics["requests_ok"] += 1
+            metrics["cached_tokens_total"] += total_cached_tokens
+            metrics["prompt_tokens_total"] += input_tokens
             if total_output_tokens:
                 metrics["tokens_out_total"] += total_output_tokens
                 _track_session_tokens(session_key, 0, total_output_tokens, count_req=False)
-            _record_call(session_key, input_tokens, total_output_tokens, "ok", VLLM_MODEL, True)
+            _record_call(session_key, input_tokens, total_output_tokens, "ok", VLLM_MODEL, True, cached_tokens=total_cached_tokens)
             if continuation_count > 0:
                 log.info("Stream done: %d continuations, %d total tokens", continuation_count, total_output_tokens)
         except httpx.TimeoutException:
@@ -2324,9 +2392,22 @@ async def _get_goose_session_info(session_id: str) -> Optional[dict]:
         log.debug("Goose session info lookup failed for %s: %s", session_id, e)
     return None
 
+WORKER_BACKPRESSURE = _env_int("CTXGATE_WORKER_BACKPRESSURE", 50)
+
+
 async def _enqueue_memory_job(session_id, user_content):
     if os.environ.get("CTXGATE_MEMORY_WORKER", "1") == "0":
         return
+    # --- Backpressure: skip if worker queue is too full ---
+    try:
+        if pool:
+            pending = await pool.fetchval(
+                "SELECT COUNT(*) FROM proxy.memory_jobs WHERE status='pending'")
+            if pending and pending > WORKER_BACKPRESSURE:
+                log.warning("Backpressure: %d pending memory jobs > %d - skipping", pending, WORKER_BACKPRESSURE)
+                return
+    except Exception:
+        pass
     # --- Boilerplate filter: strip <turn-context> blocks ---
     import re
     cleaned = re.sub(r'<turn-context>.*?</turn-context>', '', user_content, flags=re.DOTALL).strip()
@@ -2902,7 +2983,7 @@ select { background: var(--surface2); color: var(--text); border: 1px solid var(
     <h2>Recent Calls</h2>
     <div style="max-height: 250px; overflow-y: auto;">
       <table id="calls-table">
-        <thead><tr><th>Time</th><th>Session</th><th>In</th><th>Out</th><th>Lat</th><th>Status</th><th>Stream</th></tr></thead>
+        <thead><tr><th>Time</th><th>Session</th><th>In</th><th>Out</th><th>Cached%</th><th>Status</th><th>Stream</th></tr></thead>
         <tbody></tbody>
       </table>
     </div>
@@ -3048,11 +3129,15 @@ async function refresh() {
     document.getElementById('status-dot').style.background = 'var(--green)';
     document.getElementById('status-text').textContent = 'Live · ' + m.uptime_human + ' uptime · ' + m.active_sessions + ' sessions';
 
+    const _hitRate = m.cache_hit_rate != null ? (m.cache_hit_rate * 100).toFixed(1) + '%' : 'N/A';
+    const _hitCls = m.cache_hit_rate != null && m.cache_hit_rate < 0.85 ? 'red' : 'green';
     const cards = [
+      { label: 'Cache Hit %', value: _hitRate, sub: 'weighted (tokens)', cls: _hitCls },
+      { label: 'Effective Prefill / req', value: fmtNum(m.effective_prefill_per_request), sub: 'tokens pre-filled', cls: (m.effective_prefill_per_request || 0) > 10000 ? 'red' : 'green' },
+      { label: 'Prefix Invalidations', value: m.prefix_invalidations, sub: 'deliberate misses', cls: m.prefix_invalidations > 5 ? 'yellow' : '' },
       { label: 'Requests', value: m.requests_total, sub: m.requests_ok + ' ok / ' + m.requests_error + ' err', cls: 'blue' },
       { label: 'Tokens In', value: fmtNum(m.tokens_in_total), sub: 'max ctx: ' + fmtNum(m.max_context_seen), cls: '' },
       { label: 'Tokens Out', value: fmtNum(m.tokens_out_total), sub: 'avg ' + fmtNum(m.requests_total ? Math.round(m.tokens_out_total/m.requests_total) : 0) + '/req', cls: 'green' },
-      { label: 'Trim Events', value: m.trim_events, sub: 'prefix inv: ' + m.prefix_invalidations, cls: m.trim_events > 0 ? 'yellow' : '' },
       { label: 'Sessions', value: sessions.length, sub: 'active tracked', cls: 'blue' },
       { label: 'Uptime', value: m.uptime_human, sub: 'since ' + m.started_human, cls: '' },
     ];
