@@ -320,12 +320,30 @@ def check_prefix(session_key: str, messages: list) -> None:
 def strip_reasoning(messages: list) -> list:
     cleaned = []
     for m in messages:
-        if m.get("role") == "assistant" and "reasoning" in m:
-            m = {k: v for k, v in m.items() if k != "reasoning"}
+        if m.get("role") == "assistant" and "reasoning_content" in m:
+            m = {k: v for k, v in m.items() if k != "reasoning_content"}
         cleaned.append(m)
     return cleaned
 
 # --- D9: Malformed tool-call sanitization ---
+def _classify_truncation(finish_reason: str, content: str, reasoning_content: str, tool_calls: list) -> str:
+    reasoning_tok = count_tokens(reasoning_content or "" )
+    content_len = len(content or "" )
+    if finish_reason == "length":
+        if reasoning_tok >= 12000 and content_len < 50:
+            return "reasoning_overflow"
+        return "content_truncation"
+    if finish_reason == "tool_calls":
+        for tc in (tool_calls or []):
+            try:
+                args = tc.get("function", {}).get("arguments", "" )
+                if args:
+                    json.loads(args)
+            except (json.JSONDecodeError, ValueError):
+                return "tool_call_truncation"
+        return "none"
+    return "none"
+
 def sanitize_tool_calls(message: dict) -> tuple:
     tc = message.get("tool_calls")
     if not tc:
@@ -1026,6 +1044,20 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             while choices and choices[0].get("finish_reason") == "length" and cont_count < MAX_CONTINUATIONS:
                 cont_count += 1
                 log.info("Non-stream: auto-continuing (%d/%d)", cont_count, MAX_CONTINUATIONS)
+                msg_c = choices[0].get("message", {})
+                trunc_type = _classify_truncation("length", msg_c.get("content",""), msg_c.get("reasoning_content",""), msg_c.get("tool_calls"))
+                if trunc_type == "reasoning_overflow":
+                    cb = dict(vllm_body)
+                    cb["chat_template_kwargs"] = {"enable_thinking": False}
+                    r2 = await client.post(VLLM_URL + "/chat/completions", json=cb)
+                    if r2.status_code == 200:
+                        d2 = r2.json()
+                        nc = d2.get("choices", [])
+                        if nc and nc[0].get("message",{}).get("content"):
+                            choices[0]["message"]["content"] = (msg_c.get("content","") or "") + nc[0]["message"]["content"]
+                            choices[0]["finish_reason"] = nc[0].get("finish_reason", "stop")
+                            output_tokens += d2.get("usage",{}).get("completion_tokens",0)
+                    break
                 partial = choices[0].get("message", {}).get("content", "")
                 cont_msgs = list(vllm_body.get("messages", []))
                 cont_msgs.append({"role": "assistant", "content": partial})
@@ -1123,6 +1155,14 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                         if fr:
                                             finish_reason = fr
                                         delta = choices[0].get("delta", {})
+                                        reasoning_piece = delta.get("reasoning_content", "")
+                                        tool_calls_piece = delta.get("tool_calls")
+                                        if reasoning_piece:
+                                            rc = {"id": chunk.get("id","gen"),"object":"chat.completion.chunk","created":chunk.get("created",0),"model":VLLM_MODEL,"choices":[{"index":0,"delta":{"reasoning_content":reasoning_piece},"finish_reason":None}]}
+                                            yield "data: " + json.dumps(rc) + chr(10) + chr(10)
+                                        if tool_calls_piece:
+                                            tc2 = {"id": chunk.get("id","gen"),"object":"chat.completion.chunk","created":chunk.get("created",0),"model":VLLM_MODEL,"choices":[{"index":0,"delta":{"tool_calls":tool_calls_piece},"finish_reason":None}]}
+                                            yield "data: " + json.dumps(tc2) + chr(10) + chr(10)
                                         content_piece = delta.get("content", "")
                                         if content_piece:
                                             seg_content += content_piece
@@ -1183,7 +1223,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             if buf:
                 out_chunk = {"id": "gen", "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]}
                 yield "data: " + json.dumps(out_chunk) + "\n\n"
-            final_chunk = {"id": "gen", "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+            final_chunk = {"id": "gen", "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason if finish_reason else "stop"}]}
             if total_output_tokens:
                 final_chunk["usage"] = {"prompt_tokens": input_tokens, "completion_tokens": total_output_tokens, "total_tokens": input_tokens + total_output_tokens}
             yield "data: " + json.dumps(final_chunk) + "\n\n"
