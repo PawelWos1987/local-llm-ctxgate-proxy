@@ -63,6 +63,7 @@ injection_metrics.json
 # Backup files
 *.bak
 *.bak-*
+.app.py.bak
 
 # Working-directory artifacts (not deliverables)
 fix_app.py
