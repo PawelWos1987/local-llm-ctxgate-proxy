@@ -73,6 +73,20 @@ async def _call_4b(messages, max_tokens=2000, json_mode=True):
         return {}
 
 
+def _is_near_duplicate(existing_value: str, new_value: str) -> bool:
+    """Check if two memory values are near-duplicates using token overlap."""
+    stop = {"the","and","for","with","this","that","from","have","will","your","what",
+            "when","where","which","how","can","could","would","should","about","there",
+            "here","been","being","were","was","are","is","not","all","any","but","its",
+            "you","our","their","then","than","into","over","under","also","just"}
+    def _sig_tokens(text):
+        return set(w for w in _re.findall(r'[a-zA-Z_][a-zA-Z0-9_]{3,}', text.lower()) if w not in stop)
+    ex_toks = _sig_tokens(existing_value)
+    new_toks = _sig_tokens(new_value)
+    if not ex_toks or not new_toks: return False
+    overlap = len(ex_toks & new_toks)
+    return overlap >= max(2, int(0.7 * min(len(ex_toks), len(new_toks))))
+
 async def _store_memory_actions(task_uuid, actions, source_event_id):
     if not pool or not actions:
         return
@@ -88,20 +102,54 @@ async def _store_memory_actions(task_uuid, actions, source_event_id):
         if not title or not content:
             continue
         if action == "NEW":
-            await pool.execute("INSERT INTO proxy.memories (task_id, key, value, category, importance, active, source_event_id, status, model_name) VALUES ($1,$2,$3,$4,$5,true,$6,'active',$7)", task_uuid, title, content, mtype, importance, source_event_id, LM_STUDIO_MODEL)
+            existing = await pool.fetchrow(
+                "SELECT value FROM proxy.memories WHERE task_id=$1 AND active=true AND key ILIKE $2 LIMIT 1",
+                task_uuid, "%" + title[:30] + "%"
+            )
+            if existing and _is_near_duplicate(existing["value"], content):
+                log.debug("Skipping near-duplicate: %s", title)
+                continue
+            await pool.execute(
+                "INSERT INTO proxy.memories (task_id, key, value, category, importance, active, source_event_id, status, model_name) "
+                "VALUES ($1,$2,$3,$4,$5,true,$6,'active',$7)",
+                task_uuid, title, content, mtype, importance, source_event_id, LM_STUDIO_MODEL
+            )
             stored += 1
         elif action == "UPDATE":
-            row = await pool.fetchrow("SELECT id FROM proxy.memories WHERE task_id=$1 AND key=$2 AND active=true LIMIT 1", task_uuid, title)
+            row = await pool.fetchrow(
+                "SELECT id, value FROM proxy.memories WHERE task_id=$1 AND key=$2 AND active=true LIMIT 1",
+                task_uuid, title
+            )
             if row:
-                await pool.execute("UPDATE proxy.memories SET value=$3, importance=$4, updated_at=now() WHERE id=$5", content, importance, row["id"])
+                if _is_near_duplicate(row["value"], content):
+                    log.debug("Skipping no-op update: %s", title)
+                    continue
+                await pool.execute(
+                    "UPDATE proxy.memories SET value=$3, importance=$4, updated_at=now() WHERE id=$5",
+                    content, importance, row["id"]
+                )
             else:
-                await pool.execute("INSERT INTO proxy.memories (task_id, key, value, category, importance, active, source_event_id, status, model_name) VALUES ($1,$2,$3,$4,$5,true,$6,'active',$7)", task_uuid, title, content, mtype, importance, source_event_id, LM_STUDIO_MODEL)
+                await pool.execute(
+                    "INSERT INTO proxy.memories (task_id, key, value, category, importance, active, source_event_id, status, model_name) "
+                    "VALUES ($1,$2,$3,$4,$5,true,$6,'active',$7)",
+                    task_uuid, title, content, mtype, importance, source_event_id, LM_STUDIO_MODEL
+                )
             stored += 1
         elif action == "SUPERSEDE":
-            old = await pool.fetchrow("SELECT id FROM proxy.memories WHERE task_id=$1 AND key=$2 AND active=true LIMIT 1", task_uuid, title)
-            new_id = await pool.fetchval("INSERT INTO proxy.memories (task_id, key, value, category, importance, active, source_event_id, status, model_name) VALUES ($1,$2,$3,$4,$5,true,$6,'active',$7) RETURNING id", task_uuid, title, content, mtype, importance, source_event_id, LM_STUDIO_MODEL)
+            old = await pool.fetchrow(
+                "SELECT id FROM proxy.memories WHERE task_id=$1 AND key=$2 AND active=true LIMIT 1",
+                task_uuid, title
+            )
+            new_id = await pool.fetchval(
+                "INSERT INTO proxy.memories (task_id, key, value, category, importance, active, source_event_id, status, model_name) "
+                "VALUES ($1,$2,$3,$4,$5,true,$6,'active',$7) RETURNING id",
+                task_uuid, title, content, mtype, importance, source_event_id, LM_STUDIO_MODEL
+            )
             if old:
-                await pool.execute("UPDATE proxy.memories SET active=false, superseded_by=$2, updated_at=now() WHERE id=$1", old["id"], new_id)
+                await pool.execute(
+                    "UPDATE proxy.memories SET active=false, superseded_by=$2, updated_at=now() WHERE id=$1",
+                    old["id"], new_id
+                )
             stored += 1
     if stored:
         log.info("Stored %d memory actions for task %s", stored, task_uuid)
@@ -124,33 +172,58 @@ async def _update_working_memory(task_uuid, state_update):
 async def _process_memory_job(job_id, task_uuid, event_id):
     if not pool:
         return
-    try:
-        event = await pool.fetchrow("SELECT content FROM proxy.events WHERE id=$1", event_id)
-        if not event:
-            await pool.execute("UPDATE proxy.memory_jobs SET status='done' WHERE id=$1", job_id)
-            return
-        wm = await pool.fetchrow("SELECT content FROM proxy.working_memory WHERE task_id=$1", task_uuid)
-        current_state = wm["content"] if wm and wm["content"] else "No prior state"
-        recent_mems = await pool.fetch("SELECT key, value FROM proxy.memories WHERE task_id=$1 AND active=true ORDER BY updated_at DESC LIMIT 10", task_uuid)
-        mem_context = ""
-        if recent_mems:
-            parts = []
-            for r in recent_mems:
-                parts.append("- " + r["key"] + ": " + r["value"][:100])
-            mem_context = "\nKnown memories:\n" + "\n".join(parts)
-        user_msg = "Current task state: " + current_state + "\n" + mem_context + "\n\nNew event:\n" + event["content"][:3000] + "\n\nExtract durable memories and update state."
-        result = await _call_4b([{"role": "system", "content": _MEMORY_SYSTEM_PROMPT}, {"role": "user", "content": user_msg}], max_tokens=2000, json_mode=True)
-        if result:
-            await _store_memory_actions(task_uuid, result.get("memory_actions", []), event_id)
-            await _update_working_memory(task_uuid, result.get("state_update", {}))
-        await pool.execute("UPDATE proxy.memory_jobs SET status='done' WHERE id=$1", job_id)
-        log.info("Memory job %s processed", job_id)
-    except Exception as e:
-        log.warning("Memory job %s failed: %s", job_id, e)
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
         try:
-            await pool.execute("UPDATE proxy.memory_jobs SET status='error' WHERE id=$1", job_id)
-        except Exception:
-            pass
+            event = await pool.fetchrow("SELECT content FROM proxy.events WHERE id=$1", event_id)
+            if not event:
+                await pool.execute("UPDATE proxy.memory_jobs SET status='done', completed_at=now() WHERE id=$1", job_id)
+                return
+            wm = await pool.fetchrow("SELECT content FROM proxy.working_memory WHERE task_id=$1", task_uuid)
+            current_state = wm["content"] if wm and wm["content"] else "No prior state"
+            recent_mems = await pool.fetch(
+                "SELECT key, value FROM proxy.memories WHERE task_id=$1 AND active=true ORDER BY updated_at DESC LIMIT 10",
+                task_uuid
+            )
+            mem_context = ""
+            if recent_mems:
+                parts = []
+                for r in recent_mems:
+                    parts.append("- " + r["key"] + ": " + r["value"][:100])
+                mem_context = "\nKnown memories:\n" + "\n".join(parts)
+            user_msg = (
+                "Current task state: " + current_state + "\n" + mem_context +
+                "\n\nNew event:\n" + event["content"][:3000] +
+                "\n\nExtract durable memories and update state."
+            )
+            result = await _call_4b(
+                [{"role": "system", "content": _MEMORY_SYSTEM_PROMPT},
+                 {"role": "user", "content": user_msg}],
+                max_tokens=2000, json_mode=True
+            )
+            if result:
+                await _store_memory_actions(task_uuid, result.get("memory_actions", []), event_id)
+                await _update_working_memory(task_uuid, result.get("state_update", {}))
+            await pool.execute(
+                "UPDATE proxy.memory_jobs SET status='done', completed_at=now(), attempts=$2 WHERE id=$1",
+                job_id, attempt
+            )
+            log.info("Memory job %s processed (attempt %d)", job_id, attempt)
+            return
+        except Exception as e:
+            log.warning("Memory job %s attempt %d/%d failed: %s", job_id, attempt, max_retries, e)
+            if attempt < max_retries:
+                await asyncio.sleep(2 * attempt)
+            else:
+                try:
+                    await pool.execute(
+                        "UPDATE proxy.memory_jobs SET status='failed', error=$2, attempts=$3, completed_at=now() WHERE id=$1",
+                        job_id, str(e)[:200], attempt
+                    )
+                except Exception:
+                    pass
+                log.error("Memory job %s permanently failed", job_id)
+                return
 
 
 async def _memory_worker_loop():
@@ -160,10 +233,37 @@ async def _memory_worker_loop():
             await asyncio.sleep(5)
             if not pool:
                 continue
-            jobs = await pool.fetch("SELECT mj.id, mj.task_id, mj.event_id FROM proxy.memory_jobs mj WHERE mj.status='pending' ORDER BY mj.created_at ASC LIMIT 5")
+            # Recovery: reset stuck 'processing' jobs (>120s)
+            stuck = await pool.fetch(
+                "SELECT id FROM proxy.memory_jobs WHERE status='processing' AND started_at < now() - interval '120 seconds'"
+            )
+            for s in stuck:
+                log.warning("Resetting stuck memory job %s", s["id"])
+                await pool.execute(
+                    "UPDATE proxy.memory_jobs SET status='failed', error='stuck_timeout', completed_at=now() WHERE id=$1",
+                    s["id"]
+                )
+            # Pick up pending jobs
+            jobs = await pool.fetch(
+                "SELECT mj.id, mj.task_id, mj.event_id FROM proxy.memory_jobs mj "
+                "WHERE mj.status='pending' ORDER BY mj.created_at ASC LIMIT 5"
+            )
             for job in jobs:
-                await pool.execute("UPDATE proxy.memory_jobs SET status='processing' WHERE id=$1", job["id"])
-                await _process_memory_job(str(job["id"]), str(job["task_id"]), str(job["event_id"]))
+                await pool.execute(
+                    "UPDATE proxy.memory_jobs SET status='processing', started_at=now() WHERE id=$1",
+                    job["id"]
+                )
+                try:
+                    await asyncio.wait_for(
+                        _process_memory_job(str(job["id"]), str(job["task_id"]), str(job["event_id"])),
+                        timeout=90
+                    )
+                except asyncio.TimeoutError:
+                    log.warning("Memory job %s timed out", job["id"])
+                    await pool.execute(
+                        "UPDATE proxy.memory_jobs SET status='failed', error='timeout_90s', completed_at=now() WHERE id=$1",
+                        job["id"]
+                    )
         except asyncio.CancelledError:
             log.info("Memory worker loop cancelled")
             break
@@ -223,7 +323,7 @@ async def _summarize_trimmed_messages(task_uuid, session_key, trimmed_messages):
                                     parts.append(t)
                         su = parsed.get('state_update', {})
                         if isinstance(su, dict) and su.get('current_state'):
-                            parts.insert(0, "STATE: ' + su['current_state']")
+                            parts.insert(0, "STATE: " + su['current_state'])
                         summary_text = ' | ' .join(parts) if parts else ''
                     else:
                         summary_text = str(parsed)
@@ -245,7 +345,7 @@ async def _summarize_trimmed_messages(task_uuid, session_key, trimmed_messages):
                         parts.append(t)
             su = result.get('state_update', {})
             if isinstance(su, dict) and su.get('current_state'):
-                parts.insert(0, "STATE: ' + su['current_state']")
+                parts.insert(0, "STATE: " + su['current_state'])
             summary_text = ' | ' .join(parts) if parts else ''
         
         if not summary_text:
@@ -758,55 +858,82 @@ def explain_status(status: str, detail: str = "") -> str:
 import re as _re
 
 def extract_knowledge(session_id: str, session_key: str, messages: list) -> list:
-    """Deterministic extraction of high-signal knowledge from conversation."""
+    """Deterministic extraction with quality gates.
+    
+    Quality gates:
+    - Keys must be >= 4 chars, not common English words
+    - Values must be >= 20 chars (meaningful statement, not fragment)
+    - Max 5 items per batch
+    """
+    _STOP_KEYS = {
+        "that","this","it","was","are","be","would","could","should","can","will",
+        "have","has","had","do","does","did","not","no","yes","ok","okay","fine",
+        "good","great","the","and","for","with","from","your","what","when","where",
+        "which","how","about","there","here","been","being","were","all","any","but",
+        "its","you","our","their","then","than","into","over","under","also","just",
+        "only","some","such","more","most","other","out","use","using","used","make",
+        "made","get","got","one","two","see","now","new","old","set","add","run",
+        "test","tests","file","line","code","error","warn","info","debug","http",
+        "true","false","null","none","void","return","import","class","def","if",
+    }
+    def _valid_key(k):
+        k = k.strip().lower()
+        if len(k) < 4 or len(k) > 60: return False
+        if k in _STOP_KEYS: return False
+        if not _re.search(r'[a-z]', k): return False
+        if len(k) < 6 and not _re.search(r'\d', k): return False
+        return True
+    def _valid_value(v):
+        v = v.strip().rstrip('.')
+        if len(v) < 20 or len(v) > 300: return False
+        if len(v.split()) < 3: return False
+        if not _re.search(r'[a-zA-Z]{3,}', v): return False
+        return True
     items = []
     seen = set()
     for m in messages:
         role = m.get("role", "")
-        if role not in ("user", "assistant"):
-            continue
+        if role not in ("user", "assistant"): continue
         content = m.get("content") or ""
         if isinstance(content, list):
             content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
-        if not content:
-            continue
-        for match in _re.finditer(r'(?:the|a|an)?\s*([a-z_][a-z0-9_]*)\s+(?:is|equals|is set to|set to|\=)\s+(.{2,200})', content, _re.IGNORECASE):
+        if not content: continue
+        for match in _re.finditer(
+            r'\b([a-zA-Z_][a-zA-Z0-9_]{3,}(?:\s+[a-zA-Z_][a-zA-Z0-9_]{2,}){0,3})\s+(?:is|equals|is set to|set to|\=|should be)\s+(.{20,300})',
+            content, _re.IGNORECASE
+        ):
             k = match.group(1).strip().lower()
             v = match.group(2).strip().rstrip('.')
-            if len(v) < 3:
-                continue
-            if k in ("that","this","it","was","are","be","would","could","should","can","will","have","has","had","do","does","did","not","no","yes","ok","okay","fine","good","great"):
-                continue
-            key = (k, v[:100])
-            if key not in seen:
-                seen.add(key)
-                items.append({"domain": "fact", "key": k, "value": v[:200], "importance": 5})
-        for match in _re.finditer(r'(?:decided to|going with|will use|using|chose|chooses)\s+(.{2,150})', content, _re.IGNORECASE):
+            if _valid_key(k) and _valid_value(v):
+                dedup = (k, v[:80])
+                if dedup not in seen:
+                    seen.add(dedup)
+                    items.append({"domain": "fact", "key": k, "value": v[:250], "importance": 5})
+        for match in _re.finditer(
+            r'(?:decided to|going with|will use|chose|chooses|decided on)\s+(.{20,200})',
+            content, _re.IGNORECASE
+        ):
             v = match.group(1).strip().rstrip('.')
-            if len(v) < 3:
-                continue
-            key = ("decision", v[:80])
-            if key not in seen:
-                seen.add(key)
-                items.append({"domain": "decision", "key": v[:60].lower(), "value": v[:200], "importance": 7})
-        for match in _re.finditer(r'(?:prefer|preference for|always use|I like)\s+(.{2,100})', content, _re.IGNORECASE):
-            v = match.group(1).strip().rstrip('.')
-            if len(v) < 3:
-                continue
-            key = ("preference", v[:60])
-            if key not in seen:
-                seen.add(key)
-                items.append({"domain": "preference", "key": v[:50].lower(), "value": v[:200], "importance": 6})
-        for match in _re.finditer(r'(port|url|model|threshold|limit|timeout|max_\w+|min_\w+)\s*(?:is|\=|set to|:)?\s*([\w./:]+-?[\w./:=\-]*)', content, _re.IGNORECASE):
+            if _valid_value(v):
+                k = v[:50].lower()
+                if _valid_key(k):
+                    dedup = ("decision", v[:80])
+                    if dedup not in seen:
+                        seen.add(dedup)
+                        items.append({"domain": "decision", "key": k, "value": v[:250], "importance": 7})
+        for match in _re.finditer(
+            r'\b(port|url|model|threshold|limit|timeout|max_\w+|min_\w+|pool_size|batch_size)\b\s*(?:is|\=|set to|:)?\s*([\w./:=\-]{2,100})',
+            content, _re.IGNORECASE
+        ):
             k = match.group(1).strip().lower()
             v = match.group(2).strip()
-            if len(v) < 2:
-                continue
-            key = (k, v)
-            if key not in seen:
-                seen.add(key)
-                items.append({"domain": "config", "key": k, "value": v[:200], "importance": 8})
-    return items[:10]
+            if len(v) >= 2 and len(v) <= 100:
+                dedup = (k, v)
+                if dedup not in seen:
+                    seen.add(dedup)
+                    items.append({"domain": "config", "key": k, "value": v[:200], "importance": 8})
+    return items[:5]
+
 
 async def store_knowledge(items: list, source_session: str, source_key: str) -> int:
     """Upsert knowledge items into the global knowledge table."""
