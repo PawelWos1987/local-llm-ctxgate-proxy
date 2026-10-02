@@ -1,0 +1,17 @@
+[Unit]
+Description=ctxgate-proxy (context gate proxy for LLM -> vLLM)
+StartLimitIntervalSec=300
+StartLimitBurst=30
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/ctxgate-proxy/.env
+WorkingDirectory=/opt/ctxgate-proxy
+ExecStart=/opt/ctxgate-proxy/venv/bin/python -u /opt/ctxgate-proxy/proxy/app.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/ctxgate-proxy/proxy.log
+StandardError=append:/var/log/ctxgate-proxy/proxy.log
+
+[Install]
+WantedBy=multi-user.target

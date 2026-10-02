@@ -32,7 +32,7 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-LM_STUDIO_URL = os.environ.get("CTXGATE_LM_URL", "http://127.0.0.1:1234/v1")
+LM_STUDIO_URL = os.environ.get("CTXGATE_LM_URL", "http://127.0.0.1:1234/v1").removesuffix("/chat/completions")
 LM_STUDIO_MODEL = os.environ.get("CTXGATE_LM_MODEL", "qwen3-4b-instruct-2507")
 LM_STUDIO_TIMEOUT = _env_int("CTXGATE_LM_TIMEOUT", 120)
 GOOSE_SESSIONS_DB = os.environ.get("GOOSE_SESSIONS_DB", "/home/user/.local/share/goose/sessions/sessions.db")
@@ -2295,6 +2295,73 @@ async def knowledge_stats():
     )
     return {"total": total, "by_domain": [{"domain": r["domain"], "count": r["cnt"]} for r in by_domain]}
 
+@app.post("/deliverable")
+async def create_deliverable(request: Request):
+    """Register a new deliverable. Called by the agent when a task produces a document."""
+    if not pool:
+        return JSONResponse({"error": "DB not ready"}, status_code=503)
+    try:
+        body = await request.json()
+        name = body.get("name", "unnamed")
+        session_type = body.get("session_type", "goose")
+        working_dir = body.get("working_dir", "")
+        provider_name = body.get("provider_name", "")
+        summary = body.get("summary", "")
+        document_path = body.get("document_path", "")
+        
+        row = await pool.fetchrow(
+            """INSERT INTO proxy.deliverables 
+               (name, session_type, working_dir, provider_name, summary, document_path)
+               VALUES ($1, $2, $3, $4, $5, $6)
+               RETURNING id, name, session_type, working_dir, provider_name, summary, document_path, created_at""",
+            name, session_type, working_dir, provider_name, summary, document_path
+        )
+        return {
+            "id": str(row["id"]),
+            "name": row["name"],
+            "session_type": row["session_type"],
+            "working_dir": row["working_dir"],
+            "provider_name": row["provider_name"],
+            "summary": row["summary"],
+            "document_path": row["document_path"],
+            "created_at": row["created_at"].isoformat()
+        }
+    except Exception as e:
+        log.error("deliverable create error: %s", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@app.get("/deliverable")
+async def list_deliverables(limit: int = 50):
+    """List recent deliverables for the dashboard."""
+    if not pool:
+        return JSONResponse({"error": "DB not ready"}, status_code=503)
+    try:
+        rows = await pool.fetch(
+            """SELECT id, name, session_type, working_dir, provider_name, summary, document_path, created_at
+               FROM proxy.deliverables
+               ORDER BY created_at DESC
+               LIMIT $1""",
+            limit
+        )
+        return {
+            "data": [
+                {
+                    "id": str(r["id"]),
+                    "name": r["name"],
+                    "session_type": r["session_type"],
+                    "working_dir": r["working_dir"],
+                    "provider_name": r["provider_name"],
+                    "summary": r["summary"],
+                    "document_path": r["document_path"],
+                    "created_at": r["created_at"].isoformat()
+                }
+                for r in rows
+            ]
+        }
+    except Exception as e:
+        log.error("deliverable list error: %s", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
 @app.post("/memory/inject")
 async def memory_inject(request: Request):
     body = await request.json()
@@ -2724,6 +2791,13 @@ select { background: var(--surface2); color: var(--text); border: 1px solid var(
   <div id="memory-list"></div>
 </div>
 
+<div class="section card" style="padding: 20px;">
+  <h2>Deliverables</h2>
+  <div id="deliverables-panel">
+    <p style="color:var(--text2);font-size:0.85rem;">Loading...</p>
+  </div>
+</div>
+
 <script>
 let tokenChart = null;
 const charts = {};
@@ -2843,6 +2917,13 @@ async function refresh() {
     renderUtilization(analytics);
     renderMemories(analytics);
     renderKnowledge(analytics);
+
+    try {
+      const dels = await fetchJSON('/deliverable?limit=20');
+      renderDeliverables(dels.data || []);
+    } catch (e) {
+      document.getElementById('deliverables-panel').innerHTML = '<p style="color:var(--red);font-size:0.85rem;">Failed to load deliverables</p>';
+    }
 
     try {
       const lm = await fetchJSON('/api/lmstudio');
@@ -2997,6 +3078,24 @@ function renderKnowledge(a) {
     '<div class="scrollbox">' + (recent.length
       ? recent.map(r => '<div class="memory-item"><div><strong>' + esc(r.key) + '</strong></div><div class="meta">' + esc(r.value || '') + ' &middot; imp ' + (r.importance || '-') + ' &middot; ' + esc(r.domain || '') + '</div></div>').join('')
       : '<p style="color:var(--text2);font-size:0.85rem;">No knowledge items</p>') + '</div>';
+}
+
+function renderDeliverables(items) {
+  const el = document.getElementById('deliverables-panel');
+  if (!items || !items.length) {
+    el.innerHTML = '<p style="color:var(--text2);font-size:0.85rem;">No deliverables yet</p>';
+    return;
+  }
+  el.innerHTML =
+    '<div class="scrollbox"><table><thead><tr><th>Name</th><th>Type</th><th>Working Dir</th><th>Provider</th><th>Summary</th><th>Document</th><th>Created</th></tr></thead><tbody>' +
+    items.map(d => {
+      const summary = d.summary ? (d.summary.length > 80 ? d.summary.slice(0, 77) + '...' : d.summary) : '-';
+      const docLink = d.document_path
+        ? '<a href="file:///' + esc(d.document_path) + '" target="_blank" style="color:var(--blue);text-decoration:underline;">' + esc(d.document_path.split('/').pop()) + '</a>'
+        : '-';
+      return '<tr><td>' + esc(d.name) + '</td><td>' + esc(d.session_type) + '</td><td>' + esc(d.working_dir) + '</td><td>' + esc(d.provider_name) + '</td><td>' + esc(summary) + '</td><td>' + docLink + '</td><td>' + esc(d.created_at) + '</td></tr>';
+    }).join('') +
+    '</tbody></table></div>';
 }
 
 async function loadSessionMemory(sid) {

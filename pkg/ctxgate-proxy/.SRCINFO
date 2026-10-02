@@ -1,0 +1,13 @@
+kgname = ctxgate-proxy
+pkgver = 1.0.0
+pkgrel = 1
+pkgdesc = Local LLM context-gate proxy: rolling window, PG memory, 4B worker, health dashboard
+url = https://github.com/user/ctxgate-proxy
+arch = x86_64
+license = MIT
+makedepends = python-virtualenv
+depends = python
+depends = python-pip
+depends = postgresql-client
+source = ctxgate-proxy-1.0.0.tar.gz
+sha256sums = 03a8fe99f95fa37c6118ec16136a92f65f9ec7b77f32bddb15ef94c1ae1b656a

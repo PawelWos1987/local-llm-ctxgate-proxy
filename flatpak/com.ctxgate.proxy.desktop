@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ctxgate-proxy
+Comment=Context Gate Proxy - LLM Context Management
+Exec=flatpak run com.ctxgate.proxy
+Icon=utilities-system-monitor
+Categories=Development;Network;
+Terminal=false
+StartupNotify=true

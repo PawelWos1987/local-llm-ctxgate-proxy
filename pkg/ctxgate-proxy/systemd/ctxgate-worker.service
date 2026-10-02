@@ -1,0 +1,18 @@
+[Unit]
+Description=ctxgate 4B memory worker (async durable-memory extraction)
+StartLimitIntervalSec=300
+StartLimitBurst=30
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/ctxgate-proxy/.env
+WorkingDirectory=/opt/ctxgate-proxy
+ExecStart=/opt/ctxgate-proxy/venv/bin/python -u /opt/ctxgate-proxy/worker/worker.py
+Restart=on-failure
+RestartSec=5
+Nice=5
+StandardOutput=append:/var/log/ctxgate-proxy/worker.log
+StandardError=append:/var/log/ctxgate-proxy/worker.log
+
+[Install]
+WantedBy=multi-user.target

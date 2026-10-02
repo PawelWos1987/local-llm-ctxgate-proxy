@@ -1,0 +1,40 @@
+# ctxgate-proxy — single source of truth for ALL runtime parameters.
+# Edit via GUI (Settings button) or directly in this file.
+# Changes are hot-reloaded by the dashboard (polls mtime every 5s).
+
+dashboard:
+  port: 9201
+  poll_interval: 3.0
+  watchdog_timeout: 30
+
+services:
+  postgresql:
+    type: tcp
+    host: 127.0.0.1
+    port: 5432
+  vllm:
+    type: http
+    url: http://127.0.0.1:29000/v1/models
+  lm_studio:
+    type: http
+    url: http://127.0.0.1:1234/v1/models
+  ctxgate_proxy:
+    type: http
+    url: http://127.0.0.1:9200/health
+  worker:
+    type: file
+    path: /home/user/ctxproxy/worker/.worker.lock
+
+db:
+  dsn: postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy
+
+control:
+  ctxgate_proxy:
+    unit: ctxproxy-proxy.service
+    port: 9200
+    health_url: http://127.0.0.1:9200/health
+    kind: http
+  worker:
+    unit: ctxproxy-worker.service
+    lock_path: /home/user/ctxproxy/worker/.worker.lock
+    kind: file

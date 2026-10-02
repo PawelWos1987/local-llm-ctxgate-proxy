@@ -1,0 +1,43 @@
+ Maintainer: Pawel <user@localhost>
+# ctxgate-proxy: LLM context management proxy (FastAPI) + 4B memory worker + health dashboard
+# Self-contained venv, systemd system services, no global python pollution.
+
+pkgname=ctxgate-proxy
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Local LLM context-gate proxy: rolling window, PG memory, 4B worker, health dashboard"
+arch=(x86_64)
+url="https://github.com/user/ctxgate-proxy"
+license=(MIT)
+depends=(python python-pip postgresql-client)
+makedepends=(python-virtualenv)
+source=("ctxgate-proxy-${pkgver}.tar.gz")
+sha256sums=('03a8fe99f95fa37c6118ec16136a92f65f9ec7b77f32bddb15ef94c1ae1b656a')
+
+build() {
+    :
+}
+
+package() {
+    install -d "${pkgdir}/opt/ctxgate-proxy"
+    cp -r "${srcdir}/proxy" "${srcdir}/worker" "${srcdir}/dashboard" "${srcdir}/schema" \
+        "${srcdir}/requirements.txt" "${srcdir}/.env.example" \
+        "${pkgdir}/opt/ctxgate-proxy/"
+
+    install -d "${pkgdir}/usr/lib/systemd/system"
+    install -m 644 systemd/ctxgate-proxy.service    "${pkgdir}/usr/lib/systemd/system/"
+    install -m 644 systemd/ctxgate-worker.service   "${pkgdir}/usr/lib/systemd/system/"
+    install -m 644 systemd/ctxgate-dashboard.service "${pkgdir}/usr/lib/systemd/system/"
+
+    install -d "${pkgdir}/etc/ctxgate-proxy"
+    install -m 600 "${srcdir}/.env.example" "${pkgdir}/etc/ctxgate-proxy/.env"
+
+    install -d "${pkgdir}/var/log/ctxgate-proxy"
+
+    python -m venv "${pkgdir}/opt/ctxgate-proxy/venv"
+    "${pkgdir}/opt/ctxgate-proxy/venv/bin/pip" install --no-cache-dir \
+        -r "${srcdir}/requirements.txt"
+
+    install -d "${pkgdir}/usr/share/ctxgate-proxy"
+    install -m 755 systemd/ctxgate-postinst.sh "${pkgdir}/usr/share/ctxgate-proxy/"
+}

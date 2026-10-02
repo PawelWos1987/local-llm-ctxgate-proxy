@@ -1,0 +1,59 @@
+name: com.ctxgate.proxy
+runtime: org.freedesktop.Platform
+runtime-version: '23.08'
+app-id: com.ctxgate.proxy
+version: "1.0.0"
+branch: stable
+
+# Socket & network permissions
+finish-args:
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  - --talk-name=org.freedesktop.secrets
+  # Allow localhost network access
+  - --share=network
+  # Allow access to home directory for config
+  - --filesystem=home
+  # Allow access to /tmp
+  - --filesystem=/tmp
+
+modules:
+  # Python dependencies
+  - name: ctxgate-proxy
+    buildsystem: simple
+    build-commands:
+      - pip install --no-cache-dir -r requirements.txt
+    sources:
+      - type: file
+        path: ../requirements.txt
+      - type: file
+        path: ../proxy
+      - type: file
+        path: ../worker
+      - type: file
+        path: ../dashboard
+      - type: file
+        path: ../schema
+      - type: file
+        path: ../.env.example
+      - type: file
+        path: ../supervisor.sh
+      - type: file
+        path: ../start_proxy.sh
+    post-install:
+      - mkdir -p /app/ctxgate
+      - cp -r proxy worker dashboard schema /app/ctxgate/
+      - cp .env.example /app/ctxgate/.env
+      - cp supervisor.sh /app/ctxgate/
+      - cp start_proxy.sh /app/ctxgate/
+      - chmod +x /app/ctxgate/supervisor.sh
+      - chmod +x /app/ctxgate/start_proxy.sh
+    build-options:
+      no-autotools: true
+      no-autogen: true
+      no-cmake: true
+      no-configure: true
+      no-meson: true
+      no-make: true
