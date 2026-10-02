@@ -12,6 +12,7 @@ import asyncio
 import logging
 import logging.handlers
 import os
+import sys
 import re
 import signal
 import threading
@@ -28,6 +29,9 @@ _log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s 
 _log = logging.getLogger("dashboard")
 _log.setLevel(logging.INFO)
 _log.addHandler(_log_handler)
+_stream_handler = logging.StreamHandler(sys.stdout)
+_stream_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+_log.addHandler(_stream_handler)
 
 import socket
 
@@ -73,7 +77,7 @@ def load_config() -> dict:
         with open(CONFIG_PATH) as f:
             return yaml.safe_load(f) or {}
     except Exception as e:
-        print("config load error:", e, flush=True)
+        _log.warning("config load error: %s", e)
         return {}
 
 def _get(d, *keys, default=None):
@@ -152,7 +156,7 @@ async def _lifespan(_app):
             global _pg_pool
             _pg_pool = await asyncpg.create_pool(DB_DSN, min_size=1, max_size=3, command_timeout=5, max_inactive_connection_lifetime=300)
     except Exception as e:
-        print("PG pool init failed:", e, flush=True)
+        _log.warning("PG pool init failed: %s", e)
     asyncio.create_task(poll_health())
     yield
     _shutdown_event.set()
@@ -180,8 +184,6 @@ def _touch_config_mtime():
         _config_mtime = os.path.getmtime(CONFIG_PATH)
     except OSError:
         _config_mtime = 0.0
-
-    _last_config_write = time.time()
 _touch_config_mtime()
 
 def _maybe_reload_config():
@@ -200,10 +202,10 @@ def _maybe_reload_config():
     globals()["SVC_MAP"] = build_svc_map(new_cfg)
     new_dsn = os.environ.get("CTXGATE_DB_DSN") or os.environ.get("CTXPROXY_DB_DSN") or _get(new_cfg, "db", "dsn", default=None) or "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy"
     if new_dsn != globals().get("DB_DSN"):
-        print("WARNING: DSN changed - pool will use new DSN on next restart. Hot-reload of DB pool not supported.", flush=True)
+        _log.warning("DSN changed - pool will use new DSN on next restart. Hot-reload of DB pool not supported.")
     globals()["DB_DSN"] = new_dsn
     globals()["POLL_INTERVAL"] = float(_get(new_cfg, "dashboard", "poll_interval", default=POLL_INTERVAL) or POLL_INTERVAL)
-    print("config.yaml reloaded:", CONFIG_PATH, flush=True)
+    _log.info("config.yaml reloaded: %s", CONFIG_PATH)
 
 # --- Health checkers ---
 async def check_tcp(host: str, port: int, timeout: float = 2.0) -> dict:
@@ -561,6 +563,7 @@ async def get_config():
 
 @app.post("/api/config")
 async def put_config(request: Request):
+    global _last_config_write
     if not _auth_ok(request):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     if time.time() - _last_config_write < 5.0:
@@ -592,6 +595,7 @@ async def put_config(request: Request):
         os.replace(tmp, CONFIG_PATH)
     except Exception as e:
         return JSONResponse({"ok": False, "error": "write failed: " + str(e)}, status_code=400)
+    _last_config_write = time.time()
     _touch_config_mtime()
     _maybe_reload_config()
     return JSONResponse({"ok": True, "path": CONFIG_PATH})

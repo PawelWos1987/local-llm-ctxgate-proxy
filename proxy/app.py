@@ -39,7 +39,8 @@ def _env_int(name: str, default: int) -> int:
 LM_STUDIO_URL = os.environ.get("CTXGATE_LM_URL", "http://127.0.0.1:1234/v1").removesuffix("/chat/completions")
 LM_STUDIO_MODEL = os.environ.get("CTXGATE_LM_MODEL", "qwen3-4b-instruct-2507")
 LM_STUDIO_TIMEOUT = _env_int("CTXGATE_LM_TIMEOUT", 120)
-GOOSE_SESSIONS_DB = os.environ.get("GOOSE_SESSIONS_DB", "/home/user/.local/share/goose/sessions/sessions.db")
+GOOSE_SESSIONS_DB = os.environ.get("GOOSE_SESSIONS_DB") or os.path.join(
+    os.path.expanduser("~"), ".local", "share", "goose", "sessions", "sessions.db")
 
 # === 4-Step Orchestrator Prompts ===
 
@@ -452,12 +453,16 @@ MAX_OUTPUT = _env_int("CTXGATE_MAX_OUTPUT", 18000)
 SAFETY_MARGIN = _env_int("CTXGATE_SAFETY_MARGIN", 2000)
 WALL_CLOCK_MAX = _env_int("CTXGATE_WALL_CLOCK_MAX", 1800)  # 30 min - large contexts need more time
 MAX_CONTINUATIONS = int(os.environ.get("CTXGATE_MAX_CONTINUATIONS", 5))
+WORKER_BACKPRESSURE = _env_int("CTXGATE_WORKER_BACKPRESSURE", 50)
+SESSION_TTL_HOURS = _env_int("CTXGATE_SESSION_TTL_HOURS", 12)
+SESSION_LAST_ACTIVE: dict[str, float] = {}
 MEMORY_TTL_DAYS = _env_int("CTXGATE_MEMORY_TTL_DAYS", 90)
 DB_DSN = os.environ.get("CTXGATE_DB_DSN") or os.environ.get("CTXPROXY_DB_DSN") or "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy"
 PROXY_PORT = _env_int("CTXGATE_PROXY_PORT", 9201)
 API_KEY = os.environ.get("CTXGATE_API_KEY", "")
 MAX_BODY_BYTES = _env_int("CTXGATE_MAX_BODY_BYTES", 20 * 1024 * 1024)
-QWEN_TOKENIZER_PATH = os.environ.get("CTXGATE_QWEN_TOKENIZER", "/home/user/models/Swift-1.5-Qwen3.8-27b-W4A16-AutoRound/tokenizer.json")
+QWEN_TOKENIZER_PATH = os.environ.get("CTXGATE_QWEN_TOKENIZER") or os.path.join(
+    os.path.expanduser("~"), "models", "Swift-1.5-Qwen3.8-27b-W4A16-AutoRound", "tokenizer.json")
 vllm_alive = False  # Updated by _vllm_health_loop
 
 
@@ -1096,9 +1101,9 @@ def trim_context(messages: list, max_tokens: int) -> list:
     return result
 
 def _track_session_tokens(session_key: str, input_tokens: int, output_tokens: int = 0, count_req: bool = True):
+    """Update per-session token counters. count_req=False for output-only updates."""
     global SESSION_LAST_ACTIVE
     SESSION_LAST_ACTIVE[session_key] = time.time()
-    """Update per-session token counters. count_req=False for output-only updates."""
     if session_key not in session_tokens:
         session_tokens[session_key] = {"in": 0, "out": 0, "reqs": 0, "max_ctx": 0}
     st = session_tokens[session_key]
@@ -1251,16 +1256,21 @@ async def _regenerate_knowledge_item(item: dict, context: str) -> dict | None:
 
 
 _EXTRACT_SEM = asyncio.Semaphore(2)
+_EXTRACT_IN_FLIGHT = 0
 
 async def _fire_and_forget_extract(session_id: str, session_key: str, messages: list):
     """Background knowledge extraction - never blocks the request path."""
+    global _EXTRACT_IN_FLIGHT
     async with _EXTRACT_SEM:
+        _EXTRACT_IN_FLIGHT += 1
         try:
             k_items = await extract_knowledge(session_id, session_key, messages)
             if k_items:
                 await store_knowledge(k_items, session_id, session_key)
         except Exception as e:
             log.warning("Knowledge extraction (background) failed: %s", e)
+        finally:
+            _EXTRACT_IN_FLIGHT -= 1
 
 async def extract_knowledge(session_id: str, session_key: str, messages: list) -> list:
     """Async 4B-based knowledge extraction with quality orchestration.
@@ -1677,15 +1687,27 @@ async def metrics_prometheus():
         "# TYPE ctxgate_max_context_seen gauge", "ctxgate_max_context_seen %d" % metrics["max_context_seen"],
         "# TYPE ctxgate_active_sessions gauge", "ctxgate_active_sessions %d" % len(session_fingerprints),
         "# TYPE ctxgate_uptime_seconds gauge", "ctxgate_uptime_seconds %.1f" % uptime,
-        "# TYPE ctxgate_extract_queue_depth gauge", "ctxgate_extract_queue_depth %d" % (2 - _EXTRACT_SEM._value),
+        "# TYPE ctxgate_extract_queue_depth gauge", "ctxgate_extract_queue_depth %d" % _EXTRACT_IN_FLIGHT,
         "# TYPE ctxgate_worker_lag_seconds gauge", "ctxgate_worker_lag_seconds %.1f" % _read_worker_status().get("lag_seconds", 0),
-        "# TYPE ctxgate_worker_pending gauge", "ctxgate_worker_pending %d" % _read_worker_status().get("pending", 0),
+        "# TYPE ctxgate_worker_pending gauge", "ctxgate_worker_pending %d" % _worker_pending,
     ]
+    _worker_pending = 0
+    try:
+        if pool:
+            _worker_pending = await pool.fetchval("SELECT COUNT(*) FROM proxy.memory_jobs WHERE status='pending'") or 0
+    except Exception:
+        pass
     return Response("\n".join(lines) + "\n", media_type="text/plain")
 
 @app.get("/api/metrics")
 async def api_metrics():
     """Structured metrics for dashboard (JSON)."""
+    _worker_pending = 0
+    try:
+        if pool:
+            _worker_pending = await pool.fetchval("SELECT COUNT(*) FROM proxy.memory_jobs WHERE status='pending'") or 0
+    except Exception:
+        pass
     uptime = time.time() - metrics["started_at"]
     _hit_rate = metrics["cached_tokens_total"] / max(1, metrics["prompt_tokens_total"])
     _eff_prefill = (metrics["prompt_tokens_total"] - metrics["cached_tokens_total"]) / max(1, metrics["requests_ok"])
@@ -1698,6 +1720,7 @@ async def api_metrics():
         "started_human": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(metrics["started_at"])),
         "active_sessions": len(session_fingerprints),
         "worker": _read_worker_status(),
+        "worker_pending": _worker_pending,
     }
 
 @app.get("/api/sessions")
@@ -1834,6 +1857,30 @@ async def chat_completions(request: Request):
     if _dt > 50:
         log.warning("SLOW: build_context %.0fms (msgs=%d)", _dt, len(messages))
 
+
+    # Phase 1: Freeze seed pair [0][1][2] per session.
+    # First 3 messages (system + seed user + seed assistant) are immutable for session lifetime.
+    # If Goose compacts and changes them, we detect it, log a deliberate miss, and re-freeze.
+    if session_key not in session_seeds:
+        if len(built) >= 3:
+            session_seeds[session_key] = [dict(m) for m in built[:3]]
+            log.info("Seed frozen session=%s (3 msgs)", session_key)
+    else:
+        frozen = session_seeds[session_key]
+        for i, fm in enumerate(frozen):
+            if i < len(built):
+                fc = fm.get("content", "")
+                nc = built[i].get("content", "")
+                if isinstance(fc, list):
+                    fc = " ".join(p.get("text", "") for p in fc if isinstance(p, dict))
+                if isinstance(nc, list):
+                    nc = " ".join(p.get("text", "") for p in nc if isinstance(p, dict))
+                if fc != nc:
+                    metrics["prefix_invalidations"] += 1
+                    log.warning("SEED CHANGED session=%s pos=%d - re-freezing (deliberate miss)", session_key, i)
+                    session_seeds[session_key] = [dict(m) for m in built[:3]]
+                    session_compactions.pop(session_key, None)
+                    break
     # Safe defaults: guard _record_injection against a fetch exception leaving tm/kn unset
     tm = ""
     kn = ""
@@ -1848,9 +1895,6 @@ async def chat_completions(request: Request):
     _dt = (time.monotonic() - _t0) * 1000
     if _dt > 50:
         log.warning("SLOW: knowledge+memory fetch %.0fms", _dt)
-    if isinstance(kn, Exception):
-        log.warning("Knowledge injection failed: %s", kn)
-        kn = ""
     # Phase 1: kn/tm are APPENDED as separate messages after history, before current turn.
     # The system prompt is NEVER mutated — prefix stays byte-identical for cache stability.
     if isinstance(kn, Exception):
@@ -1886,29 +1930,6 @@ async def chat_completions(request: Request):
         log.warning("PREFIX INVALIDATED session=%s", session_key)
     session_fingerprints[session_key] = fp
 
-    # Phase 1: Freeze seed pair [0][1][2] per session.
-    # First 3 messages (system + seed user + seed assistant) are immutable for session lifetime.
-    # If Goose compacts and changes them, we detect it, log a deliberate miss, and re-freeze.
-    if session_key not in session_seeds:
-        if len(built) >= 3:
-            session_seeds[session_key] = [dict(m) for m in built[:3]]
-            log.info("Seed frozen session=%s (3 msgs)", session_key)
-    else:
-        frozen = session_seeds[session_key]
-        for i, fm in enumerate(frozen):
-            if i < len(built):
-                fc = fm.get("content", "")
-                nc = built[i].get("content", "")
-                if isinstance(fc, list):
-                    fc = " ".join(p.get("text", "") for p in fc if isinstance(p, dict))
-                if isinstance(nc, list):
-                    nc = " ".join(p.get("text", "") for p in nc if isinstance(p, dict))
-                if fc != nc:
-                    metrics["prefix_invalidations"] += 1
-                    log.warning("SEED CHANGED session=%s pos=%d - re-freezing (deliberate miss)", session_key, i)
-                    session_seeds[session_key] = [dict(m) for m in built[:3]]
-                    session_compactions.pop(session_key, None)
-                    break
 
     # Token tracking
     _t0 = time.monotonic()
@@ -1952,9 +1973,6 @@ async def chat_completions(request: Request):
     return result
 
 
-SESSION_TTL_HOURS = _env_int("CTXGATE_SESSION_TTL_HOURS", 12)
-SESSION_LAST_ACTIVE: dict[str, float] = {}
-
 def _read_worker_status() -> dict:
     """Read worker/.worker_status.json if it exists."""
     import json as _json
@@ -1963,7 +1981,7 @@ def _read_worker_status() -> dict:
         with open(path, "r") as f:
             return _json.load(f)
     except (FileNotFoundError, _json.JSONDecodeError, OSError):
-        return {"alive": False, "lag_seconds": 0, "pending": 0, "heartbeat": ""}
+        return {"alive": False, "lag_seconds": 0, "heartbeat": ""}
 
 
 
@@ -2300,9 +2318,6 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                     current_body["messages"] = cont_messages
                     current_body["max_tokens"] = min(MAX_OUTPUT, MAX_CONTEXT - cont_tokens - SAFETY_MARGIN)
                     continue
-                    current_body["messages"] = cont_messages
-                    current_body["max_tokens"] = MAX_OUTPUT
-                    continue
                 elif finish_reason == "length":
                     log.warning("Max continuations (%d) reached - stopping", MAX_CONTINUATIONS)
                     safe_buf = _safe_truncate(buf)
@@ -2315,7 +2330,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             final_chunk = {"id": "gen", "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason if finish_reason else "stop"}]}
             if total_output_tokens:
                 _usage = {"prompt_tokens": input_tokens, "completion_tokens": total_output_tokens, "total_tokens": input_tokens + total_output_tokens}
-                _usage["prompt_tokens_details"] = {"cached_tokens": seg_cached_tokens}
+                _usage["prompt_tokens_details"] = {"cached_tokens": total_cached_tokens}
 
                 final_chunk["usage"] = _usage
             yield "data: " + json.dumps(final_chunk) + "\n\n"
@@ -2389,8 +2404,6 @@ async def _get_goose_session_info(session_id: str) -> Optional[dict]:
     except Exception as e:
         log.debug("Goose session info lookup failed for %s: %s", session_id, e)
     return None
-
-WORKER_BACKPRESSURE = _env_int("CTXGATE_WORKER_BACKPRESSURE", 50)
 
 
 async def _enqueue_memory_job(session_id, user_content):
@@ -3158,7 +3171,7 @@ async function refresh() {
     });
 
     document.querySelector('#calls-table tbody').innerHTML = calls.map(c =>
-      '<tr><td>' + c.ts_human + '</td><td>' + esc(c.session) + '</td><td>' + fmtNum(c.in) + '</td><td>' + fmtNum(c.out) + '</td><td>' + badge(c.status) + '</td><td>' + (c.stream ? 'yes' : 'no') + '</td></tr>'
+      '<tr><td>' + c.ts_human + '</td><td>' + esc(c.session) + '</td><td>' + fmtNum(c.in) + '</td><td>' + fmtNum(c.out) + '</td><td>' + (c.cached_pct != null ? c.cached_pct + '%' : '-') + '</td><td>' + badge(c.status) + '</td><td>' + (c.stream ? 'yes' : 'no') + '</td></tr>'
     ).join('');
 
     document.querySelector('#sessions-table tbody').innerHTML = sessions.slice(0, 10).map(s =>

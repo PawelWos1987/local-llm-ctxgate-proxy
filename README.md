@@ -5,6 +5,9 @@ in front of vLLM, a 4B-model memory worker backed by PostgreSQL, and a
 health-monitoring GUI with full service control. **Everything is operated
 from the GUI (http://127.0.0.1:9202). Zero terminal, zero bash, zero fish.**
 
+![ctxgate-proxy dashboard](docs/dashboard.png)
+*The dashboard — health dots, live DB metrics, and one-click START / STOP / RESTART for every service.*
+
 ---
 
 ## 1. Full Data Flow
@@ -221,9 +224,11 @@ ctxproxy/
 ├── proxy/app.py            # :9201 context-gate proxy (FastAPI)
 ├── worker/worker.py        # 4B memory worker (async, lock-file heartbeat)
 ├── dashboard/dashboard.py  # :9202 GUI + health poller + control API
-├── schema/00X_*.sql        # PostgreSQL schema (6 migrations)
+├── schema/00X_*.sql        # PostgreSQL schema (canonical — 001–009, apply in order)
 ├── .env / .env.example     # configuration
 └── pkg/ctxgate-proxy/      # AUR package (PKGBUILD, .SRCINFO, tarball, systemd/)
+
+> **Canonical schema directory:** `schema/` — all migrations (001–009) are numbered and applied in order. There is no separate `migrations/` directory.
 ```
 
 Control API (what the buttons call, for reference):

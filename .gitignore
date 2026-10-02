@@ -6,6 +6,7 @@ __pycache__/
 
 # Logs
 *.log
+*.log.*
 *.pid
 
 # Venv
@@ -19,6 +20,7 @@ venv/
 
 # Secrets / local config
 .env
+config.yaml
 *.local.json
 
 # OS
@@ -28,6 +30,7 @@ Thumbs.db
 # Test artifacts
 test_output/
 .pytest_cache/
+.coverage
 tests/*_results.json
 tests/test_results.json
 tests/mock_vllm.py
@@ -49,6 +52,7 @@ worker.log
 proxy.pid
 worker.pid
 .worker.lock
+worker/.worker_status.json
 
 # Internal working notes (contains local secrets)
 NOTES.md
@@ -60,6 +64,9 @@ injection_metrics.json
 *.bak
 *.bak-*
 
+# Working-directory artifacts (not deliverables)
+fix_app.py
+
 # Probe artifacts (scratch scripts, results, patches)
 probes/*.txt
 probes/p[0-9]*.py
@@ -67,3 +74,8 @@ probes/patch*.py
 probes/PROBE_RESULTS.md
 probes/_handler*.txt
 probes/chat_template.jinja
+probes/_*.py
+probes/diag*.py
+probes/failprobe*.py
+probes/fix_*.py
+probes/restart_test.sh

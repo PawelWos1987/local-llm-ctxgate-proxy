@@ -146,7 +146,7 @@ running = True
 outage_since: Optional[float] = None  # timestamp when outage started
 model_loaded: bool = False
 consecutive_lm_failures: int = 0
-_last_status_write = 0.0  # whether we've confirmed the model is loaded this session
+_last_status_write = 0.0  # throttle timestamp for status-file writes
 # Lag / completion tracking (source of the worker_lag_seconds metric)
 last_completion: Optional[float] = None  # time.time() of the last successful job
 jobs_done_total: int = 0
@@ -552,12 +552,17 @@ async def process_job(job) -> None:
             )
             outage_since = None
     except Exception as e:
-        # Non-outage error: standard bounded retry
-        consecutive_lm_failures += 1
-        if consecutive_lm_failures >= 3:
-            model_loaded = False
-            consecutive_lm_failures = 0
-            log.warning("3 consecutive LM failures - resetting model_loaded")
+        # Non-outage error: standard bounded retry.
+        # Only count as an LM failure if the error originated from LM Studio itself
+        # (call_4b / call_4b_quality_check raise RuntimeError on HTTP != 200 or bad payloads).
+        # Our own logic errors (validate_response ValueError, DB errors) must NOT
+        # reset model_loaded, because the model is fine in those cases.
+        if isinstance(e, RuntimeError):
+            consecutive_lm_failures += 1
+            if consecutive_lm_failures >= 3:
+                model_loaded = False
+                consecutive_lm_failures = 0
+                log.warning("3 consecutive LM failures - resetting model_loaded")
         attempts = int(job.get("attempts") or 0) + 1
         log.warning("JOB %s failed (attempt %d/%d): %s", jid, attempts, MAX_ATTEMPTS, e)
         if attempts >= MAX_ATTEMPTS:
