@@ -2,7 +2,12 @@
 Lean integration test v4 - works with already-running proxy on port 9201.
 Strategy: short messages for fast vLLM calls, stream+disconnect for long context.
 """
-import asyncio, json, os, httpx, asyncpg
+import asyncio
+import json
+import os
+
+import asyncpg
+import httpx
 
 PORT = 9201
 URL = "http://127.0.0.1:{}".format(PORT)
@@ -70,39 +75,39 @@ async def main():
     print("CTXPROXY TEST v4 - port {}".format(PORT))
     print("="*60)
     pool = await asyncpg.create_pool(DB, min_size=2, max_size=5)
-    
+
     async with httpx.AsyncClient(timeout=5) as c:
         h = await c.get(URL+"/health")
         print("Proxy: {} {}".format(h.status_code, h.json()))
 
     # === CASE 1: Sequential (5 tests) ===
     print("\n=== CASE 1: Sequential ===")
-    
+
     print("\n[1.1] Agent task creation")
     r = await chat(AGENT, [{"role":"system","content":"Main agent."},{"role":"user","content":"Set up DB schema for users, products, orders."}])
     await asyncio.sleep(2)
     f,m = await db_tasks(pool,[AGENT])
     rec("Agent task","seq",AGENT in f,"http={} found={}".format(r.status_code,f))
-    
+
     print("\n[1.2] Delegate 1 (20261002_19)")
     r = await chat(DELS[0], [{"role":"system","content":"Sub: DB schema."},{"role":"user","content":"Design users table."}])
     await asyncio.sleep(2)
     f,m = await db_tasks(pool,[DELS[0]])
     rec("Del1 task","seq",DELS[0] in f,"http={} found={}".format(r.status_code,f))
-    
+
     print("\n[1.3] Delegate 2 (20261002_20)")
     r = await chat(DELS[1], [{"role":"system","content":"Sub: API endpoints."},{"role":"user","content":"Implement /api/users CRUD."}])
     await asyncio.sleep(2)
     f,m = await db_tasks(pool,[DELS[1]])
     rec("Del2 task","seq",DELS[1] in f,"http={} found={}".format(r.status_code,f))
-    
+
     print("\n[1.4] No cross-contamination")
     am = await db_mem(pool,AGENT)
     d1m = await db_mem(pool,DELS[0])
     d2m = await db_mem(pool,DELS[1])
     all_t = await pool.fetch("SELECT session_id FROM proxy.tasks WHERE session_id=ANY($1)",[AGENT,DELS[0],DELS[1]])
     rec("No cross-contam","seq",len(all_t)==3,"tasks={} agent_mem={} d1={} d2={}".format(len(all_t),len(am),len(d1m),len(d2m)))
-    
+
     print("\n[1.5] Long session -> trim + summary")
     lc = longctx(AGENT,20)
     tc = sum(len(m.get("content","")) for m in lc)
@@ -116,7 +121,7 @@ async def main():
 
     # === CASE 2: Parallel (5 tests) ===
     print("\n=== CASE 2: Parallel ===")
-    
+
     print("\n[2.1] 3 simultaneous (agent+2 dels)")
     try:
         r1,r2,r3 = await asyncio.gather(
@@ -129,7 +134,7 @@ async def main():
         rec("3 simultaneous","par",len(m)==0,"found={}/3 missing={}".format(len(f),m))
     except Exception as e:
         rec("3 simultaneous","par",False,"EXC: "+str(e)[:80])
-    
+
     print("\n[2.2] 4 simultaneous delegates")
     try:
         ml=[
@@ -149,13 +154,13 @@ async def main():
         rec("4 simultaneous","par",len(m)==0,"found={}/4 missing={}".format(len(f),m))
     except Exception as e:
         rec("4 simultaneous","par",False,"EXC: "+str(e)[:80])
-    
+
     print("\n[2.3] All 6 sessions in DB")
     all_s = [AGENT]+DELS
     rows = await pool.fetch("SELECT session_id FROM proxy.tasks WHERE session_id=ANY($1) ORDER BY session_id",all_s)
     ids = [r["session_id"] for r in rows]
     rec("6 sessions","par",len(set(ids))==6,"found={}/6: {}".format(len(ids),ids))
-    
+
     print("\n[2.4] Parallel long sessions -> summaries")
     la = longctx(AGENT,15)
     l2 = longctx(DELS[2],15)
@@ -175,7 +180,7 @@ async def main():
         rec("Parallel summaries","par",sa is not None,"agent={} d3={} d4={}".format("Y" if sa else "N","Y" if s2 else "N","Y" if s3 else "N"))
     except Exception as e:
         rec("Parallel summaries","par",False,"EXC: "+str(e)[:80])
-    
+
     print("\n[2.5] Knowledge injection")
     r = await chat(AGENT,[{"role":"system","content":"ctxproxy project."},{"role":"user","content":"What is the proxy port? How does session isolation work?"}],mtok=50,to=120)
     await asyncio.sleep(2)
@@ -186,7 +191,7 @@ async def main():
     rec("Knowledge inject","par",kn>0,"kn_inj={} http={}".format(kn,r.status_code))
 
     await pool.close()
-    
+
     print("\n"+"="*60)
     p = sum(1 for x in R if x["ok"])
     fl = sum(1 for x in R if not x["ok"])

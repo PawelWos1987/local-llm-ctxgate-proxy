@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """Suite 7 - SSE streaming, concurrent load, trimming, sampling, schema, tools, errors."""
 import json
-import re
 import sys
+import threading
 import time
-import urllib.request
 import urllib.error
 import urllib.parse
-import hashlib
-import threading
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 BASE = "http://127.0.0.1:9201"

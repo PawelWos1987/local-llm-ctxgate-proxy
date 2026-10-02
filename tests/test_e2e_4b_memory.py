@@ -9,12 +9,18 @@ Runs the worker's ACTUAL functions (call_4b/validate_response/apply_memories/
 update_working_memory) against real LM Studio + PostgreSQL, and app.fetch_task_memory
 for the retrieval half. Deterministic: uses a dedicated task, not the live service queue.
 """
-import asyncio, os, sys, time, uuid
+import asyncio
+import os
+import sys
+import uuid
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "worker"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "proxy"))
-import asyncpg, httpx
-import worker
 import app as proxy
+import asyncpg
+import httpx
+
+import worker
 
 DSN = os.environ.get("CTXGATE_DB_DSN", "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/local-llm-ctxgate-proxy")
 PASS, FAIL = 0, 0

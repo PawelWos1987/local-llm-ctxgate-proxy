@@ -6,8 +6,12 @@ Proves the Qwen-tokenizer fix against vLLM's REAL reported prompt_tokens:
   C. english control -> counts match vLLM
   D. Qwen proxy count tracks vLLM prompt_tokens within tolerance
 """
-import json, re, time, urllib.request, urllib.error
-import tokenizers, tiktoken
+import json
+import urllib.error
+import urllib.request
+
+import tiktoken
+import tokenizers
 
 BASE = "http://127.0.0.1:9201"
 MD = "/home/user/models/Swift-1.5-Qwen3.8-27b-W4A16-AutoRound"

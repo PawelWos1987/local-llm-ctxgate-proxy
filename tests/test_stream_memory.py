@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Suite 11: Streaming SSE, memory lifecycle, reset prefix, session isolation, prefix fingerprint, metrics deltas."""
-import json, time, urllib.request, urllib.error, threading, sys, http.client, re
+import http.client
+import json
+import re
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
 
 BASE = "http://127.0.0.1:9201"
 MODEL = "Qwen3.8-27B"

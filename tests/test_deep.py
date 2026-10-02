@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """local-llm-ctxgate-proxy DEEP TEST SUITE - tool chains, sampling, sessions, protocol, metrics, edge cases."""
-import json, urllib.request, urllib.error, time, threading, sys, re
+import json
+import threading
+import time
+import urllib.error
+import urllib.request
 
 BASE = "http://127.0.0.1:9201"
 PASS = 0; FAIL = 0; RESULTS = []
@@ -389,7 +393,7 @@ if s == 200:
         except:
             pass
     record("H2_stream_valid_sse", valid_json >= 1, "data_lines=" + str(len(data_lines)) + " valid=" + str(valid_json))
-    
+
     # Check for proper chunk structure
     has_delta = any('"delta"' in l for l in data_lines)
     record("H2_stream_has_delta", has_delta, "")

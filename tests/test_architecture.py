@@ -9,12 +9,19 @@ Deterministic: seeds memories via worker.apply_memories with crafted valid
 responses (no LM Studio dependency for the retrieval/dedupe/supersede half).
 Only Test B exercises the real 4B and degrades to SKIP if LM Studio is down.
 """
-import asyncio, os, sys, time, uuid
+import asyncio
+import os
+import sys
+import time
+import uuid
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "worker"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "proxy"))
-import asyncpg, httpx
-import worker
 import app as proxy
+import asyncpg
+import httpx
+
+import worker
 
 DSN = os.environ.get("CTXGATE_DB_DSN", "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/local-llm-ctxgate-proxy")
 PASS, FAIL, SKIP = 0, 0, 0

@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Suite 10: HTTP protocol edges, response fields, concurrency, boundaries, consistency."""
-import json, time, urllib.request, urllib.error, threading, sys
+import json
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
 
 BASE = "http://127.0.0.1:9201"
 MODEL = "Qwen3.8-27B"

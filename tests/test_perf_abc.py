@@ -10,7 +10,13 @@ Metrics: Qwen TTFT, total latency, input tokens, injected-memory delta,
 Proves the 4B does NOT materially degrade Qwen throughput and that
 automatic memory injection is normally small or absent.
 """
-import json, time, http.client, urllib.request, os, uuid, sys
+import http.client
+import json
+import os
+import sys
+import time
+import urllib.request
+import uuid
 
 BASE = "127.0.0.1"
 PORT = 9201
@@ -96,7 +102,9 @@ def main():
     print("-" * 62)
     try:
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "worker"))
-        import httpx, worker
+        import httpx
+
+        import worker
         async def b4b():
             worker.client = httpx.AsyncClient()
             t0 = time.time()

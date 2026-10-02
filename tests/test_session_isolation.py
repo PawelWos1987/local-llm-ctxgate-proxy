@@ -1,6 +1,5 @@
 """Suite 15: Session isolation - per-session prefix + token accounting."""
 import json
-import time
 import urllib.request
 
 import pytest

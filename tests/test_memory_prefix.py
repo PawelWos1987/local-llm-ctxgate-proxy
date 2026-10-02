@@ -3,17 +3,17 @@
 context building edge cases, PG state verification, concurrent memory ops."""
 import json
 import os
-import sys
-import time
-import urllib.request
-import urllib.error
-import hashlib
-import threading
 import subprocess
 import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
 sys.path.insert(0, "/home/user/local-llm-ctxgate-proxy/proxy")
-import app as _proxy
 from concurrent.futures import ThreadPoolExecutor
+
+import app as _proxy
 
 BASE = "http://127.0.0.1:9201"
 MODEL = "Qwen3.8-27B"

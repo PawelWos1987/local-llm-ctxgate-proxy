@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """local-llm-ctxgate-proxy EXTENDED TEST SUITE - real-world Goose patterns, D9/D10/D11, streaming+tools, memory, stress."""
-import json, urllib.request, urllib.error, time, threading, sys
+import json
+import threading
+import time
+import urllib.error
+import urllib.request
 
 BASE = "http://127.0.0.1:9201"
 PASS = 0; FAIL = 0; RESULTS = []

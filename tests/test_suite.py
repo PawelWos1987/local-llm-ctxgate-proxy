@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-import json, urllib.request, urllib.error, concurrent.futures
+import concurrent.futures
+import json
+import urllib.error
+import urllib.request
+
 BASE = "http://127.0.0.1:9201"
 PASS = 0
 FAIL = 0
@@ -76,7 +80,8 @@ hd = any(l.startswith("data: ") for l in lines)
 
 def test_regress_nl():
     """P1.1: _compact_context must not raise NameError (NL undefined)."""
-    import importlib, sys
+    import importlib
+    import sys
     sys.path.insert(0, "/home/pawelw/ctxproxy")
     try:
         import proxy.app as app
@@ -96,7 +101,8 @@ def test_regress_nl():
 
 def test_regress_normalize():
     """P1.2: _normalize_system_messages must not clobber non-system first message."""
-    import importlib, sys
+    import importlib
+    import sys
     sys.path.insert(0, "/home/pawelw/ctxproxy")
     try:
         import proxy.app as app
@@ -117,7 +123,8 @@ def test_regress_normalize():
 
 def test_regress_cache_metric():
     """P1.3: Weighted cache metric - 100 cached on 200 prompt = 0.5 hit rate."""
-    import importlib, sys
+    import importlib
+    import sys
     sys.path.insert(0, "/home/pawelw/ctxproxy")
     try:
         import proxy.app as app
@@ -137,7 +144,6 @@ def test_regress_cache_metric():
 
 def test_regress_no_trim():
     """P1.4: Continuation must not call trim_context - verify code has stop pattern."""
-    import os
     path = "/home/pawelw/ctxproxy/proxy/app.py"
     with open(path) as f:
         src = f.read()

@@ -14,14 +14,12 @@ Sections:
   J. Multi-turn integration flow
   K. Edge-case protocol (extra fields, empty tools, unicode system)
 """
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
 import json
-import time
-import urllib.request
-import urllib.error
 import sys
+import urllib.error
+import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 PROXY = "http://127.0.0.1:9201"
 VLLM = "http://127.0.0.1:29000/v1"

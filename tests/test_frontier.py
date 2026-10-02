@@ -2,7 +2,11 @@
 """Suite 9: Frontier - token counting, unicode, progressive trim,
 concurrent streaming, session isolation, stream integrity, metrics,
 edge payloads, memory lifecycle."""
-import json, time, urllib.request, urllib.error, threading
+import json
+import threading
+import time
+import urllib.error
+import urllib.request
 
 PROXY = "http://127.0.0.1:9201"
 passed, failed = 0, 0

@@ -1,10 +1,6 @@
 """Suite 16: Streaming at the trim boundary."""
-import asyncio
 import json
-import time
 import urllib.request
-
-import pytest
 
 PROXY = "http://127.0.0.1:9201"
 

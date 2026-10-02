@@ -11,9 +11,9 @@ Key insight: vLLM (parallel=1) is slow (2-3 min/call). We use stream=True to:
 import asyncio
 import json
 import os
-import time
-import httpx
+
 import asyncpg
+import httpx
 
 TEST_PORT = 9201
 PROXY_URL = "http://127.0.0.1:{}".format(TEST_PORT)
@@ -177,7 +177,7 @@ def generate_long_context(session_id, num_turns=20):
 
 async def test_sequential(pool):
     print("\n=== CASE 1: Sequential Delegates (one at a time) ===")
-    
+
     print("\n--- Test 1.1: Agent session creates proxy task ---")
     msgs = [{"role": "system", "content": "You are the main coding agent orchestrating sub-tasks."},
             {"role": "user", "content": "Start the backend project. First: set up database schema for users, products, orders."}]
@@ -186,7 +186,7 @@ async def test_sequential(pool):
     found, missing, rows = await check_db_tasks(pool, [AGENT_SESSION])
     passed = AGENT_SESSION in found
     record("Agent task creation", "sequential", passed, "found=" + str(found) + ", http=" + str(resp.status_code))
-    
+
     print("\n--- Test 1.2: Delegate 1 (20261002_19) ---")
     msgs = [{"role": "system", "content": "Sub-agent: database schema design."},
             {"role": "user", "content": "Design users table: id UUID, email VARCHAR unique, password_hash VARCHAR, created_at TIMESTAMPTZ."}]
@@ -195,7 +195,7 @@ async def test_sequential(pool):
     found, missing, rows = await check_db_tasks(pool, [DELEGATE_SESSIONS[0]])
     passed = DELEGATE_SESSIONS[0] in found
     record("Delegate 1 creation", "sequential", passed, "found=" + str(found) + ", http=" + str(resp.status_code))
-    
+
     print("\n--- Test 1.3: Delegate 2 (20261002_20) ---")
     msgs = [{"role": "system", "content": "Sub-agent: API endpoint implementation."},
             {"role": "user", "content": "Implement /api/users with GET (list), POST (create), GET /{id}, PUT /{id}, DELETE /{id}."}]
@@ -204,7 +204,7 @@ async def test_sequential(pool):
     found, missing, rows = await check_db_tasks(pool, [DELEGATE_SESSIONS[1]])
     passed = DELEGATE_SESSIONS[1] in found
     record("Delegate 2 creation", "sequential", passed, "found=" + str(found) + ", http=" + str(resp.status_code))
-    
+
     print("\n--- Test 1.4: No cross-contamination ---")
     agent_mem = await check_memory_for_session(pool, AGENT_SESSION)
     del1_mem = await check_memory_for_session(pool, DELEGATE_SESSIONS[0])
@@ -212,7 +212,7 @@ async def test_sequential(pool):
     all_tasks = await pool.fetch("SELECT session_id FROM proxy.tasks WHERE session_id = ANY($1)", [AGENT_SESSION, DELEGATE_SESSIONS[0], DELEGATE_SESSIONS[1]])
     passed = len(all_tasks) == 3
     record("No cross-contamination", "sequential", passed, "tasks=" + str(len(all_tasks)) + ", agent_mem=" + str(len(agent_mem)) + ", d1=" + str(len(del1_mem)) + ", d2=" + str(len(del2_mem)))
-    
+
     print("\n--- Test 1.5: Long session -> trimming + summary (agent) ---")
     long_msgs = generate_long_context(AGENT_SESSION, num_turns=20)
     total_chars = sum(len(m.get("content","")) for m in long_msgs)
@@ -231,7 +231,7 @@ async def test_sequential(pool):
 
 async def test_parallel(pool):
     print("\n=== CASE 2: Parallel Delegates (2-4 simultaneously) ===")
-    
+
     print("\n--- Test 2.1: 3 sessions simultaneous (agent + 2 delegates) ---")
     msgs_a = [{"role": "system", "content": "Orchestrator agent coordinating sub-tasks."},
               {"role": "user", "content": "Dispatch auth and payment sub-tasks."}]
@@ -252,7 +252,7 @@ async def test_parallel(pool):
         record("3 simultaneous sessions", "parallel", passed, "found={}/3, missing={}".format(len(found), missing))
     except Exception as e:
         record("3 simultaneous sessions", "parallel", False, "EXCEPTION: " + str(e)[:100])
-    
+
     print("\n--- Test 2.2: 4 delegates simultaneous ---")
     msgs_list = [
         [{"role": "system", "content": "Sub-agent: DB optimization."}, {"role": "user", "content": "Add indexes for reports queries."}],
@@ -274,7 +274,7 @@ async def test_parallel(pool):
         record("4 simultaneous delegates", "parallel", passed, "found={}/4, missing={}".format(len(found), missing))
     except Exception as e:
         record("4 simultaneous delegates", "parallel", False, "EXCEPTION: " + str(e)[:100])
-    
+
     print("\n--- Test 2.3: Session association (all 6 sessions) ---")
     all_sessions = [AGENT_SESSION] + DELEGATE_SESSIONS
     rows = await pool.fetch(
@@ -285,7 +285,7 @@ async def test_parallel(pool):
     unique = len(set(session_ids))
     passed = unique == 6
     record("All 6 sessions associated", "parallel", passed, "rows={}, unique={}, expected=6, sessions={}".format(len(rows), unique, session_ids))
-    
+
     print("\n--- Test 2.4: Long parallel sessions -> summaries ---")
     long_a = generate_long_context(AGENT_SESSION, num_turns=20)
     long_d2 = generate_long_context(DELEGATE_SESSIONS[2], num_turns=20)
@@ -310,7 +310,7 @@ async def test_parallel(pool):
         record("Parallel summary correctness", "parallel", passed, detail)
     except Exception as e:
         record("Parallel summary correctness", "parallel", False, "EXCEPTION: " + str(e)[:100])
-    
+
     print("\n--- Test 2.5: Knowledge injection ---")
     msgs = [{"role": "system", "content": "Working on ctxproxy project."},
             {"role": "user", "content": "What is the proxy port? How does session isolation work?"}]
@@ -332,19 +332,19 @@ async def main():
     print("Agent: {} | Delegates: {}".format(AGENT_SESSION, DELEGATE_SESSIONS))
     print("MAX_INPUT=4000 (triggers trimming for long contexts)")
     print("=" * 70)
-    
+
     pool = await asyncpg.create_pool(DB_DSN, min_size=2, max_size=5)
-    
+
     async with httpx.AsyncClient(timeout=5) as client:
         health = await client.get(PROXY_URL + "/health")
         print("\nProxy: {} {}".format(health.status_code, health.json()))
-    
+
     try:
         await test_sequential(pool)
         await test_parallel(pool)
     finally:
         await pool.close()
-    
+
     print("\n" + "=" * 70)
     print("RESULTS")
     print("=" * 70)
@@ -355,7 +355,7 @@ async def main():
     for r in results:
         print("  [{}] ({:12s}) {:35s} {}".format(r['status'], r['scenario'], r['test'], r['detail'][:80]))
     print("-" * 70)
-    
+
     with open("/home/user/ctxproxy/tests/integration_results.json", "w") as f:
         json.dump({"total": len(results), "passed": passed, "failed": failed, "results": results}, f, indent=2)
     print("\nSaved: /home/user/ctxproxy/tests/integration_results.json")

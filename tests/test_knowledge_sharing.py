@@ -1,10 +1,10 @@
 """Suite 18: test_knowledge_sharing.py - Cross-session knowledge sharing tests"""
-import httpx
-import json
-import time
-import sys
-import subprocess
 import os
+import subprocess
+import sys
+import time
+
+import httpx
 
 PROXY = "http://127.0.0.1:9201"
 PGENV = "PGPASSWORD=" + os.environ.get("CTXGATE_PG_PASS", "postgres") + " psql -h 127.0.0.1 -U postgres -d local-llm-ctxgate-proxy -t"
