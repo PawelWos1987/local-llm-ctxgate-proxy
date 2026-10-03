@@ -824,6 +824,7 @@ body{font-family:'Consolas','Courier New',monospace;background:var(--bg);color:v
 .sb-table .src-default{color:var(--dim)}
 .sb-table .src-custom{color:var(--green)}
 .sb-table .def-hint{color:var(--dim);font-size:.8em;font-style:italic}
+.sb-table .unit-label{font-size:.75em;color:var(--dim);font-style:italic}\.sb-table .unit-label.dim{color:var(--dim);opacity:.4}
 #logBtn{background:var(--panel);border:1px solid var(--border);color:var(--green);font-family:inherit;padding:5px 14px;cursor:pointer;font-size:.85em;letter-spacing:2px;flex-shrink:0;margin-left:8px}
 #logBtn:hover{border-color:var(--green);color:#fff}
 #logModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:110;justify-content:center;align-items:center}
@@ -960,7 +961,7 @@ body{font-family:'Consolas','Courier New',monospace;background:var(--bg);color:v
     </div>
     <div class="sb-table-wrap">
       <table class="sb-table" id="envTable">
-        <thead><tr><th>Variable</th><th>Type</th><th>Value</th><th>Source</th></tr></thead>
+        <thead><tr><th>Variable</th><th>Type</th><th>Value</th><th>Unit</th><th>Source</th></tr></thead>
         <tbody id="envTableBody"></tbody>
       </table>
     </div>
@@ -1062,40 +1063,40 @@ let _sbPath = { runtime: '', dashboard: '' };
 
 // Variable definitions: [name, type, default]
 const ENV_VARS = [
-  ["CTXGATE_DB_DSN", "str", "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy"],
-  ["CTXGATE_VLLM_URL", "url", "http://127.0.0.1:29000/v1"],
-  ["CTXGATE_VLLM_MODEL", "str", "Qwen3.8-27B"],
-  ["CTXGATE_LM_URL", "url", "http://127.0.0.1:1234/v1"],
-  ["CTXGATE_LM_MODEL", "str", "qwen3-4b-instruct-2507"],
-  ["CTXGATE_LM_TIMEOUT", "int", "120"],
-  ["CTXGATE_MAX_CONTEXT", "int", "84000"],
-  ["CTXGATE_MAX_INPUT", "int", "64000"],
-  ["CTXGATE_MAX_OUTPUT", "int", "18000"],
-  ["CTXGATE_SAFETY_MARGIN", "int", "2000"],
-  ["CTXGATE_WALL_CLOCK_MAX", "int", "1800"],
-  ["CTXGATE_MAX_CONTINUATIONS", "int", "5"],
-  ["CTXGATE_WORKER_BACKPRESSURE", "int", "50"],
-  ["CTXGATE_SESSION_TTL_HOURS", "int", "12"],
-  ["CTXGATE_MEMORY_TTL_DAYS", "int", "90"],
-  ["CTXGATE_PROXY_PORT", "int", "9201"],
-  ["CTXGATE_MAX_BODY_BYTES", "int", "20971520"],
-  ["CTXGATE_API_KEY", "str", ""],
-  ["CTXGATE_VLLM_READ_TIMEOUT", "int", "300"],
-  ["CTXGATE_VLLM_CONNECT_TIMEOUT", "int", "10"],
-  ["CTXGATE_VLLM_WRITE_TIMEOUT", "int", "120"],
-  ["CTXGATE_VLLM_POOL_TIMEOUT", "int", "30"],
-  ["CTXGATE_MEMORY_WORKER", "bool", "1"],
-  ["CTXGATE_WORKER_POLL", "float", "2.0"],
-  ["CTXGATE_WORKER_MAX_ATTEMPTS", "int", "3"],
-  ["CTXGATE_WORKER_OUTAGE_TTL", "float", "1800"],
-  ["CTXGATE_WORKER_MAX_TOKENS", "int", "512"],
-  ["CTXGATE_WORKER_LOCK_TTL", "float", "30"],
+  ["CTXGATE_DB_DSN", "str", "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy", ""],
+  ["CTXGATE_VLLM_URL", "url", "http://127.0.0.1:29000/v1", ""],
+  ["CTXGATE_VLLM_MODEL", "str", "Qwen3.8-27B", ""],
+  ["CTXGATE_LM_URL", "url", "http://127.0.0.1:1234/v1", ""],
+  ["CTXGATE_LM_MODEL", "str", "qwen3-4b-instruct-2507", ""],
+  ["CTXGATE_LM_TIMEOUT", "int", "120", "s"],
+  ["CTXGATE_MAX_CONTEXT", "int", "84000", "tokens"],
+  ["CTXGATE_MAX_INPUT", "int", "64000", "tokens"],
+  ["CTXGATE_MAX_OUTPUT", "int", "18000", "tokens"],
+  ["CTXGATE_SAFETY_MARGIN", "int", "2000", "tokens"],
+  ["CTXGATE_WALL_CLOCK_MAX", "int", "1800", "s"],
+  ["CTXGATE_MAX_CONTINUATIONS", "int", "5", "count"],
+  ["CTXGATE_WORKER_BACKPRESSURE", "int", "50", "count"],
+  ["CTXGATE_SESSION_TTL_HOURS", "int", "12", "hours"],
+  ["CTXGATE_MEMORY_TTL_DAYS", "int", "90", "days"],
+  ["CTXGATE_PROXY_PORT", "int", "9201", "port"],
+  ["CTXGATE_MAX_BODY_BYTES", "int", "20971520", "bytes"],
+  ["CTXGATE_API_KEY", "str", "", ""],
+  ["CTXGATE_VLLM_READ_TIMEOUT", "int", "300", "s"],
+  ["CTXGATE_VLLM_CONNECT_TIMEOUT", "int", "10", "s"],
+  ["CTXGATE_VLLM_WRITE_TIMEOUT", "int", "120", "s"],
+  ["CTXGATE_VLLM_POOL_TIMEOUT", "int", "30", "s"],
+  ["CTXGATE_MEMORY_WORKER", "bool", "1", ""],
+  ["CTXGATE_WORKER_POLL", "float", "2.0", "s"],
+  ["CTXGATE_WORKER_MAX_ATTEMPTS", "int", "3", "count"],
+  ["CTXGATE_WORKER_OUTAGE_TTL", "float", "1800", "s"],
+  ["CTXGATE_WORKER_MAX_TOKENS", "int", "512", "tokens"],
+  ["CTXGATE_WORKER_LOCK_TTL", "float", "30", "s"],
 ];
 
 const DASH_VARS = [
-  ["CTXGATE_DASHBOARD_PORT", "int", "9202"],
-  ["CTXGATE_DASHBOARD_HOST", "str", "127.0.0.1"],
-  ["CTXGATE_DASHBOARD_TOKEN", "str", ""],
+  ["CTXGATE_DASHBOARD_PORT", "int", "9202", "port"],
+  ["CTXGATE_DASHBOARD_HOST", "str", "127.0.0.1", ""],
+  ["CTXGATE_DASHBOARD_TOKEN", "str", "", ""],
 ];
 
 function switchTab(which) {
@@ -1147,17 +1148,19 @@ function renderTable(envText) {
   
   const tbody = document.getElementById('envTableBody');
   tbody.innerHTML = '';
-  vars.forEach(([name, type, def]) => {
+  vars.forEach(([name, type, def, unit]) => {
     const tr = document.createElement('tr');
     const val = current[name] !== undefined ? current[name] : def;
     const isCustom = current[name] !== undefined && current[name] !== def;
     const inputType = (type === 'int') ? 'number' : (type === 'float') ? 'number' : 'text';
     const step = (type === 'float') ? 'step="0.1"' : (type === 'int') ? 'step="1"' : '';
     const min = (type === 'int' || type === 'float') ? 'min="0"' : '';
+    const unitCell = unit ? '<span class="unit-label">' + unit + '</span>' : '<span class="unit-label dim">—</span>';
     tr.innerHTML =
       '<td class="var-name">' + name + '</td>' +
       '<td><span class="type-badge type-' + type + '">' + type.toUpperCase() + '</span></td>' +
       '<td><input type="' + inputType + '" ' + step + ' ' + min + ' id="env_' + name + '" value="' + val.replace(/"/g, '&quot;') + '" placeholder="' + def + '"></td>' +
+      '<td>' + unitCell + '</td>' +
       '<td><span class="src-badge ' + (isCustom ? 'src-custom' : 'src-default') + '">' + (isCustom ? 'CUSTOM' : 'DEFAULT') + '</span></td>';
     tbody.appendChild(tr);
   });
@@ -1166,7 +1169,7 @@ function renderTable(envText) {
 function collectEnvText() {
   const vars = (_sbTab === 'runtime') ? ENV_VARS : DASH_VARS;
   const lines = [];
-  vars.forEach(([name, type, def]) => {
+  vars.forEach(([name, type, def, unit]) => {
     const el = document.getElementById('env_' + name);
     if (!el) return;
     let val = el.value.trim();
@@ -1188,10 +1191,7 @@ function collectEnvText() {
       }
     }
     el.style.borderColor = '';
-    // Only include if non-empty or was explicitly set
-    if (val !== '' && val !== def) {
-      lines.push(name + '=' + val);
-    } else if (val !== '') {
+    if (val !== '') {
       lines.push(name + '=' + val);
     }
   });
