@@ -1,0 +1,29 @@
+[Unit]
+Description=ctxgate-proxy — cache-first proxy between Goose and vLLM
+Documentation=https://github.com/PawelWos1987/local-llm-ctxgate-proxy
+After=network.target postgresql.service
+Wants=network.target postgresql.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=60
+Restart=always
+RestartSec=5
+StartLimitBurst=0
+TimeoutStopSec=30
+KillMode=mixed
+WorkingDirectory=/opt/ctxgate-proxy
+EnvironmentFile=-/etc/ctxgate-proxy/env
+ExecStart=/usr/bin/python3 -u proxy/app.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ctxgate-proxy
+# Explicit memory boundary: if the proxy grows past this, systemd-oomd
+# knows exactly which cgroup to throttle, and does not kill the 27B vLLM
+# process running in a different scope.
+MemoryMax=2G
+MemoryHigh=1500M
+
+[Install]
+WantedBy=multi-user.target

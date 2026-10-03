@@ -23,6 +23,60 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("ctxgate-proxy")
+import signal as _signal
+import os as _os
+
+def _sigterm_handler(signum, frame):
+    """Log the signal and its sender before letting uvicorn's handler take over."""
+    try:
+        with open("/proc/self/status") as _f:
+            _status = _f.read()
+        _ppid = "?"
+        for _line in _status.splitlines():
+            if _line.startswith("PPid:"):
+                _ppid = _line.split()[1]
+                break
+        log.error(
+            "SIGNAL RECEIVED signum=%d (%s) PPid=%s — uvicorn will shut down gracefully. "
+            "If this was not you, something in your session/system is killing the proxy.",
+            signum, _signal.Signals(signum).name, _ppid,
+        )
+    except Exception as _e:
+        log.error("SIGNAL RECEIVED signum=%d (log failed: %s)", signum, _e)
+    # Do not chain to the default handler; uvicorn installs its own and will
+    # handle shutdown. We only want the log line.
+    # NOTE: Best-effort. Uvicorn may re-install its own handler after lifespan.
+    # If our handler is active at signal time, it logs but does not trigger
+    # shutdown — uvicorn's mechanism owns the shutdown sequence.
+
+import socket as _socket
+
+def _sd_notify(msg: str) -> None:
+    """Send an sd_notify message to systemd if NOTIFY_SOCKET is set."""
+    addr = _os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    try:
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_DGRAM)
+        s.connect(addr)
+        s.sendall(msg.encode())
+        s.close()
+    except OSError:
+        pass
+
+async def _watchdog_loop():
+    """Ping systemd every 10s. WatchdogSec=60 in the unit means the proxy
+    is killed and restarted if the event loop cannot schedule this task
+    for 60 seconds — that is the deadlock detector."""
+    while True:
+        try:
+            _sd_notify("WATCHDOG=1")
+        except Exception as _e:
+            log.warning("watchdog ping failed: %s", _e)
+        await asyncio.sleep(10)
+
 NL = "\n"  # newline constant for string building
 
 def _env_int(name: str, default: int) -> int:
@@ -497,6 +551,7 @@ metrics = {
     "evicted_sessions": 0,
     "summary_age_tokens": 0,
     "reasoning_strips": 0,
+    "extract_shed": 0,
     "started_at": time.time(),
 }
 
@@ -649,11 +704,21 @@ def validate_config() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pool, enc
+    try:
+        _signal.signal(_signal.SIGTERM, _sigterm_handler)
+        _signal.signal(_signal.SIGINT, _sigterm_handler)
+        log.info("signal handlers installed (SIGTERM/SIGINT will be logged before shutdown)")
+    except Exception as _e:
+        log.warning("could not install signal handlers: %s", _e)
     validate_config()
     # Retry DB connection (service starts independently, waits for PG)
     for _attempt in range(60):
         try:
-            pool = await asyncpg.create_pool(DB_DSN, min_size=2, max_size=10)
+            pool = await asyncpg.create_pool(
+                DB_DSN, min_size=2, max_size=10,
+                command_timeout=10, timeout=10,
+                max_inactive_connection_lifetime=300,
+            )
             break
         except Exception as _e:
             log.warning("DB not ready (attempt %d/60): %s - retrying in 2s", _attempt + 1, _e)
@@ -687,6 +752,9 @@ async def lifespan(app: FastAPI):
     )
     _vllm_client = httpx.AsyncClient(timeout=_vllm_timeout)
     log.info("shared vLLM httpx client created (timeout=%s)", _vllm_timeout)
+    _sd_notify("READY=1")
+    watchdog_task = asyncio.create_task(_watchdog_loop())
+    log.info("systemd watchdog loop started (10s heartbeat, 60s timeout in unit)")
     yield
     if _vllm_client is not None:
         await _vllm_client.aclose()
@@ -697,12 +765,17 @@ async def lifespan(app: FastAPI):
     log.info("ctxgate-proxy shutdown complete (graceful: pool drained)")
     worker_task.cancel()
     health_task.cancel()
+    watchdog_task.cancel()
     try:
         await worker_task
     except asyncio.CancelledError:
         pass
     try:
         await health_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await watchdog_task
     except asyncio.CancelledError:
         pass
 
@@ -930,16 +1003,16 @@ def _compact_context(messages: list, max_tokens: int, session_key: str, summary_
         tail.pop(0)
     last_turn = max(0, len(rest) - len(tail))
     prev = session_compactions.get(session_key) or {"last_turn": 0, "frozen_summary": ""}
+    fs = prev["frozen_summary"]
     if last_turn > prev["last_turn"]:
-        fs = summary_text.strip() if summary_text else prev["frozen_summary"]
-        if not fs:
-            fs = "[COMPACTED HISTORY: earlier turns archived]"
+        candidate = summary_text.strip() if summary_text else prev["frozen_summary"]
+        if not candidate:
+            candidate = "[COMPACTED HISTORY: earlier turns archived]"
+        fs = candidate
         session_compactions[session_key] = {"last_turn": last_turn, "frozen_summary": fs}
-        global metrics
         metrics["compaction_events"] += 1
         log.info("COMPACTION session=%s cut=%d (%d chars)", session_key, last_turn, len(fs))
     result = list(seed)
-    fs = session_compactions[session_key]["frozen_summary"]
     if fs:
         result.append({"role": "system", "content": "[COMPACTED HISTORY]" + NL + fs[:2000]})
     result.extend(tail)
@@ -1258,6 +1331,31 @@ async def _regenerate_knowledge_item(item: dict, context: str) -> dict | None:
 _EXTRACT_SEM = asyncio.Semaphore(2)
 _EXTRACT_IN_FLIGHT = 0
 
+async def _sync_deliverable_summary(session_id: str):
+    """Background: update deliverable summaries from latest working_memory for matching session."""
+    if not pool:
+        return
+    try:
+        info = await _get_goose_session_info(session_id)
+        if not info or not info.get("working_dir"):
+            return
+        wm = await pool.fetchrow(
+            """SELECT wm.content FROM proxy.working_memory wm
+               JOIN proxy.tasks t ON t.id = wm.task_id
+               WHERE t.working_dir = $1
+               ORDER BY wm.updated_at DESC LIMIT 1""",
+            info["working_dir"]
+        )
+        if not wm or not wm["content"]:
+            return
+        summary = wm["content"][:200]
+        await pool.execute(
+            "UPDATE proxy.deliverables SET summary=$1, updated_at=now() WHERE working_dir=$2",
+            summary, info["working_dir"]
+        )
+    except Exception as e:
+        log.debug("deliverable summary sync failed for %s: %s", session_id, e)
+
 async def _fire_and_forget_extract(session_id: str, session_key: str, messages: list):
     """Background knowledge extraction - never blocks the request path."""
     global _EXTRACT_IN_FLIGHT
@@ -1271,7 +1369,11 @@ async def _fire_and_forget_extract(session_id: str, session_key: str, messages: 
             log.warning("Knowledge extraction (background) failed: %s", e)
         finally:
             _EXTRACT_IN_FLIGHT -= 1
-
+        # Background deliverable summary sync (fire-and-forget, never blocks)
+        try:
+            await _sync_deliverable_summary(session_id)
+        except Exception:
+            pass
 async def extract_knowledge(session_id: str, session_key: str, messages: list) -> list:
     """Async 4B-based knowledge extraction with quality orchestration.
 
@@ -1942,7 +2044,10 @@ async def chat_completions(request: Request):
     _track_session_tokens(session_key, input_tokens)
 
     # --- Cross-session knowledge extraction (fire-and-forget, non-blocking) ---
-    asyncio.ensure_future(_fire_and_forget_extract(x_sid, session_key, messages))
+    if _EXTRACT_IN_FLIGHT < 2:
+        asyncio.ensure_future(_fire_and_forget_extract(x_sid, session_key, messages))
+    else:
+        metrics["extract_shed"] = metrics.get("extract_shed", 0) + 1
 
     # Proxy calculates output budget from post-trim input (authoritative)
     # Goose's max_tokens is based on pre-trim input - ignore it
@@ -2021,7 +2126,10 @@ async def _vllm_health_loop():
             if vllm_alive:
                 log.warning("vLLM unreachable: %s - marking dead", e)
             vllm_alive = False
-        _evict_stale_sessions()
+        try:
+            _evict_stale_sessions()
+        except Exception as e:
+            log.warning("_evict_stale_sessions failed: %s", e)
         await asyncio.sleep(60)
 
 def _normalize_system_messages(messages):
@@ -2573,11 +2681,28 @@ async def create_deliverable(request: Request):
     try:
         body = await request.json()
         name = body.get("name", "unnamed")
-        session_type = body.get("session_type", "goose")
+        session_type = body.get("session_type", "")
         working_dir = body.get("working_dir", "")
         provider_name = body.get("provider_name", "")
         summary = body.get("summary", "")
         document_path = body.get("document_path", "")
+
+        # Auto-enrichment: fill missing fields from Goose sessions DB
+        if not session_type or not working_dir or not provider_name:
+            x_sid = request.headers.get("X-Session-ID", "")
+            if not x_sid:
+                x_sid = await _get_goose_session_id()
+            if x_sid and x_sid != "unknown":
+                info = await _get_goose_session_info(x_sid)
+                if info:
+                    if not session_type:
+                        session_type = info.get("session_type", "") or "goose"
+                    if not working_dir:
+                        working_dir = info.get("working_dir", "")
+                    if not provider_name:
+                        provider_name = info.get("provider_name", "")
+        if not session_type:
+            session_type = "goose"
 
         row = await pool.fetchrow(
             """INSERT INTO proxy.deliverables
@@ -2607,7 +2732,7 @@ async def list_deliverables(limit: int = 50):
         return JSONResponse({"error": "DB not ready"}, status_code=503)
     try:
         rows = await pool.fetch(
-            """SELECT id, name, session_type, working_dir, provider_name, summary, document_path, created_at
+            """SELECT id, name, session_type, working_dir, provider_name, summary, document_path, created_at, updated_at
                FROM proxy.deliverables
                ORDER BY created_at DESC
                LIMIT $1""",
@@ -2623,7 +2748,8 @@ async def list_deliverables(limit: int = 50):
                     "provider_name": r["provider_name"],
                     "summary": r["summary"],
                     "document_path": r["document_path"],
-                    "created_at": r["created_at"].isoformat()
+                    "created_at": r["created_at"].isoformat(),
+                    "updated_at": r["updated_at"].isoformat()
                 }
                 for r in rows
             ]
@@ -2632,6 +2758,53 @@ async def list_deliverables(limit: int = 50):
         log.error("deliverable list error: %s", e)
         return JSONResponse({"error": str(e)}, status_code=500)
 
+@app.patch("/deliverable/{id}")
+async def update_deliverable(id: str, request: Request):
+    """Update a deliverable's summary, name, or document_path."""
+    if not pool:
+        return JSONResponse({"error": "DB not ready"}, status_code=503)
+    try:
+        body = await request.json()
+        sets = []
+        params = []
+        param_idx = 1
+        if body.get("summary") is not None:
+            sets.append("summary=$" + str(param_idx))
+            params.append(body["summary"])
+            param_idx += 1
+        if body.get("name") is not None:
+            sets.append("name=$" + str(param_idx))
+            params.append(body["name"])
+            param_idx += 1
+        if body.get("document_path") is not None:
+            sets.append("document_path=$" + str(param_idx))
+            params.append(body["document_path"])
+            param_idx += 1
+        if not sets:
+            return JSONResponse({"error": "No updatable fields provided"}, status_code=400)
+        sets.append("updated_at=now()")
+        params.append(id)
+        row = await pool.fetchrow(
+            "UPDATE proxy.deliverables SET " + ", ".join(sets) + " WHERE id=$" + str(param_idx) +
+            " RETURNING id, name, session_type, working_dir, provider_name, summary, document_path, created_at, updated_at",
+            *params
+        )
+        if not row:
+            return JSONResponse({"error": "Deliverable not found"}, status_code=404)
+        return {
+            "id": str(row["id"]),
+            "name": row["name"],
+            "session_type": row["session_type"],
+            "working_dir": row["working_dir"],
+            "provider_name": row["provider_name"],
+            "summary": row["summary"],
+            "document_path": row["document_path"],
+            "created_at": row["created_at"].isoformat(),
+            "updated_at": row["updated_at"].isoformat()
+        }
+    except Exception as e:
+        log.error("deliverable update error: %s", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
 @app.post("/memory/inject")
 async def memory_inject(request: Request):
     body = await request.json()
@@ -3364,10 +3537,17 @@ function renderDeliverables(items) {
     '<div class="scrollbox"><table><thead><tr><th>Name</th><th>Type</th><th>Working Dir</th><th>Provider</th><th>Summary</th><th>Document</th><th>Created</th></tr></thead><tbody>' +
     items.map(d => {
       const summary = d.summary ? (d.summary.length > 80 ? d.summary.slice(0, 77) + '...' : d.summary) : '-';
-      const docLink = d.document_path
-        ? '<a href="file:///' + esc(d.document_path) + '" target="_blank" style="color:var(--blue);text-decoration:underline;">' + esc(d.document_path.split('/').pop()) + '</a>'
-        : '-';
-      return '<tr><td>' + esc(d.name) + '</td><td>' + esc(d.session_type) + '</td><td>' + esc(d.working_dir) + '</td><td>' + esc(d.provider_name) + '</td><td>' + esc(summary) + '</td><td>' + docLink + '</td><td>' + esc(d.created_at) + '</td></tr>';
+      let docLink = '-';
+      if (d.document_path) {
+        if (d.document_path.startsWith('http://') || d.document_path.startsWith('https://')) {
+          docLink = '<a href="' + esc(d.document_path) + '" target="_blank" style="color:var(--blue);text-decoration:underline;">' + esc(d.document_path.split('/').pop()) + '</a>';
+        } else {
+          docLink = '<a href="file:///' + esc(d.document_path) + '" target="_blank" style="color:var(--blue);text-decoration:underline;">' + esc(d.document_path.split('/').pop()) + '</a>';
+        }
+      }
+      const created = esc(d.created_at || '');
+      const updated = d.updated_at ? ' &middot; updated ' + esc(d.updated_at) : '';
+      return '<tr><td>' + esc(d.name) + '</td><td>' + esc(d.session_type) + '</td><td>' + esc(d.working_dir) + '</td><td>' + esc(d.provider_name) + '</td><td>' + esc(summary) + '</td><td>' + docLink + '</td><td>' + created + updated + '</td></tr>';
     }).join('') +
     '</tbody></table></div>';
 }

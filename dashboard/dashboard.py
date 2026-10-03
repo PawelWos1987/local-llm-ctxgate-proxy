@@ -88,7 +88,7 @@ def _get(d, *keys, default=None):
     return d
 
 DEFAULT_SERVICES = {
-    "postgresql": {"type": "tcp", "host": "127.0.0.1", "port": 5432},
+    "postgresql": {"type": "pg"},
     "vllm": {"type": "http", "url": "http://127.0.0.1:29000/v1/models"},
     "lm_studio": {"type": "http", "url": "http://127.0.0.1:1234/v1/models"},
     "ctxgate_proxy": {"type": "http", "url": "http://127.0.0.1:9201/health"},
@@ -228,6 +228,23 @@ async def check_http(url: str, timeout: float = 5.0) -> dict:
             if r.status_code == 200:
                 return {"status": "up", "latency_ms": latency}
             return {"status": "degraded", "latency_ms": latency, "http_code": r.status_code}
+    except Exception as e:
+        return {"status": "down", "error": str(e)[:100]}
+
+async def check_pg() -> dict:
+    """Run SELECT 1 against PG to verify actual queryability (not just TCP)."""
+    try:
+        if _pg_pool is not None:
+            async with _pg_pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            return {"status": "up"}
+        import asyncpg
+        conn = await asyncio.wait_for(asyncpg.connect(DB_DSN), timeout=5)
+        try:
+            await conn.fetchval("SELECT 1")
+            return {"status": "up"}
+        finally:
+            await conn.close()
     except Exception as e:
         return {"status": "down", "error": str(e)[:100]}
 
@@ -381,7 +398,52 @@ async def _wait_lock_fresh(path: str, timeout: float = 20.0) -> tuple:
     return False, last
 
 # --- Control actions ---
+async def _spawn_daemon(cmd: list) -> tuple:
+    # Spawn a long-lived daemon with DEVNULL pipes so communicate() is never needed.
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL,
+            start_new_session=True
+        )
+        return (0, str(proc.pid), "")
+    except FileNotFoundError:
+        return (127, "", "command not found: " + cmd[0])
+
 async def _start(name: str) -> dict:
+    cfg = SVC_MAP[name]
+    steps = []
+    pattern = r"proxy/app\.py" if name == "ctxgate_proxy" else r"worker/worker\.py"
+    await _kill_all_matching(pattern)
+    if cfg["kind"] == "http" and await _port_open(cfg["port"]):
+        steps.append("already running (port " + str(cfg["port"]) + " open)")
+        return {"ok": True, "steps": steps}
+    if cfg["kind"] == "file":
+        lp = cfg.get("lock_path", "")
+        if lp and os.path.exists(lp):
+            ok, detail = await _wait_lock_fresh(lp, timeout=5)
+            if ok:
+                steps.append("already running (fresh lock)")
+                return {"ok": True, "steps": steps}
+    if name == "ctxgate_proxy":
+        cmd = ["bash", "-c", "cd /home/pawelw/ctxproxy && set -a && . ./.env && set +a && setsid nohup python3 -u proxy/app.py >> proxy.log 2>&1 < /dev/null &"]
+    else:
+        cmd = ["bash", "-c", "cd /home/pawelw/ctxproxy && set -a && . ./.env && set +a && setsid nohup python3 -u worker/worker.py >> worker.log 2>&1 < /dev/null &"]
+    steps.append("spawning daemon")
+    rc, pid, err = await _spawn_daemon(cmd)
+    steps.append("spawn rc=" + str(rc) + " pid=" + pid + " " + err.strip()[:80])
+    if rc != 0:
+        return {"ok": False, "error": "spawn failed: " + err, "steps": steps}
+    if cfg["kind"] == "http":
+        ok, detail = await _wait_http(cfg["health_url"])
+    else:
+        ok, detail = await _wait_lock_fresh(cfg["lock_path"])
+    steps.append("verify: " + detail)
+    return {"ok": ok, "steps": steps}
+
+
     cfg = SVC_MAP[name]
     steps = []
     # kill any strays first (guarantees one instance)
@@ -414,17 +476,11 @@ async def _start(name: str) -> dict:
 async def _stop(name: str) -> dict:
     cfg = SVC_MAP[name]
     steps = []
-    rc, out, err = await _systemctl("stop", cfg["unit"])
-    steps.append("stop rc=" + str(rc) + " " + (out or err).strip())
-    pid = await _unit_main_pid(cfg["unit"])
-    if pid:
-        try:
-            os.kill(pid, signal.SIGKILL)
-            steps.append("SIGKILL leftover pid " + str(pid))
-        except ProcessLookupError:
-            steps.append("pid " + str(pid) + " already gone")
+    pattern = r"proxy/app\.py" if name == "ctxgate_proxy" else r"worker/worker\.py"
+    k = await _kill_all_matching(pattern)
+    steps += ["SIGKILL: " + x for x in k] or ["no process found"]
     if cfg["kind"] == "http":
-        ok, ksteps = await _kill_port_forever(cfg["port"], max_wait=15.0)
+        ok, ksteps = await _kill_port_forever(cfg["port"], max_wait=10.0)
         steps += ksteps
         steps.append("port " + str(cfg["port"]) + ": " + ("free" if ok else "STILL HELD"))
     else:
@@ -434,6 +490,7 @@ async def _stop(name: str) -> dict:
         except FileNotFoundError:
             steps.append("no lock file")
     return {"ok": True, "steps": steps}
+
 
 async def _kill_all_matching(pattern: str, max_wait: float = 10.0) -> list:
     """SIGKILL every process matching pattern. Wait until zero remain."""
@@ -452,54 +509,8 @@ async def _kill_all_matching(pattern: str, max_wait: float = 10.0) -> list:
     return killed
 
 async def _hard_restart(name: str) -> dict:
-    """Kill forever + fresh start: the only way a stuck service ever recovers."""
-    cfg = SVC_MAP[name]
-    steps = []
-    # 1. clean stop (SIGTERM; systemd escalates to SIGKILL on timeout)
-    rc, out, err = await _systemctl("stop", cfg["unit"])
-    steps.append("stop rc=" + str(rc) + " " + (out or err).strip())
-    # 2. SIGKILL ALL matching processes (not just MainPID — kills strays)
-    if name == "ctxgate_proxy":
-        k = await _kill_all_matching(r"proxy/app\.py")
-        steps += ["SIGKILL all: " + x for x in k] or ["no strays"]
-    else:
-        k = await _kill_all_matching(r"worker/worker\.py")
-        steps += ["SIGKILL all: " + x for x in k] or ["no strays"]
-    pid = await _unit_main_pid(cfg["unit"])
-    if pid:
-        try:
-            os.kill(pid, signal.SIGKILL)
-            steps.append("SIGKILL pid " + str(pid))
-        except ProcessLookupError:
-            steps.append("pid " + str(pid) + " already gone")
-    # 3. free the port (proxy) / remove the lock file (worker)
-    if cfg["kind"] == "http":
-        ok, ksteps = await _kill_port_forever(cfg["port"])
-        steps += ksteps
-        steps.append("port " + str(cfg["port"]) + ": " + ("free" if ok else "STILL HELD"))
-        if not ok:
-            return {"ok": False, "error": "port " + str(cfg["port"]) + " could not be freed", "steps": steps}
-    else:
-        try:
-            os.remove(cfg["lock_path"])
-            steps.append("removed stale lock file")
-        except FileNotFoundError:
-            steps.append("no lock file")
-    # 4. reset start-limit counter (crash loops would otherwise block a fresh start)
-    rc, out, err = await _systemctl("reset-failed", cfg["unit"])
-    steps.append("reset-failed rc=" + str(rc))
-    # 5. fresh start
-    rc, out, err = await _systemctl("start", cfg["unit"])
-    steps.append("start rc=" + str(rc) + " " + (out or err).strip())
-    if rc != 0:
-        return {"ok": False, "error": "fresh start failed: " + err, "steps": steps}
-    # 6. verify it is actually healthy
-    if cfg["kind"] == "http":
-        ok, detail = await _wait_http(cfg["health_url"])
-    else:
-        ok, detail = await _wait_lock_fresh(cfg["lock_path"])
-    steps.append("verify: " + detail)
-    return {"ok": ok, "steps": steps}
+    return await _start(name)
+
 
 # --- Background poller ---
 async def poll_health():
@@ -512,6 +523,8 @@ async def poll_health():
                 services[name] = await check_tcp(cfg["host"], cfg["port"])
             elif cfg["type"] == "http":
                 services[name] = await check_http(cfg["url"])
+            elif cfg["type"] == "pg":
+                services[name] = await check_pg()
             elif cfg["type"] == "file":
                 services[name] = await check_worker_file(cfg["path"])
         db_metrics = await get_db_metrics()

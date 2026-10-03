@@ -83,6 +83,10 @@ Each one is fully independent; if one dies, the dashboard shows a red dot.
 
 ## 2. Installation
 
+> **Running an unattended agent?** Install the systemd units: see `deploy/README.md`.
+> The proxy must be managed by systemd, not by a shell or an agent's bash tool.
+> See `docs/AGENT_RULES.md` for the rules your agent must follow.
+
 ### A. AUR package (recommended — the packaged solution)
 
 ```
