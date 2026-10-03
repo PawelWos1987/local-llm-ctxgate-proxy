@@ -70,6 +70,24 @@ def _watchdog_loop():
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 CONFIG_PATH = os.environ.get("CTXGATE_CONFIG", os.path.join(_ROOT, "config.yaml"))
+ENV_PATH = os.environ.get("CTXGATE_ENV_FILE", "/etc/ctxgate-proxy/env")
+
+
+def _validate_env_text(text: str) -> tuple[bool, str]:
+    """Return (ok, error). Reject malformed lines so a bad save cannot brick the units."""
+    if not text.strip():
+        return False, "env file is empty"
+    for i, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            return False, f"line {i}: missing '=' (got: {line[:60]!r})"
+        key, _, _val = line.partition("=")
+        key = key.strip()
+        if not key or not key.replace("_", "").isalnum() or key[0].isdigit():
+            return False, f"line {i}: invalid variable name {key!r}"
+    return True, ""
 
 def load_config() -> dict:
     # Load config.yaml; return {} on error so defaults below apply.
@@ -613,6 +631,70 @@ async def put_config(request: Request):
     _maybe_reload_config()
     return JSONResponse({"ok": True, "path": CONFIG_PATH})
 
+
+@app.get("/api/env")
+async def get_env():
+    """Return the runtime env file (proxy + worker)."""
+    try:
+        with open(ENV_PATH) as f:
+            text = f.read()
+        return JSONResponse({"ok": True, "path": ENV_PATH, "text": text})
+    except FileNotFoundError:
+        return JSONResponse({"ok": True, "path": ENV_PATH, "text": ""})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": "read failed: " + str(e)}, status_code=400)
+
+
+@app.post("/api/env")
+async def put_env(request: Request):
+    """Write the runtime env file. Atomic write, ownership fixup, mode 600."""
+    global _last_config_write
+    if not _auth_ok(request):
+        return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
+    if time.time() - _last_config_write < 5.0:
+        return JSONResponse({"ok": False, "error": "rate limited (min 5s between writes)"}, status_code=429)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid json"}, status_code=400)
+    text = body.get("text")
+    if not isinstance(text, str):
+        return JSONResponse({"ok": False, "error": "body must be {text: <string>}"}, status_code=400)
+    ok, err = _validate_env_text(text)
+    if not ok:
+        return JSONResponse({"ok": False, "error": err}, status_code=400)
+    try:
+        tmp = ENV_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, ENV_PATH)
+        try:
+            os.chmod(ENV_PATH, 0o600)
+        except Exception:
+            pass
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": "write failed: " + str(e)}, status_code=400)
+    _last_config_write = time.time()
+    return JSONResponse({"ok": True, "path": ENV_PATH})
+
+
+@app.post("/api/env/save-and-restart")
+async def put_env_and_restart(request: Request):
+    """Write env then restart proxy + worker via the existing control path."""
+    r = await put_env(request)
+    if r.status_code != 200:
+        return r
+    results = {}
+    for name in ("ctxgate_proxy", "worker"):
+        try:
+            results[name] = await _hard_restart(name)
+        except Exception as e:
+            results[name] = {"ok": False, "error": str(e)}
+    return JSONResponse({"ok": True, "path": ENV_PATH, "restart": results})
+
+
 @app.get("/api/log")
 async def get_log(request: Request):
     p = request.query_params
@@ -719,6 +801,10 @@ body{font-family:'Consolas','Courier New',monospace;background:var(--bg);color:v
 .sb-btn{background:var(--panel);border:1px solid var(--border);color:var(--text);font-family:inherit;padding:6px 18px;cursor:pointer;font-size:.85em;letter-spacing:1px;margin-left:8px}
 .sb-btn:hover{border-color:var(--blue)}
 .sb-btn.save{border-color:var(--green);color:var(--green)}
+.sb-tab{background:transparent;border:1px solid var(--border);color:var(--text);font-family:inherit;padding:4px 10px;cursor:pointer;font-size:.8em;letter-spacing:1px;margin-right:4px}
+.sb-tab.active{border-color:var(--green);color:var(--green)}
+.sb-btn.restart{border-color:var(--yellow);color:var(--yellow)}
+.sb-btn.restart:hover{border-color:var(--yellow);color:#fff}
 #logBtn{background:var(--panel);border:1px solid var(--border);color:var(--green);font-family:inherit;padding:5px 14px;cursor:pointer;font-size:.85em;letter-spacing:2px;flex-shrink:0;margin-left:8px}
 #logBtn:hover{border-color:var(--green);color:#fff}
 #logModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:110;justify-content:center;align-items:center}
@@ -847,12 +933,20 @@ body{font-family:'Consolas','Courier New',monospace;background:var(--bg);color:v
 
 <div id="settingsModal">
   <div id="settingsBox">
-    <div class="sb-head"><h2>&#9881; SETTINGS — config.yaml</h2><span class="close" onclick="closeSettings()">&#10005;</span></div>
-    <div class="sb-hint">All runtime parameters (ports, URLs, DSN, poll interval, watchdog, service units). Edit the YAML and press SAVE. File: config.yaml (project root) — also editable externally; changes are hot-reloaded, no restart needed.</div>
+    <div class="sb-head"><h2>&#9881; SETTINGS</h2><span class="close" onclick="closeSettings()">&#10005;</span></div>
+    <div class="sb-hint">
+      <button class="sb-tab" id="tabRuntime" onclick="switchTab('runtime')">RUNTIME (proxy + worker)</button>
+      <button class="sb-tab" id="tabDashboard" onclick="switchTab('dashboard')">DASHBOARD (this service)</button>
+      <span id="sbPath" style="margin-left:12px;color:var(--dim)"></span>
+    </div>
     <textarea id="settingsText" spellcheck="false"></textarea>
     <div class="sb-foot">
       <span class="msg" id="settingsMsg"></span>
-      <div><button class="sb-btn" onclick="reloadSettingsText()">RELOAD</button><button class="sb-btn save" onclick="saveSettings()">SAVE</button></div>
+      <div>
+        <button class="sb-btn" onclick="reloadSettingsText()">RELOAD</button>
+        <button class="sb-btn save" onclick="saveSettings()">SAVE</button>
+        <button class="sb-btn restart" id="btnSaveRestart" onclick="saveAndRestart()">SAVE &amp; RESTART</button>
+      </div>
     </div>
   </div>
 </div>
@@ -939,32 +1033,93 @@ b.disabled=false;
 function tick(){$('clock').textContent=new Date().toLocaleTimeString()}
 tick();setInterval(tick,1000);
 poll();setInterval(poll,3000);
-function openSettings(){
+let _sbTab = 'runtime';
+let _sbPath = { runtime: '', dashboard: '' };
+
+function switchTab(which) {
+  _sbTab = which;
+  document.getElementById('tabRuntime').classList.toggle('active', which === 'runtime');
+  document.getElementById('tabDashboard').classList.toggle('active', which === 'dashboard');
+  document.getElementById('btnSaveRestart').style.display = (which === 'runtime') ? '' : 'none';
+  document.getElementById('sbPath').textContent = _sbPath[which] || '';
+  reloadSettingsText();
+}
+
+function openSettings() {
   document.getElementById('settingsModal').classList.add('open');
-  const msg = document.getElementById('settingsMsg');
-  const ta = document.getElementById('settingsText');
-  msg.textContent = 'Loading config.yaml ...';
-  msg.style.color = '';
-  fetch('/api/config').then(r=>r.json()).then(d=>{
-    if(d.ok){ ta.value = d.text; msg.textContent = d.path; }
-    else { msg.textContent = 'Error: ' + (d.error||''); }
-  }).catch(e=>{ msg.textContent = 'Fetch failed: ' + e; });
+  document.getElementById('tabRuntime').classList.toggle('active', _sbTab === 'runtime');
+  document.getElementById('tabDashboard').classList.toggle('active', _sbTab === 'dashboard');
+  document.getElementById('btnSaveRestart').style.display = (_sbTab === 'runtime') ? '' : 'none';
+  reloadSettingsText();
 }
-function closeSettings(){ document.getElementById('settingsModal').classList.remove('open'); }
-function reloadSettingsText(){ openSettings(); }
-function saveSettings(){
+
+function closeSettings() { document.getElementById('settingsModal').classList.remove('open'); }
+
+function reloadSettingsText() {
   const msg = document.getElementById('settingsMsg');
-  const ta = document.getElementById('settingsText');
-  msg.textContent = 'Saving ...';
-  msg.style.color = '';
-  fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text: ta.value})})
-    .then(r=>r.json()).then(d=>{
-      if(d.ok){ msg.textContent = 'Saved: ' + d.path + ' (hot-reloaded)'; msg.style.color = 'var(--green)'; }
-      else { msg.textContent = 'YAML error: ' + d.error; msg.style.color = 'var(--red)'; }
-      setTimeout(()=>{ msg.style.color = ''; }, 5000);
-    }).catch(e=>{ msg.textContent = 'Save failed: ' + e; msg.style.color = 'var(--red)'; });
+  const ta  = document.getElementById('settingsText');
+  const url = (_sbTab === 'runtime') ? '/api/env' : '/api/config';
+  msg.textContent = 'Loading ...'; msg.style.color = '';
+  fetch(url).then(r => r.json()).then(d => {
+    if (d.ok) {
+      ta.value = d.text || '';
+      _sbPath[_sbTab] = d.path || '';
+      document.getElementById('sbPath').textContent = d.path || '';
+      msg.textContent = d.path || '';
+    } else {
+      msg.textContent = 'Error: ' + (d.error || '');
+      msg.style.color = 'var(--red)';
+    }
+  }).catch(e => { msg.textContent = 'Fetch failed: ' + e; msg.style.color = 'var(--red)'; });
 }
-document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeSettings(); });
+
+function _save() {
+  const msg = document.getElementById('settingsMsg');
+  const ta  = document.getElementById('settingsText');
+  const url = (_sbTab === 'runtime') ? '/api/env' : '/api/config';
+  msg.textContent = 'Saving ...'; msg.style.color = '';
+  return fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({text: ta.value})
+  }).then(r => r.json()).then(d => {
+    if (d.ok) {
+      msg.textContent = 'Saved: ' + (d.path || url);
+      msg.style.color = 'var(--green)';
+    } else {
+      msg.textContent = 'Error: ' + (d.error || '');
+      msg.style.color = 'var(--red)';
+    }
+    setTimeout(() => { msg.style.color = ''; }, 5000);
+    return d;
+  });
+}
+
+function saveSettings() { _save(); }
+
+function saveAndRestart() {
+  const msg = document.getElementById('settingsMsg');
+  const ta  = document.getElementById('settingsText');
+  msg.textContent = 'Saving & restarting proxy + worker ...'; msg.style.color = '';
+  fetch('/api/env/save-and-restart', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({text: ta.value})
+  }).then(r => r.json()).then(d => {
+    if (d.ok) {
+      const p = (d.restart && d.restart.ctxgate_proxy && d.restart.ctxgate_proxy.ok) ? 'ok' : 'fail';
+      const w = (d.restart && d.restart.worker       && d.restart.worker.ok)       ? 'ok' : 'fail';
+      msg.textContent = 'Saved. proxy=' + p + ' worker=' + w;
+      msg.style.color = (p === 'ok' && w === 'ok') ? 'var(--green)' : 'var(--red)';
+    } else {
+      msg.textContent = 'Error: ' + (d.error || '');
+      msg.style.color = 'var(--red)';
+    }
+    setTimeout(() => { msg.style.color = ''; }, 8000);
+  }).catch(e => { msg.textContent = 'Failed: ' + e; msg.style.color = 'var(--red)'; });
+}
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSettings(); });
 let lgTimer = null;
 function openLog(){
   document.getElementById('logModal').classList.add('open');

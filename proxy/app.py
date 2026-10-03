@@ -510,6 +510,8 @@ MAX_CONTINUATIONS = int(os.environ.get("CTXGATE_MAX_CONTINUATIONS", 5))
 WORKER_BACKPRESSURE = _env_int("CTXGATE_WORKER_BACKPRESSURE", 50)
 SESSION_TTL_HOURS = _env_int("CTXGATE_SESSION_TTL_HOURS", 12)
 SESSION_LAST_ACTIVE: dict[str, float] = {}
+WORKER_PENDING_CACHE: dict = {"value": 0, "ts": 0.0}
+WORKER_PENDING_TTL = 5.0
 MEMORY_TTL_DAYS = _env_int("CTXGATE_MEMORY_TTL_DAYS", 90)
 DB_DSN = os.environ.get("CTXGATE_DB_DSN") or os.environ.get("CTXPROXY_DB_DSN") or "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy"
 PROXY_PORT = _env_int("CTXGATE_PROXY_PORT", 9201)
@@ -1769,6 +1771,7 @@ async def ready():
 @app.get("/metrics/prometheus")
 async def metrics_prometheus():
     uptime = time.time() - metrics["started_at"]
+    _worker_pending = await _worker_pending_count()
     lines = [
         "# TYPE ctxgate_requests_total counter", "ctxgate_requests_total %d" % metrics["requests_total"],
         "# TYPE ctxgate_requests_ok counter", "ctxgate_requests_ok %d" % metrics["requests_ok"],
@@ -1793,23 +1796,12 @@ async def metrics_prometheus():
         "# TYPE ctxgate_worker_lag_seconds gauge", "ctxgate_worker_lag_seconds %.1f" % _read_worker_status().get("lag_seconds", 0),
         "# TYPE ctxgate_worker_pending gauge", "ctxgate_worker_pending %d" % _worker_pending,
     ]
-    _worker_pending = 0
-    try:
-        if pool:
-            _worker_pending = await pool.fetchval("SELECT COUNT(*) FROM proxy.memory_jobs WHERE status='pending'") or 0
-    except Exception:
-        pass
     return Response("\n".join(lines) + "\n", media_type="text/plain")
 
 @app.get("/api/metrics")
 async def api_metrics():
     """Structured metrics for dashboard (JSON)."""
-    _worker_pending = 0
-    try:
-        if pool:
-            _worker_pending = await pool.fetchval("SELECT COUNT(*) FROM proxy.memory_jobs WHERE status='pending'") or 0
-    except Exception:
-        pass
+    _worker_pending = await _worker_pending_count()
     uptime = time.time() - metrics["started_at"]
     _hit_rate = metrics["cached_tokens_total"] / max(1, metrics["prompt_tokens_total"])
     _eff_prefill = (metrics["prompt_tokens_total"] - metrics["cached_tokens_total"]) / max(1, metrics["requests_ok"])
@@ -2089,6 +2081,28 @@ def _read_worker_status() -> dict:
         return {"alive": False, "lag_seconds": 0, "heartbeat": ""}
 
 
+async def _worker_pending_count() -> int:
+    """Return pending memory_jobs count, cached for WORKER_PENDING_TTL seconds.
+
+    The hot path (per-request backpressure check in _enqueue_memory_job) must
+    not run a full COUNT(*) against proxy.memory_jobs on every request. This
+    helper returns the last-known value if it is fresh, and only queries the
+    DB when the cache has expired or has never been populated.
+    """
+    now = time.time()
+    if now - WORKER_PENDING_CACHE["ts"] < WORKER_PENDING_TTL:
+        return WORKER_PENDING_CACHE["value"]
+    try:
+        if pool:
+            v = await pool.fetchval(
+                "SELECT COUNT(*) FROM proxy.memory_jobs WHERE status='pending'"
+            )
+            WORKER_PENDING_CACHE["value"] = int(v or 0)
+            WORKER_PENDING_CACHE["ts"] = now
+    except Exception as e:
+        log.warning("worker_pending_count refresh failed: %s", e)
+    return WORKER_PENDING_CACHE["value"]
+
 
 def _evict_stale_sessions():
     """Evict session state older than SESSION_TTL_HOURS."""
@@ -2130,6 +2144,10 @@ async def _vllm_health_loop():
             _evict_stale_sessions()
         except Exception as e:
             log.warning("_evict_stale_sessions failed: %s", e)
+        try:
+            await _worker_pending_count()
+        except Exception as e:
+            log.warning("_worker_pending_count warmup failed: %s", e)
         await asyncio.sleep(60)
 
 def _normalize_system_messages(messages):
@@ -2519,12 +2537,10 @@ async def _enqueue_memory_job(session_id, user_content):
         return
     # --- Backpressure: skip if worker queue is too full ---
     try:
-        if pool:
-            pending = await pool.fetchval(
-                "SELECT COUNT(*) FROM proxy.memory_jobs WHERE status='pending'")
-            if pending and pending > WORKER_BACKPRESSURE:
-                log.warning("Backpressure: %d pending memory jobs > %d - skipping", pending, WORKER_BACKPRESSURE)
-                return
+        pending = await _worker_pending_count()
+        if pending and pending > WORKER_BACKPRESSURE:
+            log.warning("Backpressure: %d pending memory jobs > %d - skipping", pending, WORKER_BACKPRESSURE)
+            return
     except Exception:
         pass
     # --- Boilerplate filter: strip <turn-context> blocks ---
