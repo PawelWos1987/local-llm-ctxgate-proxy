@@ -718,7 +718,7 @@ async def get_log(request: Request):
     return JSONResponse({"ok": True, "source": source, "text": text})
 
 # --- Dashboard HTML (Control Room Pulpit) ---
-DASHBOARD_HTML = """
+DASHBOARD_HTML = r"""
 <!DOCTYPE html>
 <html>
 <head>
@@ -1067,7 +1067,7 @@ const ENV_VARS = [
   ["CTXGATE_VLLM_URL", "url", "http://127.0.0.1:29000/v1", ""],
   ["CTXGATE_VLLM_MODEL", "str", "Qwen3.8-27B", ""],
   ["CTXGATE_LM_URL", "url", "http://127.0.0.1:1234/v1", ""],
-  ["CTXGATE_LM_MODEL", "str", "qwen3-4b-instruct-2507", ""],
+  ["CTXGATE_LM_MODEL", "str", "gemma-4-e4b-it-qat", ""],
   ["CTXGATE_LM_TIMEOUT", "int", "120", "s"],
   ["CTXGATE_MAX_CONTEXT", "int", "84000", "tokens"],
   ["CTXGATE_MAX_INPUT", "int", "64000", "tokens"],
@@ -1138,8 +1138,7 @@ function renderTable(envText) {
   const vars = (_sbTab === 'runtime') ? ENV_VARS : DASH_VARS;
   // Parse current env values
   const current = {};
-  envText.split('
-').forEach(line => {
+  envText.split('\n').forEach(line => {
     const idx = line.indexOf('=');
     if (idx > 0) {
       current[line.substring(0, idx).trim()] = line.substring(idx + 1).trim();
@@ -1195,9 +1194,7 @@ function collectEnvText() {
       lines.push(name + '=' + val);
     }
   });
-  return lines.join('
-') + '
-';
+  return lines.join('\n') + '\n';
 }
 
 function _save() {

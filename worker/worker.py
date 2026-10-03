@@ -31,7 +31,7 @@ import httpx
 
 # --- Configuration ---
 LM_URL = os.environ.get("CTXGATE_LM_URL", "http://127.0.0.1:1234/v1/chat/completions")
-LM_MODEL = os.environ.get("CTXGATE_LM_MODEL", "qwen3-4b-instruct-2507")
+LM_MODEL = os.environ.get("CTXGATE_LM_MODEL", "gemma-4-e4b-it-qat")
 DSN = os.environ.get("CTXGATE_DB_DSN") or os.environ.get("CTXPROXY_DB_DSN") or "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy"
 POLL = float(os.environ.get("CTXGATE_WORKER_POLL", "2.0"))
 MAX_ATTEMPTS = int(os.environ.get("CTXGATE_WORKER_MAX_ATTEMPTS", "3"))

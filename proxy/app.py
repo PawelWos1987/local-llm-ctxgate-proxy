@@ -91,7 +91,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 LM_STUDIO_URL = os.environ.get("CTXGATE_LM_URL", "http://127.0.0.1:1234/v1").removesuffix("/chat/completions")
-LM_STUDIO_MODEL = os.environ.get("CTXGATE_LM_MODEL", "qwen3-4b-instruct-2507")
+LM_STUDIO_MODEL = os.environ.get("CTXGATE_LM_MODEL", "gemma-4-e4b-it-qat")
 LM_STUDIO_TIMEOUT = _env_int("CTXGATE_LM_TIMEOUT", 120)
 GOOSE_SESSIONS_DB = os.environ.get("GOOSE_SESSIONS_DB") or os.path.join(
     os.path.expanduser("~"), ".local", "share", "goose", "sessions", "sessions.db")
@@ -263,7 +263,7 @@ async def _update_working_memory(task_uuid, state_update):
 async def _process_memory_job(job_id, task_uuid, event_id):
     """1-Step Memory Extract: 4B model extracts facts from event, we store them.
 
-    The 4B model (qwen3-4b-instruct-2507) is too small for a 4-step orchestrator.
+    The 4B model (gemma-4-e4b-it-qat) is too small for a 4-step orchestrator.
     A single extract-and-store pass is the right complexity level.
     """
     if not pool:
@@ -2322,110 +2322,165 @@ def _safe_truncate(text):
 
 
 
+def _sse_content(text: str, chunk_id: str = "gen") -> str:
+    """One SSE line carrying a content delta."""
+    return "data: " + json.dumps({
+        "id": chunk_id, "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL,
+        "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+    }) + "\n\n"
+
+
 async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
     global metrics
     vllm_body["messages"] = _normalize_system_messages(vllm_body.get("messages", []))
     async def generate():
         global metrics
+        # FIX (output cut-off): the old code held back the last 300 chars of every
+        # response in a buffer ("buf") and only released them on the happy path.
+        # Any upstream error/timeout/early EOF dropped those chars and then sent
+        # [DONE], so Goose showed a response that silently ended mid-word.
+        # Content is now forwarded immediately. The only text ever held back is
+        # the first SEAM_WINDOW chars of a continuation segment (to trim overlap
+        # with what the client already has), and it is flushed on every exit path.
+        SEAM_WINDOW = 120
         total_output_tokens = 0
-        seg_cached_tokens = 0
         total_cached_tokens = 0
-        BUFFER_SIZE = 300
-        buf = ""
-        full_content = ""
+        full_content = ""      # exactly what the client has received (content only)
+        seam_hold = ""
+        seam_active = False
         continuation_count = 0
         current_body = dict(vllm_body)
+        finish_reason = "stop"
+        exit_reason = "ok"     # ok | interrupted | wall_clock | max_continuations | repetition | cont_budget
+        notice = ""            # visible marker appended when output is NOT complete
+        stream_id = "gen"
+
+        def _seam_resolve() -> str:
+            """Release held continuation text, trimming overlap with the tail already sent."""
+            nonlocal seam_hold, seam_active
+            held, seam_hold, seam_active = seam_hold, "", False
+            tail = full_content[-100:]
+            overlap = 0
+            for j in range(min(len(tail), len(held)), 0, -1):
+                if held[:j] == tail[-j:]:
+                    overlap = j
+                    break
+            if overlap > 10:
+                log.info("Seam dedup: trimmed %d overlapping chars", overlap)
+                held = held[overlap:]
+            return held
+
         try:
             client = _vllm_client
             wall_start = time.time()
             while True:
                 if time.time() - wall_start > WALL_CLOCK_MAX:
                     log.warning("Wall clock %ds exceeded - stopping stream", WALL_CLOCK_MAX)
+                    exit_reason = "wall_clock"
+                    notice = "\n\n[ctxgate: response stopped - wall-clock limit reached]"
                     break
                 finish_reason = "stop"
+                got_finish = False
+                got_done = False
                 seg_output_tokens = 0
-                seg_content = ""
-                async with client.stream("POST", VLLM_URL + "/chat/completions", json=current_body) as resp:
-                    if resp.status_code != 200:
-                        body_bytes = await resp.aread()
-                        metrics["requests_error"] += 1
-                        _record_call(session_key, input_tokens, 0, "vllm_" + str(resp.status_code), VLLM_MODEL, True, body_bytes[:300].decode("utf-8", errors="replace"))
-                        yield "data: " + json.dumps({"error": body_bytes[:200].decode("utf-8", errors="replace")}) + "\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
-                    async for line in resp.aiter_lines():
-                        if line.startswith("data: "):
+                seg_tool_calls = False
+                interrupted = None
+                try:
+                    async with client.stream("POST", VLLM_URL + "/chat/completions", json=current_body) as resp:
+                        if resp.status_code != 200:
+                            body_bytes = await resp.aread()
+                            metrics["requests_error"] += 1
+                            _record_call(session_key, input_tokens, total_output_tokens, "vllm_" + str(resp.status_code), VLLM_MODEL, True, body_bytes[:300].decode("utf-8", errors="replace"))
+                            if seam_hold:
+                                yield _sse_content(seam_hold, stream_id)
+                            yield "data: " + json.dumps({"error": body_bytes[:200].decode("utf-8", errors="replace")}) + "\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
                             data_str = line[6:]
                             if data_str == "[DONE]":
+                                got_done = True
                                 break
                             try:
                                 chunk = json.loads(data_str)
+                                stream_id = chunk.get("id") or stream_id
                                 usage = chunk.get("usage")
                                 if usage:
                                     if usage.get("completion_tokens"):
                                         seg_output_tokens = usage["completion_tokens"]
-                                    seg_cached_tokens = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
-                                    total_cached_tokens += seg_cached_tokens
+                                    total_cached_tokens += (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
                                     usage["prompt_tokens"] = input_tokens
                                     usage["total_tokens"] = input_tokens + (usage.get("completion_tokens") or 0)
                                 choices = chunk.get("choices", [])
-                                if choices:
-                                    fr = choices[0].get("finish_reason")
-                                    if fr:
-                                        finish_reason = fr
-                                    delta = choices[0].get("delta", {})
-                                    reasoning_piece = delta.get("reasoning_content", "") or delta.get("reasoning", "")
-                                    tool_calls_piece = delta.get("tool_calls")
-                                    if reasoning_piece:
-                                        rc = {"id": chunk.get("id","gen"),"object":"chat.completion.chunk","created":chunk.get("created",0),"model":VLLM_MODEL,"choices":[{"index":0,"delta":{"reasoning_content":reasoning_piece},"finish_reason":None}]}
-                                        yield "data: " + json.dumps(rc) + chr(10) + chr(10)
-                                    if tool_calls_piece:
-                                        tc2 = {"id": chunk.get("id","gen"),"object":"chat.completion.chunk","created":chunk.get("created",0),"model":VLLM_MODEL,"choices":[{"index":0,"delta":{"tool_calls":tool_calls_piece},"finish_reason":None}]}
-                                        yield "data: " + json.dumps(tc2) + chr(10) + chr(10)
-                                    content_piece = delta.get("content", "")
-                                    if content_piece:
-                                        seg_content += content_piece
-                                        buf += content_piece
-                                        if len(buf) > BUFFER_SIZE:
-                                            flush_part = buf[:-BUFFER_SIZE]
-                                            buf = buf[-BUFFER_SIZE:]
-                                            out_chunk = {"id": chunk.get("id", "gen"), "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": chunk.get("model", VLLM_MODEL), "choices": [{"index": 0, "delta": {"content": flush_part}, "finish_reason": None}]}
-                                            yield "data: " + json.dumps(out_chunk) + "\n\n"
-                                        else:
-                                            non_content = {k: v for k, v in delta.items() if k not in ("content", "reasoning_content", "tool_calls")}
-                                            if non_content:
-                                                out_chunk = {"id": chunk.get("id", "gen"), "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": chunk.get("model", VLLM_MODEL), "choices": [{"index": 0, "delta": non_content, "finish_reason": None}]}
-                                                yield "data: " + json.dumps(out_chunk) + "\n\n"
+                                if not choices:
+                                    continue
+                                fr = choices[0].get("finish_reason")
+                                if fr:
+                                    finish_reason = fr
+                                    got_finish = True
+                                delta = choices[0].get("delta", {})
+                                reasoning_piece = delta.get("reasoning_content", "") or delta.get("reasoning", "")
+                                tool_calls_piece = delta.get("tool_calls")
+                                if reasoning_piece:
+                                    rc = {"id": stream_id, "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"reasoning_content": reasoning_piece}, "finish_reason": None}]}
+                                    yield "data: " + json.dumps(rc) + "\n\n"
+                                if tool_calls_piece:
+                                    seg_tool_calls = True
+                                    tc2 = {"id": stream_id, "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"tool_calls": tool_calls_piece}, "finish_reason": None}]}
+                                    yield "data: " + json.dumps(tc2) + "\n\n"
+                                content_piece = delta.get("content", "")
+                                if content_piece:
+                                    if seam_active:
+                                        seam_hold += content_piece
+                                        if len(seam_hold) < SEAM_WINDOW:
+                                            continue
+                                        out = _seam_resolve()
+                                    else:
+                                        out = content_piece
+                                    if out:
+                                        full_content += out
+                                        yield _sse_content(out, stream_id)
                             except (json.JSONDecodeError, ValueError):
                                 yield "data: " + data_str + "\n\n"
+                except httpx.TransportError as e:
+                    # ReadTimeout / ReadError / RemoteProtocolError / ConnectError ...
+                    interrupted = "%s: %s" % (type(e).__name__, str(e)[:150])
+
+                # Release any text still held for seam trimming (segment ended).
+                if seam_hold:
+                    out = _seam_resolve()
+                    if out:
+                        full_content += out
+                        yield _sse_content(out, stream_id)
+                seam_active = False
+
+                # vLLM closing the stream with neither finish_reason nor [DONE] is a
+                # cut-off, not a clean stop (old code defaulted this to "stop").
+                if interrupted is None and not got_finish and not got_done:
+                    interrupted = "upstream closed the stream early"
+
                 total_output_tokens += seg_output_tokens
-                seg_cached_tokens = 0
-                if seg_content and full_content:
-                    tail = full_content[-100:]
-                    overlap = 0
-                    for j in range(min(len(tail), len(seg_content)), 0, -1):
-                        if seg_content[:j] == tail[-j:]:
-                            overlap = j
-                            break
-                    if overlap > 10:
-                        log.info("Seam dedup: trimmed %d overlapping chars", overlap)
-                        seg_content = seg_content[overlap:]
-                full_content += seg_content
+
+                if interrupted:
+                    log.warning("Stream interrupted after %d chars: %s", len(full_content), interrupted)
+                    if seg_tool_calls or not full_content or continuation_count >= MAX_CONTINUATIONS:
+                        exit_reason = "interrupted"
+                        notice = "\n\n[ctxgate: response interrupted - %s]" % interrupted
+                        finish_reason = "stop"
+                        break
+                    finish_reason = "length"   # resume via the continuation path below
+                    await asyncio.sleep(min(2 * (continuation_count + 1), 5))
+
                 if finish_reason == "length" and _is_repeating(full_content):
                     log.warning("Repetition detected - stopping stream")
+                    exit_reason = "repetition"
                     finish_reason = "stop"
                     break
                 if finish_reason == "length" and continuation_count < MAX_CONTINUATIONS:
                     continuation_count += 1
-                    log.info("vLLM hit max_tokens(%d) - auto-continuing (%d/%d)", MAX_OUTPUT, continuation_count, MAX_CONTINUATIONS)
-                    safe_buf = _safe_truncate(buf)
-                    if len(buf) != len(safe_buf):
-                        log.info("Trimmed %d chars before continuation", len(buf) - len(safe_buf))
-                    buf = safe_buf
-                    if buf:
-                        out_chunk = {"id": "gen", "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]}
-                        yield "data: " + json.dumps(out_chunk) + "\n\n"
-                        buf = ""
+                    log.info("vLLM hit max_tokens(%d) or was interrupted - auto-continuing (%d/%d)", MAX_OUTPUT, continuation_count, MAX_CONTINUATIONS)
                     orig_messages = vllm_body.get("messages", [])
                     cont_messages = list(orig_messages)
                     if len(full_content) > 50:
@@ -2434,50 +2489,55 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                     else:
                         cont_messages.append({"role": "assistant", "content": full_content or "(in progress)"})
                         cont_messages.append({"role": "user", "content": "You were interrupted before producing your answer. Now produce your complete final answer directly. Skip thinking and just give the response."})
-                    # Re-trim: messages grew with assistant response
                     cont_tokens = count_messages_tokens(cont_messages)
                     if cont_tokens > MAX_INPUT:
                         log.info("Stream cont: would exceed input budget (%d > %d) - stopping", cont_tokens, MAX_INPUT)
+                        exit_reason = "cont_budget"
+                        notice = "\n\n[ctxgate: output truncated - no context budget left to continue]"
                         finish_reason = "stop"
                         break
                     current_body = dict(vllm_body)
                     current_body["messages"] = cont_messages
                     current_body["max_tokens"] = min(MAX_OUTPUT, MAX_CONTEXT - cont_tokens - SAFETY_MARGIN)
+                    seam_active = bool(full_content)
+                    seam_hold = ""
                     continue
                 elif finish_reason == "length":
                     log.warning("Max continuations (%d) reached - stopping", MAX_CONTINUATIONS)
-                    safe_buf = _safe_truncate(buf)
-                    buf = safe_buf
+                    exit_reason = "max_continuations"
+                    notice = "\n\n[ctxgate: output truncated - max continuations reached]"
                     finish_reason = "stop"
                 break
-            if buf:
-                out_chunk = {"id": "gen", "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]}
-                yield "data: " + json.dumps(out_chunk) + "\n\n"
-            final_chunk = {"id": "gen", "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason if finish_reason else "stop"}]}
-            if total_output_tokens:
-                _usage = {"prompt_tokens": input_tokens, "completion_tokens": total_output_tokens, "total_tokens": input_tokens + total_output_tokens}
-                _usage["prompt_tokens_details"] = {"cached_tokens": total_cached_tokens}
 
-                final_chunk["usage"] = _usage
+            if notice:
+                yield _sse_content(notice, stream_id)
+            final_chunk = {"id": stream_id, "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason or "stop"}]}
+            if total_output_tokens:
+                final_chunk["usage"] = {"prompt_tokens": input_tokens, "completion_tokens": total_output_tokens, "total_tokens": input_tokens + total_output_tokens, "prompt_tokens_details": {"cached_tokens": total_cached_tokens}}
             yield "data: " + json.dumps(final_chunk) + "\n\n"
             yield "data: [DONE]\n\n"
-            metrics["requests_ok"] += 1
+            if exit_reason == "ok":
+                metrics["requests_ok"] += 1
+            else:
+                metrics["requests_error"] += 1
             metrics["cached_tokens_total"] += total_cached_tokens
             metrics["prompt_tokens_total"] += input_tokens
             if total_output_tokens:
                 metrics["tokens_out_total"] += total_output_tokens
                 _track_session_tokens(session_key, 0, total_output_tokens, count_req=False)
-            _record_call(session_key, input_tokens, total_output_tokens, "ok", VLLM_MODEL, True, cached_tokens=total_cached_tokens)
-            if continuation_count > 0:
-                log.info("Stream done: %d continuations, %d total tokens", continuation_count, total_output_tokens)
-        except httpx.TimeoutException:
-            metrics["requests_error"] += 1
-            _record_call(session_key, input_tokens, total_output_tokens, "timeout", VLLM_MODEL, True, "vLLM 300s timeout (stream)")
-            yield "data: [DONE]\n\n"
+            _record_call(session_key, input_tokens, total_output_tokens, "ok" if exit_reason == "ok" else "error", VLLM_MODEL, True,
+                         "" if exit_reason == "ok" else "stream ended early: " + exit_reason, cached_tokens=total_cached_tokens)
+            # One diagnostic line per stream so a cut-off can be traced to its cause.
+            log.info("Stream end: reason=%s finish=%s chars=%d out_tokens=%d continuations=%d",
+                     exit_reason, finish_reason, len(full_content), total_output_tokens, continuation_count)
         except Exception as e:
             metrics["requests_error"] += 1
             log.exception("Stream error: %s", e)
             _record_call(session_key, input_tokens, total_output_tokens, "error", VLLM_MODEL, True, str(e)[:300])
+            if seam_hold:
+                yield _sse_content(seam_hold, stream_id)
+            yield _sse_content("\n\n[ctxgate: proxy error - %s]" % type(e).__name__, stream_id)
+            yield "data: " + json.dumps({"id": stream_id, "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}) + "\n\n"
             yield "data: [DONE]\n\n"
     return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -2856,7 +2916,7 @@ async def memory_query(task_ref: str):
 async def api_lmstudio():
     """LM Studio 4B model status and stats."""
     import subprocess
-    result = {"available": False, "model": "qwen3-4b-instruct-2507", "engine": "LM Studio (CPU)", "port": 1234}
+    result = {"available": False, "model": "gemma-4-e4b-it-qat", "engine": "LM Studio (CPU)", "port": 1234}
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get("http://127.0.0.1:1234/v1/models")
@@ -3067,7 +3127,7 @@ async def api_memory_analytics():
     except Exception:
         pass
     result["worker"] = {
-        "model": os.environ.get("CTXGATE_LM_MODEL", "qwen3-4b-instruct-2507"),
+        "model": os.environ.get("CTXGATE_LM_MODEL", "gemma-4-e4b-it-qat"),
         "lm_url": os.environ.get("CTXGATE_LM_URL", "http://127.0.0.1:1234/v1/chat/completions"),
         "poll": float(os.environ.get("CTXGATE_WORKER_POLL", "2.0")),
         "max_attempts": _env_int("CTXGATE_WORKER_MAX_ATTEMPTS", 3),
