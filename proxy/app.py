@@ -3613,4 +3613,4 @@ if __name__ == "__main__":
         log.error("Port %d already in use - another instance is running. Exiting cleanly.", PROXY_PORT)
         sys.exit(0)
 
-    uvicorn.run(app, host="127.0.0.1", port=PROXY_PORT, log_level="info", timeout_graceful_shutdown=30)
+    uvicorn.run(app, host="127.0.0.1", port=PROXY_PORT, log_level="info", timeout_graceful_shutdown=3)
