@@ -805,6 +805,25 @@ body{font-family:'Consolas','Courier New',monospace;background:var(--bg);color:v
 .sb-tab.active{border-color:var(--green);color:var(--green)}
 .sb-btn.restart{border-color:var(--yellow);color:var(--yellow)}
 .sb-btn.restart:hover{border-color:var(--yellow);color:#fff}
+.sb-table-wrap{overflow-y:auto;max-height:60vh;padding:12px 16px}
+.sb-table{width:100%;border-collapse:collapse;font-size:.85em}
+.sb-table th{text-align:left;padding:6px 8px;border-bottom:2px solid var(--border);color:var(--dim);font-size:.8em;letter-spacing:1px;text-transform:uppercase}
+.sb-table td{padding:5px 8px;border-bottom:1px solid var(--border)}
+.sb-table tr:hover td{background:rgba(255,255,255,.03)}
+.sb-table .var-name{font-family:monospace;color:var(--text);font-size:.9em}
+.sb-table .type-badge{font-size:.7em;padding:2px 6px;border-radius:3px;letter-spacing:.5px}
+.sb-table .type-int{background:rgba(99,102,241,.15);color:#818cf8}
+.sb-table .type-float{background:rgba(234,179,8,.15);color:#facc15}
+.sb-table .type-str{background:rgba(16,185,129,.15);color:#34d399}
+.sb-table .type-url{background:rgba(59,130,246,.15);color:#60a5fa}
+.sb-table .type-bool{background:rgba(239,68,68,.15);color:#f87171}
+.sb-table .type-path{background:rgba(168,85,247,.15);color:#c084fc}
+.sb-table input[type="text"],.sb-table input[type="number"]{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 8px;font-size:.9em;font-family:monospace}
+.sb-table input:focus{border-color:var(--blue);outline:none}
+.sb-table .src-badge{font-size:.7em;padding:2px 5px;border-radius:3px}
+.sb-table .src-default{color:var(--dim)}
+.sb-table .src-custom{color:var(--green)}
+.sb-table .def-hint{color:var(--dim);font-size:.8em;font-style:italic}
 #logBtn{background:var(--panel);border:1px solid var(--border);color:var(--green);font-family:inherit;padding:5px 14px;cursor:pointer;font-size:.85em;letter-spacing:2px;flex-shrink:0;margin-left:8px}
 #logBtn:hover{border-color:var(--green);color:#fff}
 #logModal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:110;justify-content:center;align-items:center}
@@ -932,14 +951,19 @@ body{font-family:'Consolas','Courier New',monospace;background:var(--bg);color:v
 </div>
 
 <div id="settingsModal">
-  <div id="settingsBox">
+    <div id="settingsBox">
     <div class="sb-head"><h2>&#9881; SETTINGS</h2><span class="close" onclick="closeSettings()">&#10005;</span></div>
     <div class="sb-hint">
-      <button class="sb-tab" id="tabRuntime" onclick="switchTab('runtime')">RUNTIME (proxy + worker)</button>
+      <button class="sb-tab active" id="tabRuntime" onclick="switchTab('runtime')">RUNTIME (proxy + worker)</button>
       <button class="sb-tab" id="tabDashboard" onclick="switchTab('dashboard')">DASHBOARD (this service)</button>
       <span id="sbPath" style="margin-left:12px;color:var(--dim)"></span>
     </div>
-    <textarea id="settingsText" spellcheck="false"></textarea>
+    <div class="sb-table-wrap">
+      <table class="sb-table" id="envTable">
+        <thead><tr><th>Variable</th><th>Type</th><th>Value</th><th>Source</th></tr></thead>
+        <tbody id="envTableBody"></tbody>
+      </table>
+    </div>
     <div class="sb-foot">
       <span class="msg" id="settingsMsg"></span>
       <div>
@@ -1036,12 +1060,49 @@ poll();setInterval(poll,3000);
 let _sbTab = 'runtime';
 let _sbPath = { runtime: '', dashboard: '' };
 
+// Variable definitions: [name, type, default]
+const ENV_VARS = [
+  ["CTXGATE_DB_DSN", "str", "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/ctxproxy"],
+  ["CTXGATE_VLLM_URL", "url", "http://127.0.0.1:29000/v1"],
+  ["CTXGATE_VLLM_MODEL", "str", "Qwen3.8-27B"],
+  ["CTXGATE_LM_URL", "url", "http://127.0.0.1:1234/v1"],
+  ["CTXGATE_LM_MODEL", "str", "qwen3-4b-instruct-2507"],
+  ["CTXGATE_LM_TIMEOUT", "int", "120"],
+  ["CTXGATE_MAX_CONTEXT", "int", "84000"],
+  ["CTXGATE_MAX_INPUT", "int", "64000"],
+  ["CTXGATE_MAX_OUTPUT", "int", "18000"],
+  ["CTXGATE_SAFETY_MARGIN", "int", "2000"],
+  ["CTXGATE_WALL_CLOCK_MAX", "int", "1800"],
+  ["CTXGATE_MAX_CONTINUATIONS", "int", "5"],
+  ["CTXGATE_WORKER_BACKPRESSURE", "int", "50"],
+  ["CTXGATE_SESSION_TTL_HOURS", "int", "12"],
+  ["CTXGATE_MEMORY_TTL_DAYS", "int", "90"],
+  ["CTXGATE_PROXY_PORT", "int", "9201"],
+  ["CTXGATE_MAX_BODY_BYTES", "int", "20971520"],
+  ["CTXGATE_API_KEY", "str", ""],
+  ["CTXGATE_VLLM_READ_TIMEOUT", "int", "300"],
+  ["CTXGATE_VLLM_CONNECT_TIMEOUT", "int", "10"],
+  ["CTXGATE_VLLM_WRITE_TIMEOUT", "int", "120"],
+  ["CTXGATE_VLLM_POOL_TIMEOUT", "int", "30"],
+  ["CTXGATE_MEMORY_WORKER", "bool", "1"],
+  ["CTXGATE_WORKER_POLL", "float", "2.0"],
+  ["CTXGATE_WORKER_MAX_ATTEMPTS", "int", "3"],
+  ["CTXGATE_WORKER_OUTAGE_TTL", "float", "1800"],
+  ["CTXGATE_WORKER_MAX_TOKENS", "int", "512"],
+  ["CTXGATE_WORKER_LOCK_TTL", "float", "30"],
+];
+
+const DASH_VARS = [
+  ["CTXGATE_DASHBOARD_PORT", "int", "9202"],
+  ["CTXGATE_DASHBOARD_HOST", "str", "127.0.0.1"],
+  ["CTXGATE_DASHBOARD_TOKEN", "str", ""],
+];
+
 function switchTab(which) {
   _sbTab = which;
   document.getElementById('tabRuntime').classList.toggle('active', which === 'runtime');
   document.getElementById('tabDashboard').classList.toggle('active', which === 'dashboard');
   document.getElementById('btnSaveRestart').style.display = (which === 'runtime') ? '' : 'none';
-  document.getElementById('sbPath').textContent = _sbPath[which] || '';
   reloadSettingsText();
 }
 
@@ -1057,15 +1118,14 @@ function closeSettings() { document.getElementById('settingsModal').classList.re
 
 function reloadSettingsText() {
   const msg = document.getElementById('settingsMsg');
-  const ta  = document.getElementById('settingsText');
-  const url = (_sbTab === 'runtime') ? '/api/env' : '/api/config';
   msg.textContent = 'Loading ...'; msg.style.color = '';
+  const url = (_sbTab === 'runtime') ? '/api/env' : '/api/config';
   fetch(url).then(r => r.json()).then(d => {
     if (d.ok) {
-      ta.value = d.text || '';
       _sbPath[_sbTab] = d.path || '';
       document.getElementById('sbPath').textContent = d.path || '';
       msg.textContent = d.path || '';
+      renderTable(d.text || '');
     } else {
       msg.textContent = 'Error: ' + (d.error || '');
       msg.style.color = 'var(--red)';
@@ -1073,15 +1133,82 @@ function reloadSettingsText() {
   }).catch(e => { msg.textContent = 'Fetch failed: ' + e; msg.style.color = 'var(--red)'; });
 }
 
+function renderTable(envText) {
+  const vars = (_sbTab === 'runtime') ? ENV_VARS : DASH_VARS;
+  // Parse current env values
+  const current = {};
+  envText.split('
+').forEach(line => {
+    const idx = line.indexOf('=');
+    if (idx > 0) {
+      current[line.substring(0, idx).trim()] = line.substring(idx + 1).trim();
+    }
+  });
+  
+  const tbody = document.getElementById('envTableBody');
+  tbody.innerHTML = '';
+  vars.forEach(([name, type, def]) => {
+    const tr = document.createElement('tr');
+    const val = current[name] !== undefined ? current[name] : def;
+    const isCustom = current[name] !== undefined && current[name] !== def;
+    const inputType = (type === 'int') ? 'number' : (type === 'float') ? 'number' : 'text';
+    const step = (type === 'float') ? 'step="0.1"' : (type === 'int') ? 'step="1"' : '';
+    const min = (type === 'int' || type === 'float') ? 'min="0"' : '';
+    tr.innerHTML =
+      '<td class="var-name">' + name + '</td>' +
+      '<td><span class="type-badge type-' + type + '">' + type.toUpperCase() + '</span></td>' +
+      '<td><input type="' + inputType + '" ' + step + ' ' + min + ' id="env_' + name + '" value="' + val.replace(/"/g, '&quot;') + '" placeholder="' + def + '"></td>' +
+      '<td><span class="src-badge ' + (isCustom ? 'src-custom' : 'src-default') + '">' + (isCustom ? 'CUSTOM' : 'DEFAULT') + '</span></td>';
+    tbody.appendChild(tr);
+  });
+}
+
+function collectEnvText() {
+  const vars = (_sbTab === 'runtime') ? ENV_VARS : DASH_VARS;
+  const lines = [];
+  vars.forEach(([name, type, def]) => {
+    const el = document.getElementById('env_' + name);
+    if (!el) return;
+    let val = el.value.trim();
+    // Validate
+    if (type === 'int') {
+      if (val && !/^\d+$/.test(val)) {
+        el.style.borderColor = 'var(--red)';
+        return;
+      }
+    } else if (type === 'float') {
+      if (val && !/^\d+\.?\d*$/.test(val)) {
+        el.style.borderColor = 'var(--red)';
+        return;
+      }
+    } else if (type === 'bool') {
+      if (val !== '0' && val !== '1') {
+        el.style.borderColor = 'var(--red)';
+        return;
+      }
+    }
+    el.style.borderColor = '';
+    // Only include if non-empty or was explicitly set
+    if (val !== '' && val !== def) {
+      lines.push(name + '=' + val);
+    } else if (val !== '') {
+      lines.push(name + '=' + val);
+    }
+  });
+  return lines.join('
+') + '
+';
+}
+
 function _save() {
   const msg = document.getElementById('settingsMsg');
-  const ta  = document.getElementById('settingsText');
-  const url = (_sbTab === 'runtime') ? '/api/env' : '/api/config';
   msg.textContent = 'Saving ...'; msg.style.color = '';
+  const text = collectEnvText();
+  const url = (_sbTab === 'runtime') ? '/api/env' : '/api/config';
   return fetch(url, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({text: ta.value})
+    body: JSON.stringify({text: text})
   }).then(r => r.json()).then(d => {
     if (d.ok) {
       msg.textContent = 'Saved: ' + (d.path || url);
@@ -1099,16 +1226,16 @@ function saveSettings() { _save(); }
 
 function saveAndRestart() {
   const msg = document.getElementById('settingsMsg');
-  const ta  = document.getElementById('settingsText');
   msg.textContent = 'Saving & restarting proxy + worker ...'; msg.style.color = '';
+  const text = collectEnvText();
   fetch('/api/env/save-and-restart', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({text: ta.value})
+    body: JSON.stringify({text: text})
   }).then(r => r.json()).then(d => {
     if (d.ok) {
       const p = (d.restart && d.restart.ctxgate_proxy && d.restart.ctxgate_proxy.ok) ? 'ok' : 'fail';
-      const w = (d.restart && d.restart.worker       && d.restart.worker.ok)       ? 'ok' : 'fail';
+      const w = (d.restart && d.restart.worker && d.restart.worker.ok) ? 'ok' : 'fail';
       msg.textContent = 'Saved. proxy=' + p + ' worker=' + w;
       msg.style.color = (p === 'ok' && w === 'ok') ? 'var(--green)' : 'var(--red)';
     } else {
