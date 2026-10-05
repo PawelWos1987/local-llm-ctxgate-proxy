@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# Logs
+*.log
+*.log.*
+*.pid
+
+# Venv
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Secrets / local config (never commit)
+.env
+config.yaml
+*.local.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Runtime artifacts
+proxy.log
+worker.log
+dashboard.log
+proxy.pid
+worker.pid
+.proxy_restart.log
+proxy_test.log
+.worker.lock
+worker/.worker_status.json
+injection_metrics.json
+
+# Local development archive — NOT for public release.
+# Development notes, internal task prompts, research, benchmarks,
+# probes/scratch scripts, migration scripts, obsolete dev tests,
+# and backup files all live under _local/.
+_local/
+
+# Backup files
+*.bak
+*.bak-*
+
+# Session sync daemon (syncer/) runtime artifacts
+syncer/*.log
+syncer/*.pid
+syncer/*.lock
+syncer/*.status.json
+syncer/syncer.log
+
+# Test result artifacts (generated, not source)
+tests/*_results.json
+
+# ─── Scratch / working files (never commit) ───
+.goosehints
+NOTES-*.md
+PROMPT.md
+RESEARCH-*.md
+apply_*.py
+orchestrator.py
+patch_*.txt
+probes/
+schema/012_*.sql
+tests/conftest.py
+tests/test_loop_guard.py
+tests/test_rate_limiter.py
+tests/test_rolling_window.py
+tests/test_sigterm_graceful_shutdown.py
+deploy/ctxgate-proxy.service

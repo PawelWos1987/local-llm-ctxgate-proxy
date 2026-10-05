@@ -1,0 +1,68 @@
+name: CI
+
+# Manual-only: no automatic triggers (push / pull_request removed).
+# Run on demand from the GitHub Actions UI (Actions > CI > "Run workflow").
+# Pushing/pulling to the repo will NOT trigger this workflow.
+on:
+  workflow_dispatch:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ctxproxy
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Syntax check
+        run: |
+          python -m py_compile proxy/app.py
+          python -m py_compile worker/worker.py
+
+      - name: Initialize database
+        run: |
+          psql -h localhost -U postgres -d ctxproxy -f schema/001_init.sql
+          psql -h localhost -U postgres -d ctxproxy -f schema/002_knowledge.sql
+          psql -h localhost -U postgres -d ctxproxy -f schema/003_memory_worker.sql
+
+      - name: Run architecture tests
+        env:
+          CTXGATE_DB_DSN: postgresql://postgres:postgres@localhost:5432/ctxproxy
+        run: |
+          python -B tests/test_architecture.py
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for hardcoded secrets
+        run: |
+          if grep -rn "postgresql://.*:[^C][^H].*@" --include="*.py" --include="*.sh" . 2>/dev/null | grep -v "CHANGE_ME" | grep -v ".env.example" | grep -v "postgresql://postgres:postgres@"; then
+            echo "ERROR: Possible hardcoded credentials found"
+            exit 1
+          fi
+          echo "No hardcoded secrets found"
