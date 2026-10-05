@@ -839,7 +839,7 @@ async def _fetch_session_summary(task_uuid, budget=1500, session_key: str = ""):
 VLLM_URL = os.environ.get("CTXGATE_VLLM_URL", "http://127.0.0.1:29000/v1")
 VLLM_MODEL = os.environ.get("CTXGATE_VLLM_MODEL", "Qwen3.8-27B")
 MAX_CONTEXT = _env_int("CTXGATE_MAX_CONTEXT", 84000)
-MAX_INPUT = _env_int("CTXGATE_MAX_INPUT", 58000)
+MAX_INPUT = _env_int("CTXGATE_MAX_INPUT", 64000)
 # --- Rolling window (sticky cut) config ---
 TRIM_TARGET_TOKENS = _env_int("CTXGATE_TRIM_TARGET_TOKENS", 0)          # absolute; wins if > 0
 TRIM_TARGET_FRACTION = _env_float("CTXGATE_TRIM_TARGET_FRACTION", 0.70)
@@ -848,10 +848,9 @@ SUMMARY_BACKFILL_CHARS = _env_int("CTXGATE_SUMMARY_BACKFILL_CHARS", 96000)
 SUMMARY_CHUNK_CHARS = _env_int("CTXGATE_SUMMARY_CHUNK_CHARS", 24000)
 SUMMARY_MAX_CHUNKS = _env_int("CTXGATE_SUMMARY_MAX_CHUNKS", 4)
 WINDOW_TTL_DAYS = _env_int("CTXGATE_WINDOW_TTL_DAYS", 7)
-MAX_OUTPUT = _env_int("CTXGATE_MAX_OUTPUT", 22500)
-SAFETY_MARGIN = _env_int("CTXGATE_SAFETY_MARGIN", 3500)
-MIN_OUTPUT = _env_int("CTXGATE_MIN_OUTPUT", 16000)  # hard floor for the output budget
-
+MAX_OUTPUT = _env_int("CTXGATE_MAX_OUTPUT", 18000)
+SAFETY_MARGIN = _env_int("CTXGATE_SAFETY_MARGIN", 2000)
+MIN_OUTPUT = _env_int("CTXGATE_MIN_OUTPUT", 8192)  # hard floor for the output budget
 WALL_CLOCK_MAX = _env_int("CTXGATE_WALL_CLOCK_MAX", 1800)  # 30 min - large contexts need more time
 MAX_CONTINUATIONS = int(os.environ.get("CTXGATE_MAX_CONTINUATIONS", 5))
 WORKER_BACKPRESSURE = _env_int("CTXGATE_WORKER_BACKPRESSURE", 50)
@@ -1572,15 +1571,6 @@ def _recut_to(messages: list, max_tokens: int) -> int:
 
 def _recut(messages: list) -> int:
     return _recut_to(messages, _trim_target())
-
-log.info("Budget config: ctx=%d input=%d output=%d margin=%d min_output=%d ceiling=%d trim_target=%d",
-         MAX_CONTEXT, MAX_INPUT, MAX_OUTPUT, SAFETY_MARGIN, MIN_OUTPUT,
-         min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT), _trim_target())
-if MAX_INPUT + MAX_OUTPUT + SAFETY_MARGIN > MAX_CONTEXT:
-    log.warning("Budget config invalid: MAX_INPUT(%d) + MAX_OUTPUT(%d) + SAFETY_MARGIN(%d) > MAX_CONTEXT(%d)",
-                MAX_INPUT, MAX_OUTPUT, SAFETY_MARGIN, MAX_CONTEXT)
-if MIN_OUTPUT > MAX_OUTPUT:
-    log.warning("Budget config invalid: MIN_OUTPUT(%d) > MAX_OUTPUT(%d)", MIN_OUTPUT, MAX_OUTPUT)
 
 def _output_budget(input_tokens: int) -> int:
     """Single authoritative output budget: never exceed MAX_OUTPUT, and never go
@@ -3266,11 +3256,6 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
     vllm_body["messages"] = _normalize_system_messages(vllm_body.get("messages", []))
     async def generate():
         global metrics
-        # The 400-retry path reassigns input_tokens inside this generator, which makes
-        # it a local to generate(); every read of the enclosing value (usage chunks,
-        # the final usage/_record_call, metrics totals) must see it. nonlocal restores
-        # the binding so the reassignment updates the outer name (no UnboundLocalError).
-        nonlocal input_tokens
         # FIX (output cut-off): the old code held back the last 300 chars of every
         # response in a buffer ("buf") and only released them on the happy path.
         # Any upstream error/timeout/early EOF dropped those chars and then sent

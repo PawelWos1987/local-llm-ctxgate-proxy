@@ -35,7 +35,8 @@ def _count_messages_tokens(ms):
 
 def _load():
     names = ["_recut_to", "_recut", "_msg_anchor", "_seed_sig", "_norm_content",
-             "_new_window_state", "_window_valid", "_kept_messages", "_prep_messages"]
+             "_new_window_state", "_window_valid", "_kept_messages", "_prep_messages",
+             "_newest_user_idx", "_make_pinned_copy", "_pinned_user_copy"]
     mod_src = _extract(names)
     ns = {}
     STUB_TEXT = "[COMPACTED HISTORY] earlier turns archived; see TASK STATE"

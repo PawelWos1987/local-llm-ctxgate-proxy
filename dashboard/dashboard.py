@@ -15,6 +15,7 @@ System metrics (htop-style): CPU, memory, swap, load average, network
 throughput, per-process CPU+MEM — all read from /proc (zero external deps).
 """
 import asyncio
+import json
 import logging
 import logging.handlers
 import os
@@ -332,7 +333,7 @@ async def check_worker_file(path: str) -> dict:
             result = {"status": "down", "pid": pid,
                     "heartbeat_age_s": round(age, 1), "error": "worker frozen/dead"}
         # Merge throttling data from the status JSON file
-        status_path = path.replace(".worker.lock", ".worker_status.json")
+        status_path = os.path.join(os.path.dirname(path), ".worker_status.json")
         try:
             with open(status_path, "r") as f2:
                 sdata = json.loads(f2.read())
@@ -342,8 +343,8 @@ async def check_worker_file(path: str) -> dict:
             result["lm_ctx_max"] = sdata.get("lm_ctx_max", 0)
             result["lm_tokens_in"] = sdata.get("lm_tokens_in_total", 0)
             result["lm_tokens_out"] = sdata.get("lm_tokens_out_total", 0)
-        except Exception:
-            pass
+        except Exception as e:
+            _log.debug("worker status file read failed: %s", e)
         return result
     except FileNotFoundError:
         return {"status": "down", "error": "lock file not found"}
@@ -584,9 +585,10 @@ def _parse_core_range(s: str) -> tuple:
 
 
 def _proc_snapshot() -> list:
-    """Per-process: real CPU% (tick delta), memory, and PER-CORE load.
-    per_core% = total% / #allowed_cores, so '0-3 (95%)' means 4 pinned cores
-    each ~95% - the signal for pinning / parallelism decisions.  Sorted by RSS."""
+    """Per-process CPU (tick delta) mapped to actual core utilisation.
+    Pinned procs: per_core = total% / #pinned_cores → real single-core load.
+    Unpinned: per_core = total% (spread across all cores, usually low).
+    Sorted by RSS."""
     now = time.time()
     rows = []
     seen = set()
@@ -596,6 +598,7 @@ def _proc_snapshot() -> list:
         return rows
     total_mem_kb = _meminfo().get("MemTotal", 1)
     ncpu = os.cpu_count() or 1
+    all_cores = "0-" + str(ncpu - 1)
     for pid in pids:
         if not pid.isdigit():
             continue
@@ -605,8 +608,8 @@ def _proc_snapshot() -> list:
             fields = stat[rp + 2:].split()
             utime = int(fields[11]); stime = int(fields[12])
             rss_pages = int(fields[21])
+            core_now = int(fields[36]) if len(fields) > 36 else -1
             name = stat[stat.index("(") + 1:rp]
-            # Derive a better name from cmdline for python processes
             _cmd = ""
             try:
                 _cmd = open("/proc/" + pid + "/cmdline").read().replace("\0", " ")
@@ -620,18 +623,21 @@ def _proc_snapshot() -> list:
                         break
             rss_kb = rss_pages * 4
             ticks = utime + stime
-            cores_list = "0-" + str(ncpu - 1)
             threads = 1
+            core_pin = ""
+            pin_count = 1
             try:
                 st = open("/proc/" + pid + "/status").read()
                 for ln in st.splitlines():
                     if ln.startswith("Cpus_allowed_list:"):
-                        cores_list = ln.split(":", 1)[1].strip()
+                        cl = ln.split(":", 1)[1].strip()
+                        if cl != all_cores:
+                            core_pin = cl
+                            pin_count = _parse_core_range(cl)[0]
                     elif ln.startswith("Threads:"):
                         threads = int(ln.split(":", 1)[1].strip())
             except Exception:
                 pass
-            core_count, core_range = _parse_core_range(cores_list)
             prev = _proc_prev_ticks.get(pid)
             if prev:
                 dt = max(0.05, now - prev["ts"])
@@ -639,26 +645,26 @@ def _proc_snapshot() -> list:
             else:
                 cpu_pct = 0.0
             _proc_prev_ticks[pid] = {"ticks": ticks, "ts": now}
-            seen.add(int(pid))
-            per_core = min(100.0, cpu_pct / max(1, core_count))
+            seen.add(pid)
+            # Per-core: for pinned procs, divide by #pinned cores
+            per_core = min(100.0, cpu_pct / max(1, pin_count)) if core_pin else cpu_pct
             rows.append({
                 "pid": int(pid),
                 "name": name[:20],
-                "cmdline": _cmd[:120] if '_cmd' in dir() else "",
+                "cmdline": _cmd[:120],
                 "rss_kb": rss_kb,
                 "mem_pct": round(rss_kb / total_mem_kb * 100, 1),
                 "cpu_pct": round(cpu_pct, 1),
-                "core_range": core_range,
-                "core_count": core_count,
-                "per_core_pct": round(per_core, 1),
+                "per_core": round(per_core, 1),
                 "threads": threads,
+                "core_pin": core_pin,
+                "pin_count": pin_count,
+                "core_now": core_now,
             })
         except Exception:
             continue
-    # prune pids that vanished
     for p in [x for x in _proc_prev_ticks if x not in seen]:
         del _proc_prev_ticks[p]
-    # Filter to model-flow processes only
     _FLOW = ('vllm', 'nexus', 'goose', 'proxy', 'worker', 'dashboard', 'postgres', 'app.py', 'worker.py', 'dashboard.py')
     def _is_flow(r: dict) -> bool:
         s = (r['name'] + ' ' + r.get('cmdline', '')).lower()
@@ -1601,7 +1607,17 @@ body{font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background
 .util-hint{color:var(--dim);font-weight:normal;text-transform:none;letter-spacing:0;margin-left:8px}
 .util-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
 .util-grid-6{grid-template-columns:repeat(6,1fr)}
+.util-grid-8{grid-template-columns:repeat(8,1fr)}
+.util-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}
+.util-grid-3{grid-template-columns:repeat(3,1fr);display:grid;gap:6px;flex:1}
+
+.ccard{padding:5px}
+.ccard .uc-name{font-size:.65em}
+.ccard .uc-val{font-size:.9em;margin-left:auto}
+.ccard .bar-track{height:6px}
+.ccard .bar-fill{transition:width .5s,background .5s}
 .corebars{display:flex;gap:2px;margin-top:2px}
+.ucard .corebars{height:3px}
 .corebar{flex:1;height:4px;background:#05080d;border-radius:1px;overflow:hidden}
 .corebar-fill{height:100%;border-radius:1px;transition:width .5s}
 .fill-mio{background:linear-gradient(90deg,#38bdf8,#06b6d4)}
@@ -1786,15 +1802,14 @@ body{font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background
   <div class="syspanel" id="syspanel">
     <div class="sp-title">&#128450; SYSTEM</div>
     <div class="gauge">
-      <div class="gl"><span class="k">CPU</span><span class="v" id="s-cpu">--</span></div>
-      <div class="bar-track"><div class="bar-fill fill-cpu" id="b-cpu" style="width:0%"></div></div>
-      <div class="corebars" id="corebars"></div>
+      <div class="gl"><span class="k">RAM LOAD</span><span class="v" id="s-ramload">--</span></div>
+      <div class="bar-track"><div class="bar-fill fill-mio" id="b-ramload" style="width:0%"></div></div>
+      <div class="gl"><span class="k">Page faults</span><span class="v" id="s-pf">--</span></div>
     </div>
     <div class="gauge">
       <div class="gl"><span class="k">MEMORY</span><span class="v" id="s-mem">--</span></div>
       <div class="bar-track"><div class="bar-fill fill-mem" id="b-mem" style="width:0%"></div></div>
       <div class="gl"><span class="k">Page I/O</span><span class="v" id="s-pg">--</span></div>
-      <div class="gl"><span class="k">Page faults</span><span class="v" id="s-pf">--</span></div>
     </div>
     <div class="gauge">
       <div class="gl"><span class="k">SWAP</span><span class="v" id="s-swap">--</span></div>
@@ -1818,10 +1833,10 @@ body{font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background
   </div>
 
   <div class="procs">
-    <div class="pt" data-tip="Top Processes (by memory)|The 12 heaviest processes by resident memory (RSS). CPU% is a real 3-second tick delta. The CPU column is PER-CORE: a process pinned to 4 cores shows ~total&divide;4, so '0-3 (95%)' means those 4 cores are each ~95% busy - the signal for pinning / parallelism decisions.">&#128202; TOP PROCESSES (by memory)</div>
+    <div class="pt" data-tip="Top Processes (by memory)|12 heaviest by RSS. CORE = physical core the process is on.">&#128202; TOP PROCESSES (by memory)</div>
     <div class="table-wrap">
       <table class="ptable">
-        <thead><tr><th data-tip="PID|Process ID.">PID</th><th data-tip="Name|Process name from /proc/PID/comm (truncated to 20 chars).">NAME</th><th data-tip="Memory|Resident set size (physical RAM currently in use).">MEM</th><th data-tip="Memory %|RSS &divide; 60 GB total, i.e. the share of host RAM.">MEM%</th><th data-tip="CPU (per-core)|Total CPU% over the 3s window, shown as 'allowed-cores (per-core%)'. e.g. 0-3 (95%) = 4 pinned cores each ~95%. All 32 cores = a single number.">CPU(s)</th></tr></thead>
+        <thead><tr><th data-tip="PID|Process ID.">PID</th><th data-tip="Name|Process name from /proc/PID/comm (truncated to 20 chars).">NAME</th><th data-tip="Memory|Resident set size (physical RAM currently in use).">MEM</th><th data-tip="Memory %|RSS &divide; 60 GB total, i.e. the share of host RAM.">MEM%</th><th data-tip="CORE|Physical core (0-31) the process is running on RIGHT NOW (/proc/PID/stat field 39). Changes as scheduler moves threads. Pinned procs stay put.">CORE</th></tr></thead>
         <tbody id="procBody"><tr><td colspan="5" style="color:var(--dim)">loading…</td></tr></tbody>
       </table>
     </div>
@@ -1829,41 +1844,71 @@ body{font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background
 
   <div class="utilpanel" id="utilpanel">
     <div class="sp-title">&#9889; UTILIZATION <span class="util-hint">100% = saturated &rarr; optimize (e.g. vLLM parallel=2)</span></div>
-    <div class="util-grid util-grid-6">
+
+    <!-- Row 1: CPU -->
+    <div class="util-row">
       <div class="ucard" id="uc-cpu">
-        <div class="uc-head" data-tip="CPU|Host CPU usage across all 32 cores, from /proc/stat tick deltas. Red at &ge;90%, yellow at &ge;70%. The sparkline is the last ~7.5 min."><span class="uc-ic">&#9881;</span><span class="uc-name">CPU</span><span class="uc-val" id="u-cpu-v">--</span></div>
+        <div class="uc-head" data-tip="CPU|Aggregate CPU across all cores. Red &ge;90%, yellow &ge;70%. Per-core detail in C0-C7 cards below."><span class="uc-ic">&#9881;</span><span class="uc-name">CPU</span><span class="uc-val" id="u-cpu-v">--</span></div>
         <div class="bar-track"><div class="bar-fill fill-cpu" id="u-cpu-b" style="width:0%"></div></div>
         <div class="spark" id="u-cpu-s"></div>
       </div>
+    </div>
+
+    <!-- Row 2: RAM -->
+    <div class="util-row">
       <div class="ucard" id="uc-mem">
-        <div class="uc-head" data-tip="RAM|Host memory usage from /proc/meminfo (used &divide; 60 GB total). Red at &ge;90%, yellow at &ge;70%."><span class="uc-ic">&#129504;</span><span class="uc-name">RAM</span><span class="uc-val" id="u-mem-v">--</span></div>
+        <div class="uc-head" data-tip="RAM|Host memory usage from /proc/meminfo (used &divide; total). Red at &ge;90%, yellow at &ge;70%."><span class="uc-ic">&#129504;</span><span class="uc-name">RAM</span><span class="uc-val" id="u-mem-v">--</span></div>
         <div class="bar-track"><div class="bar-fill fill-mem" id="u-mem-b" style="width:0%"></div></div>
         <div class="spark" id="u-mem-s"></div>
       </div>
       <div class="ucard" id="uc-mio">
-        <div class="uc-head" data-tip="Memory I/O|Page in/out rate from /proc/vmstat (pgpgin + pgpgout, in KB/s). High = heavy disk-backed memory pressure (swapping, file-backed pages). The sparkline tracks the last ~7.5 min."><span class="uc-ic">&#128192;</span><span class="uc-name">MEM I/O</span><span class="uc-val" id="u-mio-v">--</span></div>
+        <div class="uc-head" data-tip="RAM Pressure|DDR5 RAM activity: minor page faults/s (in-memory page access) + memory PSI. High = heavy RAM workload."><span class="uc-ic">&#128192;</span><span class="uc-name">RAM PRESSURE</span><span class="uc-val" id="u-mio-v">--</span></div>
         <div class="bar-track"><div class="bar-fill fill-mio" id="u-mio-b" style="width:0%"></div></div>
         <div class="spark" id="u-mio-s"></div>
       </div>
+    </div>
+
+    <!-- Row 3: Disk -->
+    <div class="util-row">
       <div class="ucard" id="uc-pf">
-        <div class="uc-head" data-tip="Page Faults|Minor page faults per second from /proc/vmstat. Major faults (disk) are shown in the value. High major faults = the system is reading from disk to satisfy memory references."><span class="uc-ic">&#9888;&#65039;</span><span class="uc-name">PFAULTS</span><span class="uc-val" id="u-pf-v">--</span></div>
+        <div class="uc-head" data-tip="Page Faults|Per-second rate from /proc/vmstat. 'm' = minor (in-memory, cheap). 'M' = major (disk reads, expensive). Red border if major &ge;10/s."><span class="uc-ic">&#9888;&#65039;</span><span class="uc-name">PFAULTS</span><span class="uc-val" id="u-pf-v">--</span></div>
         <div class="bar-track"><div class="bar-fill fill-pf" id="u-pf-b" style="width:0%"></div></div>
         <div class="spark" id="u-pf-s"></div>
       </div>
+    </div>
+
+    <!-- Row 4: GPU -->
+    <div class="util-row">
       <div class="ucard" id="uc-gpu">
-        <div class="uc-head" data-tip="GPU|Average SM utilization of both RTX 5070 Ti GPUs, from nvidia-smi. 99% = saturated. The optimization lever is vLLM parallelism / tensor-parallel, not more GPUs."><span class="uc-ic">&#127918;</span><span class="uc-name">GPU</span><span class="uc-val" id="u-gpu-v">--</span></div>
+        <div class="uc-head" data-tip="GPU|Average SM utilization of both GPUs, from nvidia-smi. 99% = saturated."><span class="uc-ic">&#127918;</span><span class="uc-name">GPU</span><span class="uc-val" id="u-gpu-v">--</span></div>
         <div class="bar-track"><div class="bar-fill fill-gpu" id="u-gpu-b" style="width:0%"></div></div>
         <div class="spark" id="u-gpu-s"></div>
       </div>
       <div class="ucard" id="uc-vmem">
-        <div class="uc-head" data-tip="VRAM|Average GPU memory (used &divide; 16303 MiB) across both GPUs. ~97% means the KV-cache is the bottleneck - true data-parallel (parallel=2) needs a second full model copy and would OOM."><span class="uc-ic">&#128190;</span><span class="uc-name">VRAM</span><span class="uc-val" id="u-vmem-v">--</span></div>
+        <div class="uc-head" data-tip="VRAM|Average GPU memory (used &divide; total) across both GPUs. ~97% means the KV-cache is the bottleneck."><span class="uc-ic">&#128190;</span><span class="uc-name">VRAM</span><span class="uc-val" id="u-vmem-v">--</span></div>
         <div class="bar-track"><div class="bar-fill fill-vram" id="u-vmem-b" style="width:0%"></div></div>
         <div class="spark" id="u-vmem-s"></div>
       </div>
     </div>
-    <div class="util-proc">
-      <div class="uc-head small"><span class="uc-ic">&#128202;</span> PROCESS CPU</div>
-      <div class="procbars" id="procbars"></div>
+
+    <!-- Row 5: Process CPU -->
+    <div class="util-row">
+      <div class="util-proc">
+        <div class="uc-head small"><span class="uc-ic">&#128202;</span> PROCESS CPU</div>
+        <div class="procbars" id="procbars"></div>
+      </div>
+    </div>
+
+    <!-- Row 6: C0-C7 (3 columns: C0-C3 | C4-C5 | C6-C7) -->
+    <div class="util-grid util-grid-3" id="corecards">
+      <div class="ucard ccard" id="cc-0"><div class="uc-head"><span class="uc-name">C0</span><span class="uc-val" id="c-0-v">--</span></div><div class="bar-track"><div class="bar-fill" id="c-0-b" style="width:0%"></div></div></div>
+      <div class="ucard ccard" id="cc-1"><div class="uc-head"><span class="uc-name">C1</span><span class="uc-val" id="c-1-v">--</span></div><div class="bar-track"><div class="bar-fill" id="c-1-b" style="width:0%"></div></div></div>
+      <div class="ucard ccard" id="cc-2"><div class="uc-head"><span class="uc-name">C2</span><span class="uc-val" id="c-2-v">--</span></div><div class="bar-track"><div class="bar-fill" id="c-2-b" style="width:0%"></div></div></div>
+      <div class="ucard ccard" id="cc-3"><div class="uc-head"><span class="uc-name">C3</span><span class="uc-val" id="c-3-v">--</span></div><div class="bar-track"><div class="bar-fill" id="c-3-b" style="width:0%"></div></div></div>
+      <div class="ucard ccard" id="cc-4"><div class="uc-head"><span class="uc-name">C4</span><span class="uc-val" id="c-4-v">--</span></div><div class="bar-track"><div class="bar-fill" id="c-4-b" style="width:0%"></div></div></div>
+      <div class="ucard ccard" id="cc-5"><div class="uc-head"><span class="uc-name">C5</span><span class="uc-val" id="c-5-v">--</span></div><div class="bar-track"><div class="bar-fill" id="c-5-b" style="width:0%"></div></div></div>
+      <div class="ucard ccard" id="cc-6"><div class="uc-head"><span class="uc-name">C6</span><span class="uc-val" id="c-6-v">--</span></div><div class="bar-track"><div class="bar-fill" id="c-6-b" style="width:0%"></div></div></div>
+      <div class="ucard ccard" id="cc-7"><div class="uc-head"><span class="uc-name">C7</span><span class="uc-val" id="c-7-v">--</span></div><div class="bar-track"><div class="bar-fill" id="c-7-b" style="width:0%"></div></div></div>
     </div>
   </div>
 </div>
@@ -1987,24 +2032,19 @@ sv('wk-pend',db.jobs_pending!=null?db.jobs_pending:0);
 sv('wk-done',db.jobs_done_today!=null?db.jobs_done_today:0);
 
 // --- System panel (htop-style) ---
-if(sys.cpu_pct!=null){
-  sv('s-cpu',sys.cpu_pct.toFixed(1)+'%  ('+sys.cpu_cores+' cores)');
-  $('b-cpu').style.width=Math.min(100,sys.cpu_pct)+'%';
-}
-var cb=$('corebars');
-if(cb&&sys.cpu_per_core&&sys.cpu_per_core.length){
-  cb.innerHTML=sys.cpu_per_core.map(function(v,i){
-    var col=v>=90?'var(--red)':(v>=70?'var(--yellow)':'var(--cyan)');
-    return '<div class="corebar" title="Core '+i+': '+v.toFixed(1)+'%"><div class="corebar-fill" style="width:'+Math.min(100,v)+'%;background:'+col+'"></div></div>';
-  }).join('');
-}
+var mioR=sys.mem_io||{};
+var mfR=mioR.pgfault_ps||0;
+var psiMR=(sys.psi&&sys.psi.memory)?sys.psi.memory:0;
+var ramLoad=Math.min(100,mfR/1000+psiMR*10);
+sv('s-ramload',(mfR>=1000?(mfR/1000).toFixed(1)+'k':mfR.toFixed(0))+'/s'+(psiMR>0.1?' +'+psiMR.toFixed(1)+'%psi':''));
+var brl=$('b-ramload');if(brl)brl.style.width=ramLoad+'%';
 if(sys.mem_pct!=null){
   sv('s-mem',fmtKB(sys.mem_used_kb)+' / '+fmtKB(sys.mem_total_kb)+'  ('+sys.mem_pct.toFixed(1)+'%)');
   $('b-mem').style.width=Math.min(100,sys.mem_pct)+'%';
 }
 var mio=sys.mem_io||{};
 sv('s-pg',fmtRate(mio.pgpgin_kbs||0)+' \u2193  '+fmtRate(mio.pgpgout_kbs||0)+' \u2191');
-sv('s-pf',(mio.pgfault_ps||0).toFixed(0)+' minor  '+(mio.pgmajfault_ps||0).toFixed(1)+' major');
+var mn2=mio.pgfault_ps||0,mj2=mio.pgmajfault_ps||0;sv('s-pf',(mn2>=1000?(mn2/1000).toFixed(1)+'k':mn2.toFixed(0))+' minor  '+(mj2>=1000?(mj2/1000).toFixed(1)+'k':mj2.toFixed(1))+' major');
 if(sys.swap_pct!=null){
   sv('s-swap',fmtKB(sys.swap_used_kb)+' / '+fmtKB(sys.swap_total_kb)+'  ('+sys.swap_pct.toFixed(1)+'%)');
   $('b-swap').style.width=Math.min(100,sys.swap_pct)+'%';
@@ -2026,13 +2066,24 @@ sv('s-disk',fmtRate(sys.disk_rd_kbs)+' \u2193  '+fmtRate(sys.disk_wr_kbs)+' \u21
 var diskTot=(sys.disk_rd_kbs||0)+(sys.disk_wr_kbs||0);
 $('b-disk').style.width=Math.min(100,diskTot/10)+'%';
 
-// --- Top processes table (per-core CPU) ---
+// --- Top processes table: per-core CPU + pin ---
 if(sys.procs&&sys.procs.length){
   var rows=sys.procs.map(function(p){
-    var pcp=p.per_core_pct!=null?p.per_core_pct:0;var cpc=p.cpu_pct!=null?p.cpu_pct:0;var mp=p.mem_pct!=null?p.mem_pct:0;var cc=p.core_count&&p.core_count>1?(p.core_range+' ('+pcp.toFixed(1)+'%)'):cpc.toFixed(1)+'%';
-    var cccol=pcp>=90?'var(--red)':(pcp>=70?'var(--yellow)':'var(--text)');
-    return '<tr data-tip="PID '+p.pid+'|'+p.name+' &middot; '+(p.threads||0)+' threads &middot; pinned to cores '+(p.core_range||'?')+' ('+(p.core_count||1)+' cores) &middot; total CPU '+cpc+'% over 3s &middot; per-core '+pcp+'% &middot; RSS '+fmtKB(p.rss_kb)+'">'+
-      '<td class="num">'+p.pid+'</td><td class="pname">'+p.name+'</td><td class="num">'+fmtKB(p.rss_kb)+'</td><td class="num">'+mp.toFixed(1)+'%</td><td class="num" style="color:'+cccol+'">'+cc+'</td></tr>';
+    var pc=p.per_core!=null?p.per_core:0;
+    var mp=p.mem_pct!=null?p.mem_pct:0;
+    var pin=p.core_pin||'';
+    // Display: "95.2%" if unpinned, "95.2% [0-3]" if pinned to cores 0-3
+    var cpuStr=pc.toFixed(1)+'%';
+    if(pin) cpuStr+=' ['+pin+']';
+    // Color by per-core utilisation
+    var cccol=pc>=90?'var(--red)':(pc>=70?'var(--yellow)':'var(--text)');
+    var th=p.threads||1;var tot=p.cpu_pct||0;
+    var tip='PID '+p.pid+'|'+p.name+' &middot; '+th+' thread'+(th>1?'s':'')+' &middot; '+tot.toFixed(1)+'% total CPU';
+    if(pin) tip+=' &middot; pinned to '+pin+' ('+p.pin_count+' cores) &middot; '+pc.toFixed(1)+'% per core';
+    else tip+=' &middot; not pinned (spread across all cores)';
+    tip+=' &middot; RSS '+fmtKB(p.rss_kb);
+    return '<tr data-tip="'+tip+'">'+
+      '<td class="num">'+p.pid+'</td><td class="pname">'+p.name+'</td><td class="num">'+fmtKB(p.rss_kb)+'</td><td class="num">'+mp.toFixed(1)+'%</td><td class="num" style="color:var(--cyan)">'+(p.core_now>=0?p.core_now:'?')+'</td></tr>';
   }).join('');
   $('procBody').innerHTML=rows;
 }else{
@@ -2047,23 +2098,34 @@ uc('mem',sys.mem_pct);
 uc('gpu',g.util_avg);
 uc('vmem',g.mem_avg);
 var mio3=sys.mem_io||{};
-var mioTot3=(mio3.pgpgin_kbs||0)+(mio3.pgpgout_kbs||0);
-var mioPct3=Math.min(100,mioTot3);
-if(mioTot3>0){
-  sv('u-mio-v',fmtRate(mioTot3));
-  var mb3=$('u-mio-b');if(mb3)mb3.style.width=mioPct3+'%';
-  var mc3=$('uc-mio');if(mc3)mc3.style.borderColor=mioTot3>=80?'var(--red)':(mioTot3>=50?'var(--yellow)':'var(--border)');
+var mf=mio3.pgfault_ps||0;
+var psiM=(sys.psi&&sys.psi.memory)?sys.psi.memory:0;
+var ramScore=Math.min(100, mf/1000 + psiM*10);
+if(mf>0||psiM>0){
+  sv('u-mio-v',(mf>=1000?(mf/1000).toFixed(1)+'k':mf.toFixed(0))+'/s'+(psiM>0.1?' +'+psiM.toFixed(1)+'%psi':''));
+  var mb3=$('u-mio-b');if(mb3)mb3.style.width=ramScore+'%';
+  var mc3=$('uc-mio');if(mc3)mc3.style.borderColor=ramScore>=50?'var(--red)':(ramScore>=25?'var(--yellow)':'var(--border)');
 }else{
-  sv('u-mio-v','0 KB/s');
+  sv('u-mio-v','idle');
 }
 var pfTot3=(mio3.pgfault_ps||0)+(mio3.pgmajfault_ps||0);
 var pfPct3=Math.min(100,pfTot3/10);
 if(pfTot3>0){
-  sv('u-pf-v',(mio3.pgfault_ps||0).toFixed(0)+'+'+(mio3.pgmajfault_ps||0).toFixed(1)+'M');
+  var mn=mio3.pgfault_ps||0,mj=mio3.pgmajfault_ps||0;
+  sv('u-pf-v',(mn>=1000?(mn/1000).toFixed(1)+'k':mn.toFixed(0))+' m  '+(mj>=1000?(mj/1000).toFixed(1)+'k':mj.toFixed(1))+' M');
   var pfb3=$('u-pf-b');if(pfb3)pfb3.style.width=pfPct3+'%';
-  var pfc3=$('uc-pf');if(pfc3)pfc3.style.borderColor=(mio3.pgmajfault_ps||0)>=10?'var(--red)':'';
+  var pfc3=$('uc-pf');if(pfc3)pfc3.style.borderColor=mj>=10?'var(--red)':(mj>=1?'var(--yellow)':'');
 }else{
   sv('u-pf-v','0/s');
+}
+// Per-core cards (8 separate components)
+if(sys.cpu_per_core&&sys.cpu_per_core.length){
+  for(var ci=0;ci<Math.min(8,sys.cpu_per_core.length);ci++){
+    var cv=sys.cpu_per_core[ci];
+    var cvs=$('c-'+ci+'-v');if(cvs)cvs.textContent=cv.toFixed(0)+'%';
+    var cbs=$('c-'+ci+'-b');if(cbs){cbs.style.width=Math.min(100,cv)+'%';cbs.style.background=cv>=90?'var(--red)':(cv>=70?'var(--yellow)':'var(--cyan)');}
+    var ccEl=$('cc-'+ci);if(ccEl)ccEl.style.borderColor=cv>=90?'var(--red)':(cv>=70?'var(--yellow)':'var(--border)');
+  }
 }
 var H=d.util_history||[];
 spark('u-cpu-s',H.map(function(x){return x.cpu||0}),100);
