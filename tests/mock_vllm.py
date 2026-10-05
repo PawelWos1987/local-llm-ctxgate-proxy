@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mock vLLM server for testing ctxgate-proxy. Supports tools, large outputs, errors."""
 import json, time, uuid, argparse
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import HTTPServer, ThreadingHTTPServer, BaseHTTPRequestHandler
 
 PORT = 29100
 request_log = []
@@ -195,5 +195,5 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=29100)
     args = parser.parse_args()
     print(f"Mock vLLM server running on port {args.port}", flush=True)
-    server = HTTPServer(("127.0.0.1", args.port), MockVLLM)
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), MockVLLM)
     server.serve_forever()

@@ -607,17 +607,17 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
         ws = session_compactions.get(session_key)
         if ws is None:
             return
-        start_idx = ws.get("summarized_through", 0)
-        end_idx = ws.get("dropped_total", ws.get("cut", 0))
-        if pending_cut is not None:
-            end_idx = min(end_idx, pending_cut)
-        _slice_log.append((start_idx, end_idx))
-        if len(_slice_log) > 1000:
-            _slice_log[:] = _slice_log[-500:]
-        _summary_last_attempt[task_uuid] = (time.time(), end_idx)
-        if end_idx <= start_idx:
-            return  # nothing new to summarize
         try:
+            start_idx = ws.get("summarized_through", 0)
+            end_idx = ws.get("dropped_total", ws.get("cut", 0))
+            if pending_cut is not None:
+                end_idx = min(end_idx, pending_cut)
+            _slice_log.append((start_idx, end_idx))
+            if len(_slice_log) > 1000:
+                _slice_log[:] = _slice_log[-500:]
+            _summary_last_attempt[task_uuid] = (time.time(), end_idx)
+            if end_idx <= start_idx:
+                return  # nothing new to summarize
             slice_msgs = rest[start_idx:end_idx]
             if not slice_msgs:
                 return
@@ -695,15 +695,15 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
                 new_phase = last_phase + 1 + ci
                 session_tag = (" [Session: " + session_name + "]") if session_name else ""
                 phase_user_msg = "Phase " + str(new_phase) + session_tag + ":\n" + chunk
-                result = await _call_4b(
+                phase_result = await _call_4b(
                     [{"role": "user", "content": phase_user_msg}],
                     max_tokens=800, json_mode=False, system=phase_prompt,
                 )
                 phase_summary = ""
-                if isinstance(result, str) and result.strip():
-                    phase_summary = result.strip()
-                elif isinstance(result, dict):
-                    su = result.get("state_update", {})
+                if isinstance(phase_result, str) and phase_result.strip():
+                    phase_summary = phase_result.strip()
+                elif isinstance(phase_result, dict):
+                    su = phase_result.get("state_update", {})
                     if isinstance(su, dict) and su.get("current_state"):
                         phase_summary = su["current_state"].strip()
                 if not phase_summary:

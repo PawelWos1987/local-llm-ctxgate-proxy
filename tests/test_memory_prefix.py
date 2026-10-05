@@ -18,6 +18,10 @@ import app as _proxy
 BASE = "http://127.0.0.1:9201"
 MODEL = "Qwen3.8-27B"
 PG_PASS = os.environ.get("CTXGATE_PG_PASS", "postgres")
+import urllib.parse as _up
+PG_DB = _up.urlparse(_proxy.DB_DSN).path.lstrip("/") or "ctxproxy"
+# NOTE: dbq() queries the REAL proxy database (derived from the proxy DB_DSN), not a stale local name.
+
 passed = 0
 failed = 0
 lock = threading.Lock()
@@ -61,7 +65,7 @@ def dbq(sql):
     try:
         p = subprocess.run(
             ["psql", "-h", "127.0.0.1", "-p", "5432", "-U", "postgres",
-             "-d", "local-llm-ctxgate-proxy", "-tA", "-c", sql],
+             "-d", PG_DB, "-tA", "-c", sql],
             capture_output=True, text=True, timeout=15, env=env)
         if p.returncode != 0:
             return []

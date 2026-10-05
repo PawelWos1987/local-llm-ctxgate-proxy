@@ -1,6 +1,6 @@
 """local-llm-ctxgate-proxy 4B Memory Worker (asynchronous durable-memory extraction).
 
-Polls proxy.memory_jobs (FOR UPDATE SKIP LOCKED, parallelism=1), calls the
+Polls proxy.memory_jobs (FOR UPDATE SKIP LOCKED, N concurrent consumers), calls the
 Qwen3-4B LM Studio model with a COMPACT payload and a STRICT JSON schema
 (sections 15/16), validates the response, applies deterministic dedupe /
 UPDATE / SUPERSEDE to proxy.memories, updates proxy.working_memory, and marks
@@ -43,6 +43,8 @@ POLL = float(os.environ.get("CTXGATE_WORKER_POLL", "2.0"))
 MAX_ATTEMPTS = int(os.environ.get("CTXGATE_WORKER_MAX_ATTEMPTS", "3"))
 # Outage TTL: how long to keep retrying before marking jobs failed (seconds)
 OUTAGE_TTL = float(os.environ.get("CTXGATE_WORKER_OUTAGE_TTL", "1800"))
+# Number of concurrent consumers (parallelism). Each consumer claims one job at a time.
+CONSUMERS = int(os.environ.get("CTXGATE_WORKER_CONSUMERS", "10"))
 # No BASE_URL needed: Mistral is a cloud API (no local model management)
 # Section 18 generation settings (established for this 4B deployment)
 TEMP = 0.7
@@ -145,6 +147,12 @@ _last_status_write = 0.0  # throttle timestamp for status-file writes
 # Lag / completion tracking (source of the worker_lag_seconds metric)
 last_completion: Optional[float] = None  # time.time() of the last successful job
 jobs_done_total: int = 0
+# Throttling / context tracking
+lm_requests: list = []  # timestamps of completed LM calls (for RPM)
+lm_context_tokens: list = []  # context token counts per request
+lm_total_tokens_in: int = 0  # cumulative input tokens
+lm_total_tokens_out: int = 0  # cumulative output tokens
+lm_last_latency_ms: float = 0.0  # most recent call latency
 
 def _sig(s, f):
     global running
@@ -285,7 +293,9 @@ async def call_4b(payload: str) -> dict:
             "json_schema": {"name": "memory_worker", "strict": True, "schema": MEMORY_SCHEMA},
         },
     }
+    t0 = time.time()
     r = await client.post(LM_URL, json=body, timeout=httpx.Timeout(300, connect=10))
+    latency_ms = round((time.time() - t0) * 1000, 1)
     if r.status_code == 429:
         raise RateLimitError("Mistral rate limit (429): %s" % r.text[:200])
     if r.status_code != 200:
@@ -297,6 +307,24 @@ async def call_4b(payload: str) -> dict:
     content = msg.get("content", "")
     if not content:
         raise RuntimeError("Mistral returned empty content")
+    # Track throttling metrics
+    global lm_requests, lm_context_tokens, lm_total_tokens_in, lm_total_tokens_out, lm_last_latency_ms
+    now = time.time()
+    lm_requests.append(now)
+    # Keep only last 5 min of requests for RPM calc
+    cutoff = now - 300
+    lm_requests = [t for t in lm_requests if t >= cutoff]
+    lm_last_latency_ms = latency_ms
+    # Extract token usage if present in response
+    usage = data.get("usage", {})
+    tin = usage.get("prompt_tokens", 0)
+    tout = usage.get("completion_tokens", 0)
+    lm_total_tokens_in += tin
+    lm_total_tokens_out += tout
+    lm_context_tokens.append(tin)
+    # Keep only last 100 for context trend
+    if len(lm_context_tokens) > 100:
+        lm_context_tokens = lm_context_tokens[-100:]
     return _extract_json(content)
 
 # --- Quality check: 4B self-reviews its own output ---
@@ -458,12 +486,15 @@ async def prune_memories(pool) -> None:
     except Exception as e:
         log.warning("memory prune failed (non-fatal): %s", e)
 
-async def claim_job():
-    """Claim exactly ONE pending job (parallelism=1) with row locking."""
-    return await pool.fetchrow(
+async def claim_jobs(n: int = 1) -> list:
+    """Claim up to N pending jobs with row locking (FOR UPDATE SKIP LOCKED).
+    With N consumers, we claim N jobs in one query so each consumer gets one."""
+    rows = await pool.fetch(
         "SELECT id, task_id, event_id, attempts FROM proxy.memory_jobs "
-        "WHERE status='pending' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED"
+        "WHERE status='pending' ORDER BY created_at LIMIT $1 FOR UPDATE SKIP LOCKED",
+        n
     )
+    return list(rows)
 
 async def process_job(job) -> None:
     """Process a single memory job with outage-aware retry logic.
@@ -618,28 +649,54 @@ async def process_job(job) -> None:
                 attempts, str(e)[:500], jid,
             )
 
+# Track active consumer tasks for the status file
+_active_consumers: dict = {}  # consumer_id -> asyncio.Task
+
+async def _consumer(cid: int) -> None:
+    """One consumer loop: claim one job at a time, process it, repeat."""
+    global model_loaded
+    while running:
+        try:
+            job = await claim_jobs(1)
+            if job:
+                if not model_loaded:
+                    await ensure_model_loaded()
+                _active_consumers[cid] = {"job_id": str(job[0]["id"]), "task_id": str(job[0]["task_id"])}
+                try:
+                    await process_job(job[0])
+                finally:
+                    _active_consumers[cid] = {"idle": True}
+            else:
+                _active_consumers[cid] = {"idle": True}
+                await asyncio.sleep(POLL)
+        except Exception as e:
+            log.exception("consumer %d: %s", cid, e)
+            _active_consumers[cid] = {"error": str(e)}
+            await asyncio.sleep(5)
+
 async def poll():
-    """Main poll loop with pre-load before first completion in a batch."""
+    """Main loop: spawn N consumers, each claims and processes one job at a time."""
     last_prune = time.time()
+    tasks = []
+    for cid in range(CONSUMERS):
+        tasks.append(asyncio.create_task(_consumer(cid), name=f"consumer-{cid}"))
+    log.info("Spawned %d consumers", CONSUMERS)
     while running:
         _heartbeat()
         try:
-            # Slow prune cycle (~6h): never in the hot path
             now = time.time()
             if now - last_prune > 6 * 3600:
                 await prune_memories(pool)
                 last_prune = now
-            job = await claim_job()
-            if job is not None:
-                # Pre-load: before the first completion, ensure model is loaded
-                if not model_loaded:
-                    await ensure_model_loaded()
-                await process_job(job)
-            else:
-                await asyncio.sleep(POLL)
+            await asyncio.sleep(1.0)
         except Exception as e:
             log.exception("poll loop: %s", e)
             await asyncio.sleep(5)
+    # Cancel all consumers on shutdown
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    log.info("All %d consumers stopped", CONSUMERS)
 
 def _pid_alive(pid: int) -> bool:
     try:
@@ -676,12 +733,27 @@ def _write_status(force: bool = False) -> None:
         return
     _last_status_write = now
     lag = (now - last_completion) if last_completion else 0.0
+    # Count active (non-idle) consumers
+    active = sum(1 for v in _active_consumers.values() if not v.get("idle") and not v.get("error"))
+    # Calculate requests per minute (last 5 min window)
+    rpm = len(lm_requests)
+    # Context: average and max of recent requests
+    ctx_avg = round(sum(lm_context_tokens) / len(lm_context_tokens)) if lm_context_tokens else 0
+    ctx_max = max(lm_context_tokens) if lm_context_tokens else 0
     data = {
         "pid": os.getpid(),
         "heartbeat": now,
         "lag_seconds": round(lag, 2),
         "last_completion": last_completion,
         "jobs_done": jobs_done_total,
+        "consumers_total": CONSUMERS,
+        "consumers_active": active,
+        "lm_rpm": rpm,
+        "lm_latency_ms": lm_last_latency_ms,
+        "lm_ctx_avg": ctx_avg,
+        "lm_ctx_max": ctx_max,
+        "lm_tokens_in_total": lm_total_tokens_in,
+        "lm_tokens_out_total": lm_total_tokens_out,
     }
     _atomic_write(STATUS_FILE, json.dumps(data))
 
@@ -769,7 +841,7 @@ async def main():
     if not acquire_single_instance_lock():
         return
     _sd_notify("READY=1")
-    pool = await asyncpg.create_pool(DSN, min_size=1, max_size=3)
+    pool = await asyncpg.create_pool(DSN, min_size=1, max_size=max(5, CONSUMERS * 2))
     client = httpx.AsyncClient(headers={"Authorization": f"Bearer {LM_API_KEY}"}) if LM_API_KEY else httpx.AsyncClient()
     _write_status()
     # Recover stuck 'processing' jobs (from previous crash/restart)
@@ -778,8 +850,8 @@ async def main():
     )
     if recovered:
         log.info("Recovered %d stuck 'processing' jobs back to 'pending'", len(recovered))
-    log.info("Memory worker started (model=%s, url=%s, poll=%.1fs, max_attempts=%d, outage_ttl=%.0fs, api_key=%s)",
-              LM_MODEL, LM_URL, POLL, MAX_ATTEMPTS, OUTAGE_TTL, "set" if LM_API_KEY else "MISSING")
+    log.info("Memory worker started (model=%s, url=%s, poll=%.1fs, consumers=%d, max_attempts=%d, outage_ttl=%.0fs, api_key=%s)",
+              LM_MODEL, LM_URL, POLL, CONSUMERS, MAX_ATTEMPTS, OUTAGE_TTL, "set" if LM_API_KEY else "MISSING")
     try:
         await poll()
     finally:

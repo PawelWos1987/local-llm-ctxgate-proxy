@@ -14,6 +14,7 @@ Targets INTERNAL functions via direct import + HTTP integration:
   J. Concurrent memory inject (race safety)
 """
 import json
+import os
 import sys
 import time
 import urllib.error
