@@ -19,7 +19,10 @@ def _load():
     names = ["_make_pinned_copy", "_norm_content"]
     mod_src = _extract(names)
     ns = {}
-    ns.update(PINNED_USER_MAX_CHARS=16000, PINNED_USER_FAR_CHARS=2000, PINNED_USER_FAR_THRESHOLD=8)
+    import hashlib
+    ns.update(hashlib=hashlib,
+              PINNED_USER_MAX_CHARS=16000, PINNED_USER_FAR_CHARS=2000,
+              PINNED_USER_FAR_THRESHOLD=8)
     exec(compile(mod_src, "extracted", "exec"), ns)
     return ns
 
@@ -31,7 +34,7 @@ def test_pinned_copy_within_cap():
     text = copy["content"]
     assert text[:300] == "A" * 300, "first 300 chars must be verbatim"
     assert len(text) <= 16000 + 30, f"cap exceeded: {len(text)}"
-    assert "[...truncated...]" in text, "truncation marker missing"
+    assert "[...middle omitted by ctxgate...]" in text, "truncation marker missing"
 
 def test_pinned_copy_short_unchanged():
     short_msg = {"role": "user", "content": "B" * 200}

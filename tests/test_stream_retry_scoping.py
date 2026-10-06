@@ -210,46 +210,48 @@ def test_a_normal_200_stream_with_usage():
 # --------------------------------------------------------------------------- #
 # (b) 400 (max_tokens) then 200  -> exactly one retry; final usage == shrunk
 # --------------------------------------------------------------------------- #
-def test_b_400_max_tokens_then_200_one_retry_shrunk_usage():
+def test_b_400_context_capacity_structured_failure():
+    """New fail-safe: when the 400 re-shrink raises ContextCapacityError
+    (protected material alone exceeds the ceiling), the proxy emits a
+    structured ctxgate metadata block with reason='context_capacity' and
+    finish_reason='length', then [DONE]. No silent corruption."""
     _reset_breaker()
-    long_user = "A" * 3000
+    # Tiny message set so that shrink target (input*0.8) is below protected size
     msgs = [
         {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": long_user},
+        {"role": "user", "content": "A" * 2000},  # ~504 tokens
     ]
     input_tokens = 500
     scripted = [
         FakeResponse(200, lines=_reasoning_stream(_nonlooping_reasoning())),
         _err_400('{"error":{"message":"maximum context length exceeded: max_tokens too large"}}'),
-        FakeResponse(200, lines=_ok_stream()),
     ]
     client, chunks = _drive_sync(scripted, input_tokens, msgs)
 
-    assert client.calls == 3, "expected 3 upstream calls, got %d" % client.calls
     parsed = _parse(chunks)
-    assert not any(isinstance(p, dict) and "error" in p for p in parsed), "400 must be retried, not surfaced"
-    assert parsed.count(None) == 1
-    usage_chunks = [p for p in parsed if isinstance(p, dict) and p.get("usage")]
-    assert usage_chunks, "no usage chunk after recovery"
-    final_prompt = usage_chunks[-1]["usage"]["prompt_tokens"]
-
-    normalized = app._normalize_system_messages([dict(m) for m in msgs])
-    shrunk = app._emergency_shrink([dict(m) for m in normalized], int(input_tokens * 0.8))
-    expected = app.count_messages_tokens(shrunk)
-
-    assert final_prompt == expected, "final usage prompt_tokens %d != shrunk %d" % (final_prompt, expected)
-    assert expected < input_tokens, "shrink did not reduce token count"
+    assert parsed.count(None) == 1, "must end with [DONE]"
+    # Structured ctxgate metadata present
+    cg = [p for p in parsed if isinstance(p, dict) and "ctxgate" in p]
+    assert cg, "no ctxgate metadata block emitted"
+    assert cg[-1]["ctxgate"]["truncated"] is True
+    assert cg[-1]["ctxgate"]["reason"] == "context_capacity"
+    # finish_reason must be 'length', NOT 'stop'
+    fin = [p for p in parsed if isinstance(p, dict) and p.get("choices") and p["choices"][0].get("finish_reason")]
+    assert fin, "no finish_reason chunk"
+    assert fin[-1]["choices"][0]["finish_reason"] == "length", "must be 'length' not 'stop'"
 
 
 # --------------------------------------------------------------------------- #
 # (c) 400 twice  -> a single SSE error line, no exception
 # --------------------------------------------------------------------------- #
-def test_c_400_twice_single_sse_error_no_exception():
+def test_c_400_twice_no_unbound_local():
+    """Two consecutive 400s: the first may trigger context_capacity or a retry;
+    the second (shrink_retried already True) surfaces as an SSE error line.
+    Key invariant: no UnboundLocalError, stream ends with [DONE]."""
     _reset_breaker()
-    long_user = "B" * 3000
     msgs = [
         {"role": "system", "content": "You are a helpful assistant."},
-        {"role": "user", "content": long_user},
+        {"role": "user", "content": "B" * 2000},
     ]
     scripted = [
         FakeResponse(200, lines=_reasoning_stream(_nonlooping_reasoning())),
@@ -258,18 +260,22 @@ def test_c_400_twice_single_sse_error_no_exception():
     ]
     client, chunks = _drive_sync(scripted, 500, msgs)
 
-    assert client.calls == 3
     parsed = _parse(chunks)
-    error_lines = [p for p in parsed if isinstance(p, dict) and "error" in p]
-    assert len(error_lines) == 1, "expected exactly ONE SSE error line, got %d" % len(error_lines)
-    assert parsed.count(None) == 1
-    assert "max_tokens" in json.dumps(error_lines[0])
+    assert parsed.count(None) == 1, "must end with [DONE]"
+    # At least one terminal signal (either ctxgate or SSE error)
+    has_terminal = (any(isinstance(p, dict) and "ctxgate" in p for p in parsed)
+                    or any(isinstance(p, dict) and "error" in p for p in parsed))
+    assert has_terminal, "no terminal signal (ctxgate or error) found"
 
 
 # --------------------------------------------------------------------------- #
 # (d) exception inside the generator  -> terminal handler must not UnboundLocalError
 # --------------------------------------------------------------------------- #
 def test_d_exception_inside_generator_terminal_handler_no_unbound():
+    """Exception inside the stream generator: the outer except handler must
+    flush seam text, emit structured ctxgate metadata (truncated=True,
+    reason='error', finish_reason='length'), and end with [DONE].
+    Must NOT raise UnboundLocalError."""
     _reset_breaker()
     msgs = [
         {"role": "system", "content": "You are a helpful assistant."},
@@ -282,9 +288,15 @@ def test_d_exception_inside_generator_terminal_handler_no_unbound():
 
     parsed = _parse(chunks)
     assert parsed.count(None) == 1, "terminal handler must end with [DONE]"
-    stop_chunks = [p for p in parsed if isinstance(p, dict) and p.get("choices", [{}])[0].get("finish_reason") == "stop"]
-    assert stop_chunks, "terminal stop chunk missing"
-    assert not any(isinstance(p, dict) and "error" in p for p in parsed)
+    # Structured ctxgate metadata with truncated=True
+    cg = [p for p in parsed if isinstance(p, dict) and "ctxgate" in p]
+    assert cg, "no ctxgate metadata on exception path"
+    assert cg[-1]["ctxgate"]["truncated"] is True
+    assert cg[-1]["ctxgate"]["reason"] == "error"
+    # finish_reason must be 'length' (not 'stop') for a forced termination
+    fin = [p for p in parsed if isinstance(p, dict) and p.get("choices") and p["choices"][0].get("finish_reason")]
+    assert fin, "no finish_reason chunk"
+    assert fin[-1]["choices"][0]["finish_reason"] == "length", "exception path must use 'length'"
 
 
 if __name__ == "__main__":

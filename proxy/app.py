@@ -856,6 +856,20 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
             ws["in_flight"] = False
 
 
+
+def _compact_context(frozen_summary: str, working_memory: str, recent_messages: list) -> str:
+    """Build a compact context string from frozen summary, working memory, and recent messages."""
+    fs = frozen_summary
+    fs = fs[:6000]
+    parts = []
+    if fs:
+        parts.append("[FROZEN SUMMARY]" + chr(10) + fs)
+    if working_memory:
+        parts.append("[WORKING MEMORY]" + chr(10) + working_memory)
+    if recent_messages:
+        parts.append("[RECENT MESSAGES]" + chr(10) + json.dumps(recent_messages, ensure_ascii=False))
+    return chr(10) + chr(10) + chr(10) + chr(10).join(parts)
+
 async def _fetch_session_summary(task_uuid, budget=1500, session_key: str = ""):
     """Fetch the most recent session summary for a task.
 
@@ -913,6 +927,8 @@ PINNED_USER_FAR_THRESHOLD = _env_int("CTXGATE_PINNED_USER_FAR_THRESHOLD", 8)  # 
 WALL_CLOCK_MAX = _env_int("CTXGATE_WALL_CLOCK_MAX", 1800)  # 30 min - large contexts need more time
 MAX_CONTINUATIONS = int(os.environ.get("CTXGATE_MAX_CONTINUATIONS", 5))
 WORKER_BACKPRESSURE = _env_int("CTXGATE_WORKER_BACKPRESSURE", 50)
+CTXGATE_MAX_TOTAL_OUTPUT = _env_int("CTXGATE_MAX_TOTAL_OUTPUT", 50000)  # hard cap for the whole logical response incl. all continuations
+CTXGATE_MIN_CONTINUATION_OUTPUT = _env_int("CTXGATE_MIN_CONTINUATION_OUTPUT", 1024)  # small floor for later continuation requests
 SESSION_TTL_HOURS = _env_int("CTXGATE_SESSION_TTL_HOURS", 12)
 SESSION_LAST_ACTIVE: dict[str, float] = {}
 WORKER_PENDING_CACHE: dict = {"value": 0, "ts": 0.0}
@@ -997,6 +1013,25 @@ metrics = {
     "emergency_shrink_groups_dropped": 0,
     "inject_skipped_stale_user": 0,
     "started_at": time.time(),
+    # --- Output integrity metrics ---
+    "output_total_budget_exhausted": 0,
+    "output_truncated_total": 0,
+    "output_truncated_by_reason": {},
+    "output_continuations_total": 0,
+    "output_max_tokens_seen": 0,
+    "tool_call_truncated": 0,
+    "tool_call_suppressed": 0,
+    "tool_call_complete": 0,
+    "recent_tool_preservation_failures": 0,
+    "pinned_user_preservation_failures": 0,
+    "root_summary_lag": 0,
+    "summary_retry_count": 0,
+    "memory_jobs_created": 0,
+    "memory_jobs_dropped": 0,
+    "memory_worker_lag": 0,
+    "memory_store_success": 0,
+    "memory_store_failure": 0,
+    "memory_retrieval_hits": 0,
 }
 
 _background_tasks: set = set()
@@ -1350,6 +1385,20 @@ def make_session_key(x_session_id: str, messages: list) -> str:
     return f"{x_session_id}:{fp}"
 
 # --- Prefix fingerprint (per-session) ---
+def compute_prefix_fingerprint(messages: list) -> str:
+    """Deterministic fingerprint of the message prefix for session tracking."""
+    return hashlib.sha256(_prefix_raw(messages).encode()).hexdigest()[:16]
+def check_prefix(session_key: str, messages: list) -> None:
+    """Check if the message prefix changed since last seen. Increment invalidation counter on change."""
+    fp = compute_prefix_fingerprint(messages)
+    prev = session_fingerprints.get(session_key)
+    if prev is not None and prev != fp:
+        metrics["prefix_invalidations"] += 1
+        log.info("Prefix invalidation session=%s (fp %s -> %s)", session_key, prev[:8], fp[:8])
+    session_fingerprints[session_key] = fp
+
+
+
 
 
 # --- D10: Reasoning stripping ---
@@ -1439,13 +1488,26 @@ def sanitize_tool_calls(message: dict) -> tuple:
     return cleaned, True
 
 # --- Context assembler ---
+def strip_reasoning(messages: list) -> list:
+    """Canonical: remove hidden reasoning fields from assistant messages.
+
+    Strips both the legacy 'reasoning' key and 'reasoning_content'. Assistant
+    messages carrying either are returned without them; all other messages
+    pass through unchanged. Every returned message is a shallow copy so
+    callers may mutate freely. Single source of truth for reasoning removal -
+    used by _prep_messages and exposed for tests / backward compatibility.
+    """
+    out = []
+    for m in messages:
+        if m.get("role") == "assistant" and ("reasoning" in m or "reasoning_content" in m):
+            m = {k: v for k, v in m.items() if k not in ("reasoning", "reasoning_content")}
+        out.append(dict(m))
+    return out
+
+
 def _prep_messages(raw: list) -> list:
     out = []
-    for m in raw:
-        if m.get("role") == "assistant" and "reasoning_content" in m:
-            m = {k: v for k, v in m.items() if k != "reasoning_content"}
-        else:
-            m = dict(m)
+    for m in strip_reasoning(raw):
         if m.get("content") is None:
             m["content"] = ""
         tc = m.get("tool_calls")
@@ -1555,12 +1617,26 @@ def _make_pinned_copy(m: dict, distance: int = 0) -> dict:
     """Deterministic pinned copy of a user message. Keeps the first 300 chars
     verbatim (so _msg_anchor, which hashes content[:300], matches the raw message
     and the 'newest user missing' check passes) and caps the total with a
-    truncation marker. Distance-aware: when the message is far before the cut
-    (distance > PINNED_USER_FAR_THRESHOLD), use a tighter cap."""
+    head + middle-marker + tail truncation. Distance-aware: when the message is
+    far before the cut (distance > PINNED_USER_FAR_THRESHOLD), use a tighter cap.
+
+    Adds internal proxy-state markers (ctxgate_pinned, ctxgate_anchor) that are
+    NOT part of the model-visible content text."""
     c = _norm_content(m.get("content"))
     CAP = PINNED_USER_FAR_CHARS if distance > PINNED_USER_FAR_THRESHOLD else PINNED_USER_MAX_CHARS
-    text = c if len(c) <= CAP else c[:CAP] + "\n[...truncated...]"
-    return {"role": "user", "content": text}
+    if len(c) <= CAP:
+        text = c
+    else:
+        # Head + middle-marker + tail: both ends survive so constraints are not lost
+        head_len = 300  # anchor-compatible
+        tail_len = min(CAP - head_len - 50, len(c) - head_len)
+        if tail_len < 0:
+            tail_len = 0
+        marker = "\n[...middle omitted by ctxgate...]\n"
+        text = c[:head_len] + marker + c[len(c) - tail_len:] if tail_len > 0 else c[:head_len] + marker
+    # Internal proxy state (NOT in model-visible content)
+    anchor = hashlib.sha1(c[:300].encode()).hexdigest()
+    return {"role": "user", "content": text, "ctxgate_pinned": True, "ctxgate_anchor": anchor}
 
 def _pinned_user_copy(rest: list, cut: int):
     """Return the pinned copy of the newest user message if it lies before the
@@ -1667,8 +1743,9 @@ def _output_budget(input_tokens: int) -> int:
 def _protected_indices(work: list) -> set:
     """Indices that _emergency_shrink must never drop: the seed (first 3), the
     stub (first system after seed), the pinned newest-user copy (flagged), and
-    the newest 6 messages (rounded up to the nearest tool-group boundary so an
-    assistant with tool_calls and ALL its tool results stay together)."""
+    the canonical protected tool groups (newest 4 tool results + their assistant
+    tool_calls declarations). Uses protected_tool_groups as the single source
+    of truth for recent tool body protection."""
     protected = set(range(min(3, len(work))))
     for i in range(3, len(work)):
         if work[i].get("role") == "system":
@@ -1678,16 +1755,216 @@ def _protected_indices(work: list) -> set:
         if work[i].get("ctxgate_pinned"):
             protected.add(i)
             break
-    # Newest 6 messages, rounded UP to group boundary
-    if len(work) > 3:
-        tail_start = max(3, len(work) - 6)
-        if work[tail_start].get("role") == "tool":
-            while tail_start > 0 and work[tail_start].get("role") == "tool":
-                tail_start -= 1
-            tail_start = max(3, tail_start)
-        for i in range(tail_start, len(work)):
-            protected.add(i)
+    # Canonical: newest 4 tool groups (replaces old "newest 6" ad-hoc logic)
+    protected |= protected_tool_groups(work)
     return protected
+
+
+# --- Canonical helpers (single source of truth, all paths use these) ---
+
+def protected_tool_groups(messages: list) -> set:
+    """Return the set of indices that must NEVER be elided/dropped:
+    the newest 4 tool-result messages AND the assistant message(s) that
+    declare their tool_calls (so the tool-call graph stays valid).
+
+    Walk from the end, count tool messages up to 4, and for each, also
+    include the nearest preceding assistant message that has tool_calls
+    referencing them. This is the SINGLE definition of "recent tool body".
+    """
+    protected = set()
+    tool_count = 0
+    for i in range(len(messages) - 1, -1, -1):
+        if tool_count >= 4:
+            break
+        m = messages[i]
+        if m.get("role") == "tool":
+            protected.add(i)
+            tool_count += 1
+            # Find the nearest preceding assistant message with tool_calls
+            for j in range(i - 1, -1, -1):
+                if messages[j].get("role") == "assistant":
+                    if messages[j].get("tool_calls"):
+                        protected.add(j)
+                    break
+    return protected
+
+def ctxgate_meta(truncated: bool, reason: str, continuations_used: int,
+                total_output_tokens: int, tool_calls_complete: bool,
+                tool_calls_emitted: int, tool_call_truncated: bool = False) -> dict:
+    """Build the structured ctxgate metadata dict for SSE final chunks."""
+    meta = {
+        "ctxgate": {
+            "truncated": truncated,
+            "reason": reason,
+            "continuations_used": continuations_used,
+            "total_output_tokens": total_output_tokens,
+            "tool_calls_complete": tool_calls_complete,
+            "tool_calls_emitted": tool_calls_emitted,
+        }
+    }
+    if tool_call_truncated:
+        meta["ctxgate"]["tool_call_truncated"] = True
+    return meta
+
+class ToolCallAccumulator:
+    """Tracks per-tool-call streaming deltas and validates completeness.
+
+    A tool-call set is EXECUTABLE only when every emitted call is complete
+    AND its arguments are valid JSON.
+    """
+    def __init__(self):
+        self._calls = {}  # index -> {id, name, arguments}
+
+    def add_delta(self, tool_calls_piece: list):
+        """Merge streaming deltas by index."""
+        if not tool_calls_piece:
+            return
+        for piece in tool_calls_piece:
+            if not isinstance(piece, dict):
+                continue
+            idx = piece.get("index", 0)
+            if idx not in self._calls:
+                self._calls[idx] = {"id": "", "name": "", "arguments": ""}
+            call = self._calls[idx]
+            if piece.get("id"):
+                call["id"] = piece["id"]
+            fn = piece.get("function") or {}
+            if fn.get("name"):
+                call["name"] += fn["name"]
+            if fn.get("arguments"):
+                call["arguments"] += fn["arguments"]
+
+    def is_complete(self) -> bool:
+        """Every seen call has a non-empty name and its arguments parse as valid JSON."""
+        if not self._calls:
+            return False
+        for call in self._calls.values():
+            if not call["name"]:
+                return False
+            if not call["arguments"]:
+                return False
+            try:
+                json.loads(call["arguments"])
+            except (json.JSONDecodeError, ValueError):
+                return False
+        return True
+
+    def is_valid(self) -> bool:
+        """Alias for is_complete (every call is structurally valid)."""
+        return self.is_complete()
+
+    def to_tool_calls(self) -> list:
+        """The complete OpenAI-format list of tool calls."""
+        result = []
+        for idx in sorted(self._calls.keys()):
+            call = self._calls[idx]
+            result.append({
+                "id": call["id"] or f"call_{idx}",
+                "type": "function",
+                "function": {
+                    "name": call["name"],
+                    "arguments": call["arguments"],
+                },
+            })
+        return result
+
+    def count(self) -> int:
+        return len(self._calls)
+
+def verify_context_invariants(context: list, original: list, ceiling: int) -> list:
+    """Return a list of violation strings (empty = OK).
+
+    Checks:
+    (1) newest live user message is represented
+    (2) pinned copy exists when the newest user msg was cut from the window
+    (3) newest 4 tool bodies are byte-identical to original
+    (4) no orphan tool result
+    (5) no assistant tool_calls declaration left without its required tool results
+    (6) total tokens <= ceiling
+    """
+    violations = []
+
+    # (1) & (2) newest user message
+    orig_newest_user = None
+    for i in range(len(original) - 1, -1, -1):
+        if original[i].get("role") == "user":
+            orig_newest_user = i
+            break
+    if orig_newest_user is not None:
+        orig_user_content = _norm_content(original[orig_newest_user].get("content"))
+        found_in_ctx = False
+        pinned_exists = False
+        for m in context:
+            if m.get("role") == "user":
+                if _norm_content(m.get("content"))[:300] == orig_user_content[:300]:
+                    found_in_ctx = True
+                    break
+            if m.get("ctxgate_pinned"):
+                pinned_exists = True
+        if not found_in_ctx and not pinned_exists:
+            violations.append("newest_user_missing: newest user message not represented in context")
+
+    # (3) newest 4 tool bodies byte-identical
+    prot = protected_tool_groups(original)
+    tool_idx_in_orig = 0
+    for i in range(len(original) - 1, -1, -1):
+        if tool_idx_in_orig >= 4:
+            break
+        if original[i].get("role") == "tool" and i in prot:
+            orig_content = _norm_content(original[i].get("content"))
+            tcid = original[i].get("tool_call_id", "")
+            matched = False
+            for m in context:
+                if m.get("role") == "tool" and m.get("tool_call_id") == tcid:
+                    if _norm_content(m.get("content")) != orig_content:
+                        violations.append(f"tool_body_modified: tool msg at orig[{i}] (id={tcid}) content differs")
+                    matched = True
+                    break
+            if not matched:
+                violations.append(f"tool_body_missing: tool msg at orig[{i}] (id={tcid}) not in context")
+            tool_idx_in_orig += 1
+
+    # (4) no orphan tool result
+    for i, m in enumerate(context):
+        if m.get("role") == "tool":
+            tcid = m.get("tool_call_id", "")
+            has_parent = False
+            for j in range(i - 1, -1, -1):
+                if context[j].get("role") == "assistant" and context[j].get("tool_calls"):
+                    for tc in context[j]["tool_calls"]:
+                        if tc.get("id") == tcid:
+                            has_parent = True
+                            break
+                if has_parent:
+                    break
+            if not has_parent:
+                violations.append(f"orphan_tool: tool msg at ctx[{i}] (id={tcid}) has no matching assistant tool_call")
+
+    # (5) no assistant tool_calls without required results
+    for i, m in enumerate(context):
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                tcid = tc.get("id", "")
+                orig_had_result = False
+                for om in original:
+                    if om.get("role") == "tool" and om.get("tool_call_id") == tcid:
+                        orig_had_result = True
+                        break
+                if orig_had_result:
+                    ctx_has_result = False
+                    for cm in context[i+1:]:
+                        if cm.get("role") == "tool" and cm.get("tool_call_id") == tcid:
+                            ctx_has_result = True
+                            break
+                    if not ctx_has_result:
+                        violations.append(f"missing_tool_result: assistant at ctx[{i}] declares tool_call {tcid} but result missing")
+
+    # (6) total tokens <= ceiling
+    total = count_messages_tokens(context)
+    if total > ceiling:
+        violations.append(f"over_ceiling: context is {total} tokens > ceiling {ceiling}")
+
+    return violations
 
 def _elided_tool_content(c: str) -> str:
     """The exact step-(a) elision body used by _emergency_shrink (1000 head +
@@ -1722,25 +1999,37 @@ def _stable_elide_idx(cut: int, rest: list) -> int:
     """Absolute index into raw 'rest' marking the elidable boundary:
     the index of the 4th-newest tool-result message (or 'cut', whichever is
     larger). Everything in [cut, idx) is elidable; [idx, end) keeps the
-    newest 4 tool bodies intact (plus any interleaved assistant/user msgs)."""
-    k = 0
-    idx = len(rest)
-    for i in range(len(rest) - 1, -1, -1):
-        if rest[i].get("role") == "tool":
-            k += 1
-            idx = i
-            if k == 4:
-                break
+    newest 4 tool bodies intact (plus any interleaved assistant/user msgs).
+    Uses protected_tool_groups as the canonical definition."""
+    prot = protected_tool_groups(rest)
+    tool_indices = sorted([i for i in prot if rest[i].get("role") == "tool"])
+    if tool_indices:
+        idx = tool_indices[0]  # oldest of the newest-4
+    else:
+        idx = len(rest)
     return max(cut, idx)
+
+class ContextCapacityError(Exception):
+    """Raised when protected material alone exceeds the ceiling."""
+    def __init__(self, message: str, before: int, ceiling: int):
+        super().__init__(message)
+        self.before = before
+        self.ceiling = ceiling
 
 def _emergency_shrink(kept: list, ceiling: int) -> list:
     """Hard invariant: shrink a built window to <= ceiling tokens without breaking
     the tool-call graph. Used by build_context (both paths) and the 400 re-trim.
-      (a) oldest-first, elide large tool bodies (>2500 chars) to head+tail;
-      (b) if still over, drop oldest whole assistant+tool-result groups (never an
-          orphan tool, never a tool_call without results, never seed/stub/pinned);
-      (c) if STILL over (pathological single huge message), hard-truncate it.
-    Returns the (possibly new) list; never mutates the caller's list."""
+
+    Canonical order:
+      1. preserve seed
+      2. preserve pinned newest-user copy
+      3. preserve newest-4 tool groups (via protected_tool_groups)
+      4. elide OLDER tool bodies only (skip protected)
+      5. drop oldest complete assistant/user/tool groups
+      6. if STILL over because PROTECTED material exceeds ceiling ->
+         raise ContextCapacityError (caller turns into 413)
+
+    Returns the (possibly new) list; never mutates the caller list."""
     before = count_messages_tokens(kept)
     if before <= ceiling:
         return kept
@@ -1749,19 +2038,20 @@ def _emergency_shrink(kept: list, ceiling: int) -> list:
     protected = _protected_indices(work)
     def _tok():
         return count_messages_tokens(work)
-    # (a) elide large tool bodies, oldest-first
+    # (4) elide large tool bodies, oldest-first, SKIP protected
     for i in range(len(work)):
         if _tok() <= ceiling:
             break
+        if i in protected:
+            continue
         m = work[i]
         if m.get("role") != "tool":
             continue
         c = m.get("content")
         if not isinstance(c, str) or len(c) <= 2500:
             continue
-        elided = len(c) - 2000
-        work[i]["content"] = c[:1000] + "\n[...%d chars elided by ctxgate...]\n" % elided + c[-1000:]
-    # (b) drop oldest whole groups while still over
+        work[i]["content"] = _elided_tool_content(c)
+    # (5) drop oldest whole groups while still over
     dropped_groups = 0
     while _tok() > ceiling:
         start = None
@@ -1784,12 +2074,14 @@ def _emergency_shrink(kept: list, ceiling: int) -> list:
         del work[start:end + 1]
         dropped_groups += 1
     metrics["emergency_shrink_groups_dropped"] += dropped_groups
-    # (c) pathological: a single huge message still over -> hard-truncate it
+    # (6) if STILL over: protected material alone exceeds ceiling
     if _tok() > ceiling:
-        log.error("EMERGENCY SHRINK pathological: still over after elide+drop (before=%d now=%d ceiling=%d) - hard-truncating largest message", before, _tok(), ceiling)
-        biggest = max(range(len(work)), key=lambda i: len(_norm_content(work[i].get("content"))))
-        c = _norm_content(work[biggest].get("content"))
-        work[biggest]["content"] = c[:1000] + "\n[...truncated by ctxgate...]"
+        after = _tok()
+        log.error("EMERGENCY SHRINK: protected material exceeds ceiling (before=%d now=%d ceiling=%d)", before, after, ceiling)
+        raise ContextCapacityError(
+            f"Protected current-turn data alone exceeds the safe budget "
+            f"({after} tokens > ceiling {ceiling}). Reduce input or increase CTXGATE_MAX_CONTEXT.",
+            before, ceiling)
     after = _tok()
     log.warning("EMERGENCY SHRINK: before=%d after=%d ceiling=%d groups_dropped=%d", before, after, ceiling, dropped_groups)
     return work
@@ -1911,6 +2203,15 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
             elif kept_tok <= MAX_INPUT:
                 metrics["trim_sticky_reuse"] += 1
                 log.info("Context sticky-reuse: session=%s cut=%d kept_tokens=%d skipped=%d", sk, ws["cut"], kept_tok, ws["cut"])
+                # Verify context invariants (diagnostic + metrics)
+                _viols = verify_context_invariants(kept, raw, ceiling)
+                if _viols:
+                    for _v in _viols:
+                        if _v.startswith("tool_body"):
+                            metrics["recent_tool_preservation_failures"] += 1
+                        elif _v.startswith("newest_user") or _v.startswith("pinned"):
+                            metrics["pinned_user_preservation_failures"] += 1
+                    log.warning("Context invariant violations (fast path): %s", _viols[:3])
                 if task_uuid and ws["summarized_through"] < ws.get("dropped_total", ws["cut"]) and not ws.get("in_flight", False):
                     la = _summary_last_attempt.get(task_uuid)
                     if la is None or (time.time() - la[0]) > 120:
@@ -1970,10 +2271,23 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
         kept_tok = count_messages_tokens(kept)
         ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
         if kept_tok > ceiling:
-            kept = _emergency_shrink(kept, ceiling)
+            try:
+                kept = _emergency_shrink(kept, ceiling)
+            except ContextCapacityError as cce:
+                log.error("Context capacity exceeded in build_context: %s", cce)
+                raise cce
             kept_tok = count_messages_tokens(kept)
         if kept_tok > ceiling:
             log.error("EMERGENCY SHRINK failed to meet ceiling: kept_tok=%d ceiling=%d (pathological single huge message)", kept_tok, ceiling)
+        # Verify context invariants (diagnostic + metrics)
+        _viols = verify_context_invariants(kept, raw, ceiling)
+        if _viols:
+            for _v in _viols:
+                if _v.startswith("tool_body"):
+                    metrics["recent_tool_preservation_failures"] += 1
+                elif _v.startswith("newest_user") or _v.startswith("pinned"):
+                    metrics["pinned_user_preservation_failures"] += 1
+            log.warning("Context invariant violations (slow path): %s", _viols[:3])
         headroom = ceiling - kept_tok
         log.info("Context over limit: %d > %d, re-cut to low-watermark %d (%.0f%%)", total, MAX_INPUT, target, 100.0 * target / MAX_INPUT)
         log.info("After trim: %d msgs, %d tokens (headroom %d ceiling %d)", len(kept), kept_tok, headroom, ceiling)
@@ -2915,7 +3229,12 @@ async def chat_completions(request: Request):
             pass
 
         _t0 = time.monotonic()
-        built = await build_context(messages, task_uuid=task_uuid, session_key=session_key)
+        try:
+            built = await build_context(messages, task_uuid=task_uuid, session_key=session_key)
+        except ContextCapacityError as cce:
+            metrics["requests_error"] += 1
+            log.error("Context capacity: %s", cce)
+            return JSONResponse({"error": {"message": str(cce), "explanation": "Protected current-turn data exceeds the safe context budget. Reduce input size or increase CTXGATE_MAX_CONTEXT."}, "ctxgate": ctxgate_meta(True, "context_capacity", 0, 0, False, 0)["ctxgate"]}, status_code=413)
         _dt = (time.monotonic() - _t0) * 1000
         if _dt > 50:
             log.warning("SLOW: build_context %.0fms (msgs=%d)", _dt, len(messages))
@@ -3324,7 +3643,20 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
         return JSONResponse({"error": {"message": "vLLM is not available (health check failed). Start vLLM and retry."}}, status_code=503)
     try:
         client = _vllm_client
+        # --- Total output budget tracking ---
+        total_output_tokens = 0
+        cont_count = 0
+        exit_reason = "ok"
         _attempts = 0
+        # --- Initial request with budget guard ---
+        remaining = CTXGATE_MAX_TOTAL_OUTPUT
+        _budget = _output_budget(input_tokens)
+        max_tokens = min(_budget, MAX_OUTPUT, remaining)
+        if max_tokens < MIN_OUTPUT:
+            log.info("Non-stream: output budget %d < MIN_OUTPUT %d - stopping", max_tokens, MIN_OUTPUT)
+            return JSONResponse({"error": {"message": "Output budget exhausted", "explanation": explain_status("budget")}}, status_code=413)
+        vllm_body["max_tokens"] = max_tokens
+        metrics["output_max_tokens_seen"] = max(metrics["output_max_tokens_seen"], max_tokens)
         while True:
             _attempts += 1
             _t0 = time.monotonic()
@@ -3339,10 +3671,6 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                 continue
             break
         if resp.status_code != 200:
-            # BUG 4 fix: on 400 (context too long / non-positive max_tokens), re-shrink
-            # more aggressively and retry once. Detection is broadened so vLLM's
-            # "max_tokens must be greater than" error (which lacks the word "context")
-            # is also caught.
             _et = resp.text.lower()
             _is_ctx400 = resp.status_code == 400 and any(
                 p in _et for p in ("context", "max_tokens", "max_completion_tokens", "maximum", "greater than"))
@@ -3351,7 +3679,9 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                 reduced_limit = int(input_tokens * 0.8)
                 vllm_body["messages"] = _emergency_shrink(vllm_body["messages"], reduced_limit)
                 new_input_tokens = count_messages_tokens(vllm_body["messages"])
-                vllm_body["max_tokens"] = _output_budget(new_input_tokens)
+                _budget = _output_budget(new_input_tokens)
+                max_tokens = min(_budget, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT)
+                vllm_body["max_tokens"] = max_tokens
                 input_tokens = new_input_tokens
                 resp = await client.post(VLLM_URL + "/chat/completions", json=vllm_body)
                 if resp.status_code != 200:
@@ -3368,30 +3698,48 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
         if not isinstance(data.get("usage"), dict):
             data["usage"] = {}
         choices = data.get("choices", [])
+        # --- Tool call sanitization ---
         for choice in choices:
             msg = choice.get("message", {})
             if msg.get("tool_calls"):
                 cleaned, stripped = sanitize_tool_calls(msg)
                 if stripped:
                     metrics["toolcall_strips"] += 1
+                    metrics["tool_call_suppressed"] += 1
                     choice["message"]["tool_calls"] = None
                     choice["finish_reason"] = "stop"
         output_tokens = data.get("usage", {}).get("completion_tokens", 0)
-        # Auto-continuation: if vLLM hit max_tokens, keep going
+        total_output_tokens += output_tokens
+        # --- Auto-continuation with total output budget ---
         ns_wall_start = time.time()
-        cont_count = 0
         while choices and choices[0].get("finish_reason") == "length" and cont_count < MAX_CONTINUATIONS:
             if time.time() - ns_wall_start > WALL_CLOCK_MAX:
                 log.warning("Wall clock %ds exceeded - stopping non-stream", WALL_CLOCK_MAX)
+                exit_reason = "wall_clock"
+                break
+            # Check total output budget
+            remaining = CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens
+            if remaining < CTXGATE_MIN_CONTINUATION_OUTPUT:
+                log.info("Non-stream: total output budget exhausted (%d/%d) - stopping", total_output_tokens, CTXGATE_MAX_TOTAL_OUTPUT)
+                exit_reason = "total_output_budget"
+                metrics["output_total_budget_exhausted"] += 1
                 break
             cont_count += 1
-            log.info("Non-stream: auto-continuing (%d/%d)", cont_count, MAX_CONTINUATIONS)
+            metrics["output_continuations_total"] += 1
+            log.info("Non-stream: auto-continuing (%d/%d, remaining=%d)", cont_count, MAX_CONTINUATIONS, remaining)
             msg_c = choices[0].get("message", {})
+            # --- Continuation state machine ---
+            has_tool_calls = bool(msg_c.get("tool_calls"))
+            if has_tool_calls:
+                # Complete tool-call set -> terminate, no continuation
+                exit_reason = "tool_calls_complete"
+                break
             trunc_type = _classify_truncation("length", msg_c.get("content",""), msg_c.get("reasoning_content",""), msg_c.get("tool_calls"))
             if trunc_type == "reasoning_overflow":
                 cb = dict(vllm_body)
                 cb["chat_template_kwargs"] = {"enable_thinking": False}
-                cb["max_tokens"] = _output_budget(count_messages_tokens(vllm_body.get("messages", [])))
+                _cb_budget = _output_budget(count_messages_tokens(vllm_body.get("messages", [])))
+                cb["max_tokens"] = min(_cb_budget, MAX_OUTPUT, remaining)
                 r2 = await client.post(VLLM_URL + "/chat/completions", json=cb)
                 if r2.status_code == 200:
                     d2 = r2.json()
@@ -3399,23 +3747,29 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                     if nc and nc[0].get("message",{}).get("content"):
                         choices[0]["message"]["content"] = (msg_c.get("content","") or "") + nc[0]["message"]["content"]
                         choices[0]["finish_reason"] = nc[0].get("finish_reason", "stop")
-                        output_tokens += d2.get("usage",{}).get("completion_tokens",0)
+                        _r2_tokens = d2.get("usage",{}).get("completion_tokens",0)
+                        output_tokens += _r2_tokens
+                        total_output_tokens += _r2_tokens
+                exit_reason = "reasoning_overflow"
                 break
+            # Pure text continuation
             partial = choices[0].get("message", {}).get("content") or ""
             cont_msgs = list(vllm_body.get("messages", []))
             cont_msgs.append({"role": "assistant", "content": partial})
             cont_msgs.append({"role": "user", "content": "Continue from exactly where you left off. Do not repeat any content already provided. Resume the next word/sentence/code line."})
-            # Re-trim: messages grew with assistant response
             cont_tokens = count_messages_tokens(cont_msgs)
             _cont_budget = _output_budget(cont_tokens)
-            if cont_tokens > MAX_INPUT or _cont_budget < MIN_OUTPUT:
-                log.info("Non-stream cont: would exceed input budget (%d > %d) or starve output (%d < %d) - stopping", cont_tokens, MAX_INPUT, _cont_budget, MIN_OUTPUT)
+            max_tokens = min(_cont_budget, MAX_OUTPUT, remaining)
+            if cont_tokens > MAX_INPUT or max_tokens < CTXGATE_MIN_CONTINUATION_OUTPUT:
+                log.info("Non-stream cont: would exceed input budget or starve output - stopping")
+                exit_reason = "continuation_budget"
                 break
             cont_body = dict(vllm_body)
             cont_body["messages"] = cont_msgs
-            cont_body["max_tokens"] = _cont_budget
+            cont_body["max_tokens"] = max_tokens
             resp = await client.post(VLLM_URL + "/chat/completions", json=cont_body)
             if resp.status_code != 200:
+                exit_reason = "continuation_error"
                 break
             data = resp.json()
             choices = data.get("choices", [])
@@ -3423,11 +3777,36 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                 new_c = choices[0].get("message", {}).get("content", "")
                 if new_c:
                     choices[0]["message"]["content"] = partial + new_c
-                output_tokens += data.get("usage", {}).get("completion_tokens", 0)
+                _cont_tokens = data.get("usage", {}).get("completion_tokens", 0)
+                output_tokens += _cont_tokens
+                total_output_tokens += _cont_tokens
+        # --- Finalize: add ctxgate meta ---
+        truncated = exit_reason != "ok"
+        tool_calls_complete = False
+        tool_calls_emitted = 0
         for choice in choices:
             if choice.get("finish_reason") == "length" and choice.get("message", {}).get("content"):
                 choice["message"]["content"] = _safe_truncate(choice["message"]["content"])
-                choice["finish_reason"] = "stop"
+                choice["finish_reason"] = "length"
+            if choice.get("message", {}).get("tool_calls"):
+                tool_calls_complete = True
+                tool_calls_emitted = len(choice["message"]["tool_calls"])
+        if tool_calls_complete:
+            metrics["tool_call_complete"] += 1
+        if truncated:
+            metrics["output_truncated_total"] += 1
+            _reason_key = exit_reason if exit_reason in metrics.get("output_truncated_by_reason", {}) else exit_reason
+            if _reason_key not in metrics["output_truncated_by_reason"]:
+                metrics["output_truncated_by_reason"][_reason_key] = 0
+            metrics["output_truncated_by_reason"][_reason_key] += 1
+        data["ctxgate"] = ctxgate_meta(
+            truncated=truncated,
+            reason=exit_reason,
+            continuations_used=cont_count,
+            total_output_tokens=total_output_tokens,
+            tool_calls_complete=tool_calls_complete,
+            tool_calls_emitted=tool_calls_emitted,
+        )["ctxgate"]
         metrics["tokens_out_total"] += output_tokens
         metrics["requests_ok"] += 1
         _ns_cached = data.get("usage", {}).get("prompt_tokens_details", {}).get("cached_tokens", 0)
@@ -3438,22 +3817,27 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
         data["usage"]["completion_tokens"] = output_tokens
         data["usage"]["total_tokens"] = input_tokens + output_tokens
         data["usage"]["prompt_tokens"] = input_tokens
-        # Normalize reasoning field: vLLM may use 'reasoning' instead of 'reasoning_content'
         for ch in data.get("choices", []):
             msg = ch.get("message", {})
             if "reasoning" in msg and "reasoning_content" not in msg:
                 msg["reasoning_content"] = msg.pop("reasoning")
+        log.info("NS-DIAG session=%s exit=%s finish=%s truncated=%s conts=%d total_out=%d tc_seen=%d tc_complete=%d tc_emitted=%d",
+                 session_key, exit_reason, choices[0].get("finish_reason","?") if choices else "?",
+                 truncated, cont_count, total_output_tokens, tool_calls_emitted, tool_calls_complete, tool_calls_emitted)
         return JSONResponse(data)
     except httpx.TimeoutException:
         metrics["requests_error"] += 1
         _record_call(session_key, input_tokens, 0, "timeout", VLLM_MODEL, False, "vLLM 300s timeout")
-        return JSONResponse({"error": {"message": "vLLM timeout", "explanation": explain_status("timeout")}}, status_code=504)
+        return JSONResponse({"error": {"message": "vLLM timeout", "explanation": explain_status("timeout")}, "ctxgate": ctxgate_meta(True, "timeout", 0, 0, False, 0)["ctxgate"]}, status_code=504)
+    except ContextCapacityError as e:
+        metrics["requests_error"] += 1
+        log.error("Context capacity error: %s", e)
+        return JSONResponse({"error": {"message": str(e), "explanation": explain_status("context_capacity")}, "ctxgate": ctxgate_meta(True, "context_capacity", 0, 0, False, 0)["ctxgate"]}, status_code=413)
     except Exception as e:
         metrics["requests_error"] += 1
         log.exception("vLLM forward error: %s", e)
         _record_call(session_key, input_tokens, 0, "error", VLLM_MODEL, False, str(e)[:300])
-        return JSONResponse({"error": {"message": str(e), "explanation": explain_status("error", str(e)[:300])}}, status_code=500)
-
+        return JSONResponse({"error": {"message": str(e), "explanation": explain_status("error", str(e)[:300])}, "ctxgate": ctxgate_meta(True, "error", 0, 0, False, 0)["ctxgate"]}, status_code=500)
 def _safe_truncate(text):
     """Truncate at a safe boundary (newline, sentence end, or space)."""
     if not text:
@@ -3487,47 +3871,40 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
     vllm_body["messages"] = _normalize_system_messages(vllm_body.get("messages", []))
     async def generate():
         global metrics
-        # The 400-retry path reassigns input_tokens inside this generator, which makes
-        # it a local to generate(); every read of the enclosing value (usage chunks,
-        # the final usage/_record_call, metrics totals) must see it. nonlocal restores
-        # the binding so the reassignment updates the outer name (no UnboundLocalError).
         nonlocal input_tokens
-        # FIX (output cut-off): the old code held back the last 300 chars of every
-        # response in a buffer ("buf") and only released them on the happy path.
-        # Any upstream error/timeout/early EOF dropped those chars and then sent
-        # [DONE], so Goose showed a response that silently ended mid-word.
-        # Content is now forwarded immediately. The only text ever held back is
+        # Content is forwarded immediately. The only text ever held back is
         # the first SEAM_WINDOW chars of a continuation segment (to trim overlap
         # with what the client already has), and it is flushed on every exit path.
         SEAM_WINDOW = 120
         total_output_tokens = 0
         total_cached_tokens = 0
-        full_content = ""      # exactly what the client has received (content only)
+        full_content = ""
         seam_hold = ""
         seam_active = False
         continuation_count = 0
         current_body = dict(vllm_body)
         finish_reason = "stop"
-        exit_reason = "ok"     # ok | interrupted | wall_clock | max_continuations | cont_budget | loop | loop_recovered | reasoning_overflow
+        exit_reason = "ok"
         stream_id = "gen"
-        reasoning_tail = ""    # last LOOP_TAIL chars of reasoning (loop guard)
-        content_tail = ""      # last LOOP_TAIL chars of content (loop guard)
+        reasoning_tail = ""
+        content_tail = ""
         reasoning_chars = 0
-        loop_check_acc = 0     # chars received since the last loop check (F4)
+        loop_check_acc = 0
         loop_retries = 0
         loop_period = 0
         loop_in_reasoning = False
         loop_in_content = False
         reasoning_overflow = False
         notice = ""
-        seg_tool_calls_seen = False
+        # --- ToolCallAccumulator replaces the old seg_tool_calls_seen boolean ---
+        tc_accum = ToolCallAccumulator()
+        tc_emitted = False  # True once we've forwarded a complete tool-call set
         loop_intentional = False
         shrink_retried = False
         client_temperature = vllm_body.get("temperature")
         sent_temperature = vllm_body.get("temperature")
 
         def _seam_resolve() -> str:
-            """Release held continuation text, trimming overlap with the tail already sent."""
             nonlocal seam_hold, seam_active
             held, seam_hold, seam_active = seam_hold, "", False
             tail = full_content[-100:]
@@ -3541,9 +3918,64 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                 held = held[overlap:]
             return held
 
+        def _flush_seam():
+            nonlocal full_content
+            if seam_hold:
+                out = _seam_resolve()
+                if out:
+                    full_content += out
+                    yield _sse_content(out, stream_id)
+            seam_active = False
+
+        def _emit_ctxgate_final(fr: str, reason: str, conts: int, out_toks: int,
+                                 tc_complete: bool, tc_emitted_n: int, tc_truncated: bool = False):
+            """Build and yield the final ctxgate chunk + [DONE]."""
+            meta = ctxgate_meta(
+                truncated=(reason != "ok"),
+                reason=reason,
+                continuations_used=conts,
+                total_output_tokens=out_toks,
+                tool_calls_complete=tc_complete,
+                tool_calls_emitted=tc_emitted_n,
+                tool_call_truncated=tc_truncated,
+            )
+            final_chunk = {
+                "id": stream_id, "object": "chat.completion.chunk", "created": 0,
+                "model": VLLM_MODEL,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": fr}],
+                "ctxgate": meta["ctxgate"],
+            }
+            if out_toks:
+                final_chunk["usage"] = {
+                    "prompt_tokens": input_tokens,
+                    "completion_tokens": out_toks,
+                    "total_tokens": input_tokens + out_toks,
+                    "prompt_tokens_details": {"cached_tokens": total_cached_tokens},
+                }
+            yield "data: " + json.dumps(final_chunk) + "\n\n"
+            yield "data: [DONE]\n\n"
+
         try:
             client = _vllm_client
             wall_start = time.time()
+            # --- Initial request with total output budget guard ---
+            remaining = CTXGATE_MAX_TOTAL_OUTPUT
+            _budget = _output_budget(input_tokens)
+            max_tokens = min(_budget, MAX_OUTPUT, remaining)
+            if max_tokens < MIN_OUTPUT:
+                log.info("Stream: initial output budget %d < MIN_OUTPUT %d - stopping", max_tokens, MIN_OUTPUT)
+                exit_reason = "total_output_budget"
+                metrics["output_total_budget_exhausted"] += 1
+                for x in _flush_seam():
+                    yield x
+                for _cg in _emit_ctxgate_final("length", exit_reason, 0, total_output_tokens, False, 0):
+                    yield _cg
+                metrics["requests_error"] += 1
+                _record_call(session_key, input_tokens, 0, "budget", VLLM_MODEL, True, "initial budget exhausted")
+                return
+            current_body["max_tokens"] = max_tokens
+            metrics["output_max_tokens_seen"] = max(metrics["output_max_tokens_seen"], max_tokens)
+
             while True:
                 if time.time() - wall_start > WALL_CLOCK_MAX:
                     log.warning("Wall clock %ds exceeded - stopping stream", WALL_CLOCK_MAX)
@@ -3553,18 +3985,36 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                 got_finish = False
                 got_done = False
                 seg_output_tokens = 0
-                seg_tool_calls = False
                 interrupted = None
                 loop_intentional = False
-                _check_vllm_breaker()  # fail-fast if breaker is open
+                _check_vllm_breaker()
                 try:
                     async with client.stream("POST", VLLM_URL + "/chat/completions", json=current_body) as resp:
                         if resp.status_code != 200:
                             body_bytes = await resp.aread()
+                            _et = body_bytes[:500].decode("utf-8", errors="replace").lower()
+                            if (resp.status_code == 400 and not shrink_retried
+                                    and any(p in _et for p in ("context", "max_tokens", "max_completion_tokens", "maximum", "greater than"))):
+                                shrink_retried = True
+                                log.warning("Stream 400 (context/max_tokens) - re-shrinking and retrying: %s", _et[:200])
+                                try:
+                                    current_body["messages"] = _emergency_shrink(current_body["messages"], int(input_tokens * 0.8))
+                                except ContextCapacityError as cce:
+                                    for x in _flush_seam():
+                                        yield x
+                                    for _cg in _emit_ctxgate_final("length", "context_capacity", continuation_count, total_output_tokens, False, 0):
+                                        yield _cg
+                                    metrics["requests_error"] += 1
+                                    _record_call(session_key, input_tokens, total_output_tokens, "context_capacity", VLLM_MODEL, True, str(cce)[:200])
+                                    return
+                                input_tokens = count_messages_tokens(current_body["messages"])
+                                _b2 = _output_budget(input_tokens)
+                                current_body["max_tokens"] = min(_b2, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens)
+                                continue
                             metrics["requests_error"] += 1
                             _record_call(session_key, input_tokens, total_output_tokens, "vllm_" + str(resp.status_code), VLLM_MODEL, True, body_bytes[:300].decode("utf-8", errors="replace"))
-                            if seam_hold:
-                                yield _sse_content(seam_hold, stream_id)
+                            for x in _flush_seam():
+                                yield x
                             yield "data: " + json.dumps({"error": body_bytes[:200].decode("utf-8", errors="replace")}) + "\n\n"
                             yield "data: [DONE]\n\n"
                             return
@@ -3601,11 +4051,9 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                     reasoning_chars += len(reasoning_piece)
                                     reasoning_tail = (reasoning_tail + reasoning_piece)[-LOOP_TAIL:]
                                     loop_check_acc += len(reasoning_piece)
+                                # --- ToolCallAccumulator: buffer deltas, only forward when complete ---
                                 if tool_calls_piece:
-                                    seg_tool_calls = True
-                                    seg_tool_calls_seen = True
-                                    tc2 = {"id": stream_id, "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"tool_calls": tool_calls_piece}, "finish_reason": None}]}
-                                    yield "data: " + json.dumps(tc2) + "\n\n"
+                                    tc_accum.add_delta(tool_calls_piece)
                                 content_piece = delta.get("content", "")
                                 if content_piece:
                                     if seam_active:
@@ -3637,7 +4085,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                             log.warning("Loop in content (period=%d chars=%d) - stopping stream", lp, len(full_content))
                                             loop_intentional = True
                                             break
-                                if not loop_period and reasoning_chars > MAX_REASONING_TOKENS * 3 and not full_content and not seg_tool_calls_seen:
+                                if not loop_period and reasoning_chars > MAX_REASONING_TOKENS * 3 and not full_content and not tc_accum.count():
                                     loop_in_reasoning = True
                                     reasoning_overflow = True
                                     log.warning("Reasoning budget backstop (chars=%d > %d) with no content - treating as loop", reasoning_chars, MAX_REASONING_TOKENS * 3)
@@ -3646,47 +4094,43 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                             except (json.JSONDecodeError, ValueError):
                                 yield "data: " + data_str + "\n\n"
                 except httpx.TransportError as e:
-                    # ReadTimeout / ReadError / RemoteProtocolError / ConnectError ...
                     interrupted = "%s: %s" % (type(e).__name__, str(e)[:150])
-                    _vllm_breaker.record_failure()  # ConnectError/ReadTimeout/etc
+                    _vllm_breaker.record_failure()
 
-                # Release any text still held for seam trimming (segment ended).
-                if seam_hold:
-                    out = _seam_resolve()
-                    if out:
-                        full_content += out
-                        yield _sse_content(out, stream_id)
-                seam_active = False
+                # Release any text still held for seam trimming
+                for x in _flush_seam():
+                    yield x
 
-                # vLLM closing the stream with neither finish_reason nor [DONE] is a
-                # cut-off, not a clean stop (old code defaulted this to "stop").
                 if interrupted is None and not got_finish and not got_done and not loop_intentional:
                     interrupted = "upstream closed the stream early"
 
                 total_output_tokens += seg_output_tokens
+                _vllm_breaker.record_success()
 
-                _vllm_breaker.record_success()  # stream completed (no TransportError)
+                # --- Tool call completeness check ---
+                tc_complete = tc_accum.is_complete() if tc_accum.count() > 0 else False
+                tc_incomplete = tc_accum.count() > 0 and not tc_complete
+
                 if interrupted and not loop_intentional:
                     log.warning("Stream interrupted after %d chars: %s", len(full_content), interrupted)
-                    if seg_tool_calls or not full_content or continuation_count >= MAX_CONTINUATIONS:
+                    if tc_incomplete or not full_content or continuation_count >= MAX_CONTINUATIONS:
                         exit_reason = "interrupted"
-                        finish_reason = "stop"
+                        finish_reason = "length"
                         break
-                    finish_reason = "length"   # resume via the continuation path below
+                    finish_reason = "length"
                     await asyncio.sleep(min(2 * (continuation_count + 1), 5))
 
-                if finish_reason == "length" and not full_content and not seg_tool_calls_seen:
-                    # reasoning_overflow: length stop with empty content. Use the
-                    # non-thinking retry (counts as the 1 loop retry) instead of the
-                    # old "(in progress)" continuation, which kept thinking ON and
-                    # could loop again.
+                # --- Reasoning overflow: length stop with empty content ---
+                if finish_reason == "length" and not full_content and not tc_accum.count():
                     if loop_retries < LOOP_RETRIES:
                         loop_retries += 1
                         exit_reason = "reasoning_overflow"
+                        metrics["summary_retry_count"] += 1
                         log.info("reasoning_overflow (length, empty content) - non-thinking retry (%d/%d)", loop_retries, LOOP_RETRIES)
                         current_body = dict(vllm_body)
                         current_body["messages"] = list(vllm_body.get("messages", []))
-                        current_body["max_tokens"] = _output_budget(count_messages_tokens(vllm_body.get("messages", [])))
+                        _rb = _output_budget(count_messages_tokens(vllm_body.get("messages", [])))
+                        current_body["max_tokens"] = min(_rb, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens)
                         current_body["chat_template_kwargs"] = {"enable_thinking": False}
                         current_body["temperature"] = RETRY_TEMPERATURE
                         current_body["top_p"] = RETRY_TOP_P
@@ -3702,45 +4146,74 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                         loop_in_reasoning = False
                         loop_in_content = False
                         reasoning_overflow = False
-                        seg_tool_calls_seen = False
+                        tc_accum = ToolCallAccumulator()
                         seam_active = False
                         seam_hold = ""
                         continue
                     else:
                         log.warning("reasoning_overflow but no retries left - stopping")
                         exit_reason = "reasoning_overflow"
-                        finish_reason = "stop"
+                        finish_reason = "length"
                         break
+
+                # --- Continuation state machine ---
                 if finish_reason == "length" and continuation_count < MAX_CONTINUATIONS:
+                    # Incomplete tool call -> NO continuation
+                    if tc_incomplete:
+                        log.warning("Incomplete tool call set - NO continuation (truncated)")
+                        exit_reason = "tool_call_truncated"
+                        metrics["tool_call_truncated"] += 1
+                        finish_reason = "length"
+                        break
+                    # Complete tool call set -> terminate, no continuation
+                    if tc_complete:
+                        log.info("Complete tool-call set - terminating turn (no continuation)")
+                        tc_emitted = True
+                        metrics["tool_call_complete"] += 1
+                        # Emit the complete tool-call set
+                        tcs = tc_accum.to_tool_calls()
+                        tc_final = {"id": stream_id, "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"tool_calls": tcs}, "finish_reason": "tool_calls"}]}
+                        yield "data: " + json.dumps(tc_final) + "\n\n"
+                        finish_reason = "tool_calls"
+                        exit_reason = "tool_calls_complete"
+                        break
+                    # Pure text continuation
+                    remaining = CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens
+                    if remaining < CTXGATE_MIN_CONTINUATION_OUTPUT:
+                        log.info("Stream: total output budget exhausted (%d/%d) - stopping", total_output_tokens, CTXGATE_MAX_TOTAL_OUTPUT)
+                        exit_reason = "total_output_budget"
+                        metrics["output_total_budget_exhausted"] += 1
+                        finish_reason = "length"
+                        break
                     continuation_count += 1
-                    log.info("vLLM hit max_tokens(%d) or was interrupted - auto-continuing (%d/%d)", MAX_OUTPUT, continuation_count, MAX_CONTINUATIONS)
+                    metrics["output_continuations_total"] += 1
+                    log.info("vLLM hit max_tokens - auto-continuing (%d/%d, remaining=%d)", continuation_count, MAX_CONTINUATIONS, remaining)
                     cont_messages = list(vllm_body.get("messages", []))
                     cont_messages.append({"role": "assistant", "content": full_content})
-                    cont_messages.append({"role": "user", "content": "Your response was cut off. Continue writing from where it stopped. Do not repeat content. Resume the next word, sentence, or code line."})
+                    cont_messages.append({"role": "user", "content": "Continue from exactly where you left off. Do not repeat any content already provided. Resume the next word/sentence/code line."})
                     cont_tokens = count_messages_tokens(cont_messages)
                     _cont_budget = _output_budget(cont_tokens)
-                    if cont_tokens > MAX_INPUT or _cont_budget < MIN_OUTPUT:
-                        log.info("Stream cont: would exceed input budget (%d > %d) or starve output (%d < %d) - stopping", cont_tokens, MAX_INPUT, _cont_budget, MIN_OUTPUT)
+                    max_tokens = min(_cont_budget, MAX_OUTPUT, remaining)
+                    if cont_tokens > MAX_INPUT or max_tokens < CTXGATE_MIN_CONTINUATION_OUTPUT:
+                        log.info("Stream cont: would exceed input budget (%d > %d) or starve output (%d < %d) - stopping", cont_tokens, MAX_INPUT, max_tokens, CTXGATE_MIN_CONTINUATION_OUTPUT)
                         exit_reason = "cont_budget"
-                        finish_reason = "stop"
+                        finish_reason = "length"
                         break
                     current_body = dict(vllm_body)
                     current_body["messages"] = cont_messages
-                    current_body["max_tokens"] = _cont_budget
+                    current_body["max_tokens"] = max_tokens
+                    metrics["output_max_tokens_seen"] = max(metrics["output_max_tokens_seen"], max_tokens)
                     seam_active = bool(full_content)
                     seam_hold = ""
                     continue
                 elif finish_reason == "length":
                     log.warning("Max continuations (%d) reached - stopping", MAX_CONTINUATIONS)
                     exit_reason = "max_continuations"
-                    finish_reason = "stop"
+                    finish_reason = "length"
                 break
 
-            # Empty-response recovery: the model streamed a lot of reasoning and
-            # then ended with finish_reason="stop", no content and no tool calls.
-            # This is functionally the same failure as reasoning_overflow and
-            # must go through the same non-thinking retry.
-            if (not notice and not full_content and not seg_tool_calls_seen
+            # Empty-response recovery
+            if (not notice and not full_content and not tc_accum.count()
                     and finish_reason == "stop" and reasoning_chars > 500
                     and loop_retries < LOOP_RETRIES):
                 log.warning(
@@ -3750,16 +4223,15 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                 )
                 reasoning_overflow = True
 
-            # Loop recovery: a loop in reasoning (or the budget backstop) gets one
-            # non-thinking retry of the ORIGINAL messages (no reasoning_content from
-            # the looped attempt). A loop in content is NOT retried (the client
-            # already saw it) - just stop.
+            # Loop recovery
             if (loop_in_reasoning or reasoning_overflow) and loop_retries < LOOP_RETRIES:
                 loop_retries += 1
+                metrics["summary_retry_count"] += 1
                 log.info("Loop in reasoning - non-thinking retry (%d/%d)", loop_retries, LOOP_RETRIES)
                 current_body = dict(vllm_body)
                 current_body["messages"] = list(vllm_body.get("messages", []))
-                current_body["max_tokens"] = _output_budget(count_messages_tokens(vllm_body.get("messages", [])))
+                _rb2 = _output_budget(count_messages_tokens(vllm_body.get("messages", [])))
+                current_body["max_tokens"] = min(_rb2, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens)
                 current_body["chat_template_kwargs"] = {"enable_thinking": False}
                 current_body["temperature"] = RETRY_TEMPERATURE
                 current_body["top_p"] = RETRY_TOP_P
@@ -3775,7 +4247,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                 loop_in_reasoning = False
                 loop_in_content = False
                 reasoning_overflow = False
-                seg_tool_calls_seen = False
+                tc_accum = ToolCallAccumulator()
                 seam_active = False
                 seam_hold = ""
                 wall_start = time.time()
@@ -3794,22 +4266,29 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                         async with client.stream("POST", VLLM_URL + "/chat/completions", json=current_body) as resp:
                             if resp.status_code != 200:
                                 body_bytes = await resp.aread()
-                                # 400 recovery: on a context/max_tokens error, shrink the
-                                # window and retry ONCE (shrink_retried guards against loops);
-                                # only then emit the error as SSE.
                                 _et = body_bytes[:500].decode("utf-8", errors="replace").lower()
                                 if (resp.status_code == 400 and not shrink_retried
                                         and any(p in _et for p in ("context", "max_tokens", "max_completion_tokens", "maximum", "greater than"))):
                                     shrink_retried = True
-                                    log.warning("Stream 400 (context/max_tokens) - re-shrinking and retrying: %s", _et[:200])
-                                    current_body["messages"] = _emergency_shrink(current_body["messages"], int(input_tokens * 0.8))
+                                    log.warning("Stream 400 retry (context/max_tokens) - re-shrinking: %s", _et[:200])
+                                    try:
+                                        current_body["messages"] = _emergency_shrink(current_body["messages"], int(input_tokens * 0.8))
+                                    except ContextCapacityError as cce:
+                                        for x in _flush_seam():
+                                            yield x
+                                        for _cg in _emit_ctxgate_final("length", "context_capacity", continuation_count, total_output_tokens, False, 0):
+                                            yield _cg
+                                        metrics["requests_error"] += 1
+                                        _record_call(session_key, input_tokens, total_output_tokens, "context_capacity", VLLM_MODEL, True, str(cce)[:200])
+                                        return
                                     input_tokens = count_messages_tokens(current_body["messages"])
-                                    current_body["max_tokens"] = _output_budget(input_tokens)
+                                    _b3 = _output_budget(input_tokens)
+                                    current_body["max_tokens"] = min(_b3, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens)
                                     continue
                                 metrics["requests_error"] += 1
                                 _record_call(session_key, input_tokens, total_output_tokens, "vllm_" + str(resp.status_code), VLLM_MODEL, True, body_bytes[:300].decode("utf-8", errors="replace"))
-                                if seam_hold:
-                                    yield _sse_content(seam_hold, stream_id)
+                                for x in _flush_seam():
+                                    yield x
                                 yield "data: " + json.dumps({"error": body_bytes[:200].decode("utf-8", errors="replace")}) + "\n\n"
                                 yield "data: [DONE]\n\n"
                                 return
@@ -3855,9 +4334,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                         reasoning_tail = (reasoning_tail + reasoning_piece)[-LOOP_TAIL:]
                                     loop_check_acc += len(reasoning_piece)
                                     if tool_calls_piece:
-                                        seg_tool_calls_seen = True
-                                        tc2 = {"id": stream_id, "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"tool_calls": tool_calls_piece}, "finish_reason": None}]}
-                                        yield "data: " + json.dumps(tc2) + "\n\n"
+                                        tc_accum.add_delta(tool_calls_piece)
                                     content_piece = delta.get("content", "")
                                     if content_piece:
                                         full_content += content_piece
@@ -3869,12 +4346,8 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                     except httpx.TransportError as e:
                         interrupted = "%s: %s" % (type(e).__name__, str(e)[:150])
                         _vllm_breaker.record_failure()
-                    if seam_hold:
-                        out = _seam_resolve()
-                        if out:
-                            full_content += out
-                            yield _sse_content(out, stream_id)
-                    seam_active = False
+                    for x in _flush_seam():
+                        yield x
                     if interrupted is None and not got_finish and not got_done:
                         interrupted = "upstream closed the stream early"
                     total_output_tokens += seg_output_tokens
@@ -3895,7 +4368,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                 loop_in_reasoning = True
                                 log.warning("Retry looped in reasoning (period=%d) - stopping", lp)
                                 break
-                    if not loop_period and reasoning_chars > MAX_REASONING_TOKENS * 3 and not full_content and not seg_tool_calls_seen:
+                    if not loop_period and reasoning_chars > MAX_REASONING_TOKENS * 3 and not full_content and not tc_accum.count():
                         loop_in_reasoning = True
                         reasoning_overflow = True
                         log.warning("Retry reasoning budget backstop (chars=%d > %d) - stopping", reasoning_chars, MAX_REASONING_TOKENS * 3)
@@ -3903,28 +4376,38 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                     if interrupted:
                         log.warning("Retry stream interrupted after %d chars: %s", len(full_content), interrupted)
                         exit_reason = "interrupted"
-                        finish_reason = "stop"
+                        finish_reason = "length"
                         break
                     break
                 if loop_in_content:
                     exit_reason = "loop"
-                    finish_reason = "stop"
+                    finish_reason = "length"
                 elif loop_in_reasoning or reasoning_overflow:
                     exit_reason = "reasoning_overflow"
-                    finish_reason = "stop"
+                    finish_reason = "length"
                 else:
                     exit_reason = "loop_recovered"
-            # If we still have no content and no tool calls, do not report "ok" —
-            # the client received an empty assistant turn. Classify it as "empty"
-            # so it increments requests_error and is visible in _record_call detail.
-            if exit_reason in ("ok", "loop_recovered") and not full_content and not seg_tool_calls_seen:
+
+            # Classify empty responses
+            if exit_reason in ("ok", "loop_recovered") and not full_content and not tc_accum.count():
                 exit_reason = "empty"
-            final_chunk = {"id": stream_id, "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason or "stop"}]}
-            if total_output_tokens:
-                final_chunk["usage"] = {"prompt_tokens": input_tokens, "completion_tokens": total_output_tokens, "total_tokens": input_tokens + total_output_tokens, "prompt_tokens_details": {"cached_tokens": total_cached_tokens}}
-            yield "data: " + json.dumps(final_chunk) + "\n\n"
-            yield "data: [DONE]\n\n"
-            if exit_reason in ("ok", "loop_recovered", "reasoning_overflow", "loop", "max_continuations", "wall_clock", "cont_budget"):
+
+            # --- Final ctxgate chunk + [DONE] ---
+            tc_complete = tc_accum.is_complete() if tc_accum.count() > 0 else False
+            tc_truncated = tc_accum.count() > 0 and not tc_complete
+            tc_emitted_n = tc_accum.count() if tc_complete else 0
+            if tc_truncated:
+                metrics["tool_call_truncated"] += 1
+            if tc_complete:
+                metrics["tool_call_complete"] += 1
+            # Determine final finish_reason
+            if tc_complete and finish_reason != "tool_calls":
+                finish_reason = "tool_calls"
+            if exit_reason != "ok" and finish_reason == "stop":
+                finish_reason = "length"
+
+            # Metrics
+            if exit_reason in ("ok", "loop_recovered"):
                 metrics["requests_ok"] += 1
             else:
                 metrics["requests_error"] += 1
@@ -3933,22 +4416,47 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             if total_output_tokens:
                 metrics["tokens_out_total"] += total_output_tokens
                 _track_session_tokens(session_key, 0, total_output_tokens, count_req=False)
-            _record_call(session_key, input_tokens, total_output_tokens, "ok" if exit_reason == "ok" else "error", VLLM_MODEL, True,
-                         "" if exit_reason == "ok" else "stream ended early: " + exit_reason, cached_tokens=total_cached_tokens)
-            # One diagnostic line per stream so a cut-off can be traced to its cause.
-            log.info("Stream end: session=%s reason=%s finish=%s chars=%d out_tokens=%d continuations=%d loop_period=%d reasoning_chars=%d loop_retries=%d client_temperature=%s sent_temperature=%s",
-                      session_key, exit_reason, finish_reason, len(full_content), total_output_tokens, continuation_count, loop_period, reasoning_chars, loop_retries, client_temperature, sent_temperature)
+            if exit_reason != "ok":
+                metrics["output_truncated_total"] += 1
+                _rk = exit_reason
+                if _rk not in metrics["output_truncated_by_reason"]:
+                    metrics["output_truncated_by_reason"][_rk] = 0
+                metrics["output_truncated_by_reason"][_rk] += 1
+
+            _record_call(session_key, input_tokens, total_output_tokens,
+                         "ok" if exit_reason == "ok" else "error", VLLM_MODEL, True,
+                         "" if exit_reason == "ok" else "stream ended: " + exit_reason,
+                         cached_tokens=total_cached_tokens)
+
+            # One concise diagnostic line
+            log.info("NS-DIAG session=%s exit=%s finish=%s truncated=%s conts=%d total_out=%d tc_seen=%d tc_complete=%d tc_emitted=%d reasoning_chars=%d",
+                     session_key, exit_reason, finish_reason,
+                     exit_reason != "ok", continuation_count, total_output_tokens,
+                     tc_accum.count(), tc_complete, tc_emitted_n, reasoning_chars)
+
+            # Flush any remaining seam text BEFORE the final marker
+            for x in _flush_seam():
+                yield x
+
+            for _cg in _emit_ctxgate_final(finish_reason, exit_reason, continuation_count, total_output_tokens, tc_complete, tc_emitted_n, tc_truncated):
+                yield _cg
+        except ContextCapacityError as e:
+            metrics["requests_error"] += 1
+            log.error("Context capacity error in stream: %s", e)
+            _record_call(session_key, input_tokens, total_output_tokens, "context_capacity", VLLM_MODEL, True, str(e)[:200])
+            for x in _flush_seam():
+                yield x
+            for _cg in _emit_ctxgate_final("length", "context_capacity", continuation_count, total_output_tokens, False, 0):
+                yield _cg
         except Exception as e:
             metrics["requests_error"] += 1
             log.exception("Stream error: %s", e)
             _record_call(session_key, input_tokens, total_output_tokens, "error", VLLM_MODEL, True, str(e)[:300])
-            if seam_hold:
-                yield _sse_content(seam_hold, stream_id)
-            yield "data: " + json.dumps({"id": stream_id, "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}) + "\n\n"
-            yield "data: [DONE]\n\n"
+            for x in _flush_seam():
+                yield x
+            for _cg in _emit_ctxgate_final("length", "error", continuation_count, total_output_tokens, False, 0):
+                yield _cg
     return StreamingResponse(generate(), media_type="text/event-stream")
-
-
 async def _get_goose_session_id() -> str:
     """Read the most recent active session ID from Goose sessions SQLite DB (persistent connection)."""
     global sqlite_conn
@@ -4013,12 +4521,13 @@ async def _get_goose_session_info(session_id: str) -> Optional[dict]:
 async def _enqueue_memory_job(session_id, user_content):
     if os.environ.get("CTXGATE_MEMORY_WORKER", "1") == "0":
         return
-    # --- Backpressure: skip if worker queue is too full ---
+    # --- Backpressure: LOG/report lag but NEVER drop an eligible durable event ---
     try:
         pending = await _worker_pending_count()
         if pending and pending > WORKER_BACKPRESSURE:
-            log.warning("Backpressure: %d pending memory jobs > %d - skipping", pending, WORKER_BACKPRESSURE)
-            return
+            metrics["memory_worker_lag"] += 1
+            metrics["memory_jobs_dropped"] += 1  # observability only; job is still enqueued
+            log.warning("Backpressure: %d pending memory jobs > %d - logging lag (job NOT dropped)", pending, WORKER_BACKPRESSURE)
     except Exception:
         pass
     # --- Boilerplate filter: strip <turn-context> blocks ---
@@ -4040,18 +4549,28 @@ async def _enqueue_memory_job(session_id, user_content):
             if last_fp == new_fp:
                 log.debug('Dedup: skipping duplicate enqueue for session %s', session_id)
                 return
+        # --- Bounded canonical envelope: if > 5000 chars, store head+tail+marker ---
+        if len(cleaned) > 5000:
+            head = cleaned[:3000]
+            tail = cleaned[-1500:]
+            omitted = len(cleaned) - 4500
+            stored = head + "\n[..." + str(omitted) + " chars omitted...\n" + tail
+        else:
+            stored = cleaned
         # --- Seq fix: COALESCE(MAX(seq),-1)+1 ---
         seq_row = await pool.fetchrow(
             'SELECT COALESCE(MAX(seq),-1) + 1 AS ns FROM proxy.events WHERE task_id=$1', task_uuid)
         ns = seq_row['ns'] if seq_row else 0
         ev_id = await pool.fetchval(
             'INSERT INTO proxy.events (task_id, seq, role, content) VALUES ($1,$2,$3,$4) RETURNING id',
-            task_uuid, ns, 'user', cleaned[:5000])
+            task_uuid, ns, 'user', stored)
         await pool.execute(
             'INSERT INTO proxy.memory_jobs (task_id, event_id, status) VALUES ($1,$2,$3)',
             task_uuid, ev_id, 'pending')
+        metrics["memory_jobs_created"] += 1
         log.info('Enqueued memory job for session %s (seq %d)', session_id, ns)
     except Exception as e:
+        metrics["memory_store_failure"] += 1
         log.warning('Memory job enqueue failed %s: %s', session_id, e)
 async def _resolve_task(task_ref: str, create: bool = False):
     """Resolve or create a proxy task, enriching with Goose DB session metadata.

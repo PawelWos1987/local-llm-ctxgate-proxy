@@ -147,6 +147,7 @@ _last_status_write = 0.0  # throttle timestamp for status-file writes
 # Lag / completion tracking (source of the worker_lag_seconds metric)
 last_completion: Optional[float] = None  # time.time() of the last successful job
 jobs_done_total: int = 0
+pending_jobs_cache: int = 0  # cached count of pending jobs (updated by poll loop)
 # Throttling / context tracking
 lm_requests: list = []  # timestamps of completed LM calls (for RPM)
 lm_context_tokens: list = []  # context token counts per request
@@ -197,6 +198,13 @@ def validate_response(obj: Any) -> bool:
 
 # --- Compact payload builder (section 8) ---
 def build_payload(task_desc: str, wm: str, event: dict) -> str:
+    """Build a compact LM payload from a task, working memory, and event.
+
+    Handles role in (user, assistant, tool) so the worker can extract
+    durable facts from ALL meaningful session events, not just user messages.
+    Tool-result events carry findings, file paths, decisions, failures, and
+    state changes that would otherwise be lost.
+    """
     role = event.get("role", "user")
     content = (event.get("content") or "")[:EVENT_EXCERPT_CHARS]
     tool = event.get("tool_calls")
@@ -207,14 +215,26 @@ def build_payload(task_desc: str, wm: str, event: dict) -> str:
         except Exception:
             tool_txt = str(tool)[:600]
     changed = event.get("changed_files") or ""
-    return (
-        "CURRENT TASK: " + (task_desc or "(none)") + "\n"
-        "CURRENT WORKING MEMORY: " + (wm or "(empty)")[:WM_EXCERPT_CHARS] + "\n"
-        "NEW EVENT (role=" + role + "): " + content + "\n"
-        + ("TOOL RESULT EXCERPT: " + tool_txt + "\n" if tool_txt else "")
-        + ("CHANGED FILES: " + changed + "\n" if changed else "")
-        + "source_event_id: " + str(event.get("id", ""))
-    )
+
+    # Role-specific framing so the 4B knows what kind of event it is looking at
+    if role == "assistant":
+        event_label = "ASSISTANT MESSAGE (decisions, findings, state changes, plan updates)"
+    elif role == "tool":
+        event_label = "TOOL RESULT (findings, file paths, errors, state changes, command output)"
+    else:
+        event_label = "USER MESSAGE"
+
+    parts = [
+        "CURRENT TASK: " + (task_desc or "(none)"),
+        "CURRENT WORKING MEMORY: " + (wm or "(empty)")[:WM_EXCERPT_CHARS],
+        "NEW EVENT (" + event_label + "): " + content,
+    ]
+    if tool_txt:
+        parts.append("TOOL CALLS/RESULT EXCERPT: " + tool_txt)
+    if changed:
+        parts.append("CHANGED FILES: " + changed)
+    parts.append("source_event_id: " + str(event.get("id", "")))
+    return "\n".join(parts)
 
 # --- Pre-load: ensure model is loaded before first completion ---
 async def ensure_model_loaded() -> bool:
@@ -374,7 +394,24 @@ async def call_4b_quality_check(memory_actions: list) -> dict:
     return _extract_json(content)
 
 # --- Deterministic dedupe / UPDATE / SUPERSEDE (section 12) ---
-async def apply_memories(task_id: str, event_id: str, resp: dict) -> int:
+async def apply_memories(task_id: str, event_id: str, resp: dict, conn=None) -> int:
+    """Apply memory actions (NEW/UPDATE/SUPERSEDE) in a SINGLE transaction.
+
+    All reads (existing memories) and writes (inserts/updates/supersedes)
+    happen in one txn so concurrent consumers never create duplicate
+    durable memories for the same (task_id, source_event_id, key_norm).
+
+    If *conn* is provided (caller manages the transaction), use it directly.
+    Otherwise acquire a connection and manage the transaction here.
+    """
+    if conn is not None:
+        return await _do_apply_memories(conn, task_id, event_id, resp)
+    async with pool.acquire() as c:
+        async with c.transaction():
+            return await _do_apply_memories(c, task_id, event_id, resp)
+
+async def _do_apply_memories(conn, task_id: str, event_id: str, resp: dict) -> int:
+    """Inner implementation of apply_memories, operating on a given connection."""
     applied = 0
     for a in resp.get("memory_actions", []):
         action = a["action"]
@@ -388,25 +425,25 @@ async def apply_memories(task_id: str, event_id: str, resp: dict) -> int:
         imp = IMP_MAP.get(a["importance"], 5)
         mkey = _norm(title)
         # Find an existing ACTIVE memory of the same type+title for this task
-        row = await pool.fetchrow(
+        row = await conn.fetchrow(
             "SELECT id FROM proxy.memories WHERE task_id=$1 AND active=true AND category=$2 "
             "AND key_norm = $3 LIMIT 1",
             task_id, category, mkey,
         )
         if action == "SUPERSEDE":
             if row:
-                nid = await pool.fetchval(
+                nid = await conn.fetchval(
                     "INSERT INTO proxy.memories(task_id,key,value,category,importance,source_event_id,status,model_name,key_norm) "
                     "VALUES($1,$2,$3,$4,$5,$6,'active',$7,$8) RETURNING id",
                     task_id, title, content, category, imp, event_id, LM_MODEL, mkey,
                 )
-                await pool.execute(
+                await conn.execute(
                     "UPDATE proxy.memories SET active=false,status='superseded',superseded_by=$1,updated_at=now() WHERE id=$2",
                     nid, row["id"],
                 )
                 log.info("SUPERSEDE %s (old=%s new=%s)", title, row["id"], nid)
             else:
-                await pool.execute(
+                await conn.execute(
                     "INSERT INTO proxy.memories(task_id,key,value,category,importance,source_event_id,status,model_name,key_norm) "
                     "VALUES($1,$2,$3,$4,$5,$6,'active',$7,$8)",
                     task_id, title, content, category, imp, event_id, LM_MODEL, mkey,
@@ -415,13 +452,13 @@ async def apply_memories(task_id: str, event_id: str, resp: dict) -> int:
             applied += 1
         elif action == "UPDATE":
             if row:
-                await pool.execute(
+                await conn.execute(
                     "UPDATE proxy.memories SET value=$1,importance=$2,source_event_id=$3,updated_at=now() WHERE id=$4",
                     content, imp, event_id, row["id"],
                 )
                 log.info("UPDATE %s", title)
             else:
-                await pool.execute(
+                await conn.execute(
                     "INSERT INTO proxy.memories(task_id,key,value,category,importance,source_event_id,status,model_name,key_norm) "
                     "VALUES($1,$2,$3,$4,$5,$6,'active',$7,$8)",
                     task_id, title, content, category, imp, event_id, LM_MODEL, mkey,
@@ -431,13 +468,13 @@ async def apply_memories(task_id: str, event_id: str, resp: dict) -> int:
         else:  # NEW
             if row:
                 # Deterministic dedupe: same (type,title) already active -> refresh, don't duplicate
-                await pool.execute(
+                await conn.execute(
                     "UPDATE proxy.memories SET value=$1,importance=$2,source_event_id=$3,updated_at=now() WHERE id=$4",
                     content, imp, event_id, row["id"],
                 )
                 log.info("NEW(dup) -> refresh %s", title)
             else:
-                await pool.execute(
+                await conn.execute(
                     "INSERT INTO proxy.memories(task_id,key,value,category,importance,source_event_id,status,model_name,key_norm) "
                     "VALUES($1,$2,$3,$4,$5,$6,'active',$7,$8)",
                     task_id, title, content, category, imp, event_id, LM_MODEL, mkey,
@@ -446,7 +483,8 @@ async def apply_memories(task_id: str, event_id: str, resp: dict) -> int:
             applied += 1
     return applied
 
-async def update_working_memory(task_id: str, su: dict):
+async def update_working_memory(task_id: str, su: dict, conn=None) -> None:
+    """Refresh working memory. If *conn* is provided, use it (caller manages txn)."""
     # Refresh WM for every substantive turn - not just when 'changed' is true.
     # The 4B always returns current_state; we use it to keep WM fresh.
     state = su.get("current_state") or ""
@@ -454,7 +492,8 @@ async def update_working_memory(task_id: str, su: dict):
     if not state and not subtask:
         return
     content = "STATE: " + state + (" | SUBTASK: " + subtask if subtask else "")
-    await pool.execute(
+    c = conn if conn is not None else pool
+    await c.execute(
         "INSERT INTO proxy.working_memory(task_id,content,updated_at) VALUES($1,$2,now()) "
         "ON CONFLICT(task_id) DO UPDATE SET content=$2,updated_at=now()",
         task_id, content[:2000],
@@ -488,13 +527,55 @@ async def prune_memories(pool) -> None:
 
 async def claim_jobs(n: int = 1) -> list:
     """Claim up to N pending jobs with row locking (FOR UPDATE SKIP LOCKED).
-    With N consumers, we claim N jobs in one query so each consumer gets one."""
+    With N consumers, we claim N jobs in one query so each consumer gets one.
+    Sets claimed_at so stuck-job recovery can detect crashed consumers."""
     rows = await pool.fetch(
         "SELECT id, task_id, event_id, attempts FROM proxy.memory_jobs "
         "WHERE status='pending' ORDER BY created_at LIMIT $1 FOR UPDATE SKIP LOCKED",
         n
     )
+    if rows:
+        ids = [str(r["id"]) for r in rows]
+        placeholders = ",".join("$" + str(i+1) for i in range(len(ids)))
+        await pool.execute(
+            "UPDATE proxy.memory_jobs SET status='processing', started_at=now(), claimed_at=now() "
+            "WHERE id IN (" + placeholders + ")",
+            *ids,
+        )
     return list(rows)
+
+async def recover_stuck_jobs(stale_seconds: float = 300.0) -> int:
+    """Recover jobs stuck in 'processing' (worker crashed mid-claim).
+
+    Resets jobs whose claimed_at is older than *stale_seconds* back to 'pending'.
+    Jobs older than OUTAGE_TTL are marked 'failed' instead.
+    Called on worker start and periodically from the poll loop.
+    """
+    try:
+        # Mark truly stuck jobs (older than OUTAGE_TTL) as failed
+        failed = await pool.execute(
+            "UPDATE proxy.memory_jobs SET status='failed', completed_at=now(), "
+            "error='stuck in processing beyond OUTAGE_TTL' "
+            "WHERE status='processing' AND claimed_at IS NOT NULL "
+            "AND claimed_at < now() - make_interval(secs => $1)",
+            int(OUTAGE_TTL),
+        )
+        failed_n = int(failed.split()[-1]) if failed else 0
+        # Reset recently-stuck jobs back to pending
+        recovered = await pool.execute(
+            "UPDATE proxy.memory_jobs SET status='pending', started_at=NULL, claimed_at=NULL "
+            "WHERE status='processing' AND claimed_at IS NOT NULL "
+            "AND claimed_at < now() - make_interval(secs => $1) "
+            "AND claimed_at >= now() - make_interval(secs => $2)",
+            int(stale_seconds), int(OUTAGE_TTL),
+        )
+        recovered_n = int(recovered.split()[-1]) if recovered else 0
+        if failed_n or recovered_n:
+            log.info("Stuck-job recovery: %d failed, %d reset to pending", failed_n, recovered_n)
+        return failed_n + recovered_n
+    except Exception as e:
+        log.warning("Stuck-job recovery failed (non-fatal): %s", e)
+        return 0
 
 async def process_job(job) -> None:
     """Process a single memory job with outage-aware retry logic.
@@ -506,7 +587,8 @@ async def process_job(job) -> None:
     """
     global outage_since, last_completion, jobs_done_total, consecutive_lm_failures, model_loaded
     jid, task_id, event_id = str(job["id"]), str(job["task_id"]), str(job["event_id"]) if job["event_id"] else None
-    await pool.execute("UPDATE proxy.memory_jobs SET status='processing',started_at=now() WHERE id=$1", jid)
+    # Safety net: ensure claimed_at is set (claim_jobs already does this, but guard against edge cases)
+    await pool.execute("UPDATE proxy.memory_jobs SET status='processing',started_at=now(),claimed_at=COALESCE(claimed_at,now()) WHERE id=$1", jid)
     try:
         # Load current task + working memory + event (compact)
         task_desc = ""
@@ -558,12 +640,17 @@ async def process_job(job) -> None:
 
         if not validate_response(resp):
             raise ValueError("4B response failed schema validation")
-        applied = await apply_memories(task_id, event_id or jid, resp)
-        await update_working_memory(task_id, resp.get("state_update", {}))
-        await pool.execute(
-            "UPDATE proxy.memory_jobs SET status='done',completed_at=now(),result=$1,attempts=$2 WHERE id=$3",
-            json.dumps(resp), int(job.get("attempts") or 0) + 1, jid,
-        )
+        # --- Single transaction: apply memories + update WM + mark job done ---
+        # This guarantees no partial state: if any step fails, the whole txn
+        # rolls back and the job stays 'processing' (reclaimable by stuck-job recovery).
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                applied = await _do_apply_memories(conn, task_id, event_id or jid, resp)
+                await update_working_memory(task_id, resp.get("state_update", {}), conn=conn)
+                await conn.execute(
+                    "UPDATE proxy.memory_jobs SET status='done',completed_at=now(),result=$1,attempts=$2 WHERE id=$3",
+                    json.dumps(resp), int(job.get("attempts") or 0) + 1, jid,
+                )
         log.info("JOB done %s (applied=%d)", jid, applied)
         last_completion = time.time()
         jobs_done_total += 1
@@ -675,8 +762,12 @@ async def _consumer(cid: int) -> None:
             await asyncio.sleep(5)
 
 async def poll():
-    """Main loop: spawn N consumers, each claims and processes one job at a time."""
+    """Main loop: spawn N consumers, each claims and processes one job at a time.
+    Also runs periodic stuck-job recovery and memory pruning."""
+    global pending_jobs_cache
     last_prune = time.time()
+    last_recovery = time.time()
+    last_pending_count = time.time()
     tasks = []
     for cid in range(CONSUMERS):
         tasks.append(asyncio.create_task(_consumer(cid), name=f"consumer-{cid}"))
@@ -688,6 +779,19 @@ async def poll():
             if now - last_prune > 6 * 3600:
                 await prune_memories(pool)
                 last_prune = now
+            # Periodic stuck-job recovery (every 60s)
+            if now - last_recovery > 60.0:
+                await recover_stuck_jobs(stale_seconds=300.0)
+                last_recovery = now
+            # Refresh pending job count (every 5s) for the status file
+            if now - last_pending_count > 5.0:
+                try:
+                    pending_jobs_cache = await pool.fetchval(
+                        "SELECT count(*) FROM proxy.memory_jobs WHERE status='pending'"
+                    ) or 0
+                except Exception:
+                    pass
+                last_pending_count = now
             await asyncio.sleep(1.0)
         except Exception as e:
             log.exception("poll loop: %s", e)
@@ -746,6 +850,7 @@ def _write_status(force: bool = False) -> None:
         "lag_seconds": round(lag, 2),
         "last_completion": last_completion,
         "jobs_done": jobs_done_total,
+        "pending_jobs": pending_jobs_cache,
         "consumers_total": CONSUMERS,
         "consumers_active": active,
         "lm_rpm": rpm,
@@ -845,11 +950,7 @@ async def main():
     client = httpx.AsyncClient(headers={"Authorization": f"Bearer {LM_API_KEY}"}) if LM_API_KEY else httpx.AsyncClient()
     _write_status()
     # Recover stuck 'processing' jobs (from previous crash/restart)
-    recovered = await pool.fetch(
-        "UPDATE proxy.memory_jobs SET status='pending', started_at=NULL WHERE status='processing' RETURNING id"
-    )
-    if recovered:
-        log.info("Recovered %d stuck 'processing' jobs back to 'pending'", len(recovered))
+    await recover_stuck_jobs(stale_seconds=0.0)  # 0 = recover ALL stuck jobs on startup
     log.info("Memory worker started (model=%s, url=%s, poll=%.1fs, consumers=%d, max_attempts=%d, outage_ttl=%.0fs, api_key=%s)",
               LM_MODEL, LM_URL, POLL, CONSUMERS, MAX_ATTEMPTS, OUTAGE_TTL, "set" if LM_API_KEY else "MISSING")
     try:
