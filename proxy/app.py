@@ -515,16 +515,18 @@ async def _store_memory_actions(task_uuid, actions, source_event_id):
                 "SELECT id FROM proxy.memories WHERE task_id=$1 AND key=$2 AND active=true LIMIT 1",
                 task_uuid, title
             )
-            new_id = await pool.fetchval(
-                "INSERT INTO proxy.memories (task_id, key, value, category, importance, active, source_event_id, status, model_name) "
-                "VALUES ($1,$2,$3,$4,$5,true,$6,'active',$7) RETURNING id",
-                task_uuid, title, content, mtype, importance, source_event_id, MISTRAL_MODEL
-            )
-            if old:
-                await pool.execute(
-                    "UPDATE proxy.memories SET active=false, superseded_by=$2, updated_at=now() WHERE id=$1",
-                    old["id"], new_id
-                )
+            with pool.acquire() as conn:
+                async with conn.transaction():
+                    new_id = await conn.fetchval(
+                        "INSERT INTO proxy.memories (task_id, key, value, category, importance, active, source_event_id, status, model_name) "
+                        "VALUES ($1,$2,$3,$4,$5,true,$6,'active',$7) RETURNING id",
+                        task_uuid, title, content, mtype, importance, source_event_id, MISTRAL_MODEL
+                    )
+                    if old:
+                        await conn.execute(
+                            "UPDATE proxy.memories SET active=false, superseded_by=$2, updated_at=now() WHERE id=$1",
+                            old["id"], new_id
+                        )
             stored += 1
     if stored:
         log.info("Stored %d memory actions for task %s", stored, task_uuid)
