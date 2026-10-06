@@ -897,6 +897,7 @@ SUMMARY_MAX_CHUNKS = _env_int("CTXGATE_SUMMARY_MAX_CHUNKS", 4)
 SUMMARY_TOOL_CAP_CHARS = _env_int("CTXGATE_SUMMARY_TOOL_CAP_CHARS", 1000)
 WINDOW_TTL_DAYS = _env_int("CTXGATE_WINDOW_TTL_DAYS", 7)
 SSE_HEARTBEAT_INTERVAL = _env_int("CTXGATE_SSE_HEARTBEAT_INTERVAL", 10)
+STABLE_ELIDE = os.environ.get("CTXGATE_STABLE_ELIDE", "1") != "0"  # stable tool-body elision (prefix-cache friendly)
 MAX_OUTPUT = _env_int("CTXGATE_MAX_OUTPUT", 22500)
 SAFETY_MARGIN = _env_int("CTXGATE_SAFETY_MARGIN", 3500)
 MIN_OUTPUT = _env_int("CTXGATE_MIN_OUTPUT", 16000)  # hard floor for the output budget
@@ -1521,6 +1522,7 @@ def _new_window_state(cut: int, rest: list, seed: list, summarized_through: int)
         "summarized_through": summarized_through,
         "pending_cut": cut,
         "in_flight": False,
+        "elide_idx": None,
     }
 
 def _window_valid(ws: dict, seed: list, rest: list) -> bool:
@@ -1679,6 +1681,50 @@ def _protected_indices(work: list) -> set:
             protected.add(i)
     return protected
 
+def _elided_tool_content(c: str) -> str:
+    """The exact step-(a) elision body used by _emergency_shrink (1000 head +
+    marker + 1000 tail). Shared so stable elision and emergency shrink produce
+    byte-identical content for the same input."""
+    if "chars elided by ctxgate" in c:
+        return c
+    elided = len(c) - 2000
+    return c[:1000] + "\n[...%d chars elided by ctxgate...]\n" % elided + c[-1000:]
+
+def _stable_elide_inplace(msgs: list, start: int, end: int) -> None:
+    """Elide in-place every 'tool' message with string content > 2500 chars
+    in msgs[start:end]. Content > 2500 becomes head+tail (~2550 chars, back
+    below the 2500 threshold) so the operation is IDEMPOTENT and deterministic:
+    the same message elides to the same bytes on every call, keeping the sent
+    prefix byte-stable across re-cuts. Never touches non-tool messages; the
+    caller computes start/end so seed/stub/pinned are never elided."""
+    if start < 0:
+        start = 0
+    end = min(end, len(msgs))
+    if start >= end:
+        return
+    for i in range(start, end):
+        m = msgs[i]
+        if m.get("role") != "tool":
+            continue
+        c = m.get("content")
+        if isinstance(c, str) and len(c) > 2500:
+            m["content"] = _elided_tool_content(c)
+
+def _stable_elide_idx(cut: int, rest: list) -> int:
+    """Absolute index into raw 'rest' marking the elidable boundary:
+    the index of the 4th-newest tool-result message (or 'cut', whichever is
+    larger). Everything in [cut, idx) is elidable; [idx, end) keeps the
+    newest 4 tool bodies intact (plus any interleaved assistant/user msgs)."""
+    k = 0
+    idx = len(rest)
+    for i in range(len(rest) - 1, -1, -1):
+        if rest[i].get("role") == "tool":
+            k += 1
+            idx = i
+            if k == 4:
+                break
+    return max(cut, idx)
+
 def _emergency_shrink(kept: list, ceiling: int) -> list:
     """Hard invariant: shrink a built window to <= ceiling tokens without breaking
     the tool-call graph. Used by build_context (both paths) and the 400 re-trim.
@@ -1833,6 +1879,17 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
             lu = _newest_user_idx(rest_raw)
             if lu is not None and lu < ws["cut"]:
                 kept.insert(4, _make_pinned_copy(rest_raw[lu]))
+            if STABLE_ELIDE:
+                if ws.get("elide_idx") is None:
+                    ws["elide_idx"] = _stable_elide_idx(ws["cut"], rest_raw)
+                # Deterministically elide the [cut, elide_idx) tool bodies so
+                # the kept window is byte-stable between requests.
+                # kept = seed(3) + stub(1) + [pinned(1)] + rest[cut:]
+                # so rest[cut] starts at kept[4+has_pin].
+                has_pin = 1 if (lu is not None and lu < ws["cut"]) else 0
+                base = 4 + has_pin
+                # rest[cut:elide_idx] maps to kept[base : base+(elide_idx-cut)]
+                _stable_elide_inplace(kept, base, base + (ws["elide_idx"] - ws["cut"]))
             kept_tok = count_messages_tokens(kept)
             ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
             if kept_tok > ceiling:
@@ -1864,7 +1921,16 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
                 session_compactions.pop(sk, None)
             return messages
         target = _trim_target()
+        # Pre-recut elision: shrink tool bodies up to the newest-4 boundary so
+        # _recut_to budgets on stable (post-elision) sizes, not full originals.
+        # messages is a fresh _prep_messages list (dict copies) -> caller safe.
+        _pre_elide = _stable_elide_idx(0, rest) if STABLE_ELIDE else 0
+        if STABLE_ELIDE:
+            # messages = seed(3) + rest; _pre_elide is a rest-index.
+            # Elide rest[0:_pre_elide] -> messages[3 : 3+_pre_elide]
+            _stable_elide_inplace(messages, 3, 3 + _pre_elide)
         cut = _recut(messages)
+        elide_idx = max(cut, _pre_elide) if STABLE_ELIDE else 0
         # F2b: never store a window anchored past the end of rest (caused the
         # per-turn re-collapse, W2). Clamp so the anchor is a real message.
         if rest and cut >= len(rest):
@@ -1884,6 +1950,15 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
         metrics["dropped_total"] += (cut - st_start) if cut > st_start else 0
         metrics["compaction_events"] += 1
         kept = _kept_messages(seed, rest, cut)
+        new_ws["elide_idx"] = elide_idx
+        if STABLE_ELIDE:
+            # Elide the [cut, elide_idx) tool bodies in the freshly built kept
+            # window. kept = seed(3) + stub(1) + [pinned(1)] + rest[cut:]
+            lu2 = _newest_user_idx(rest)
+            has_pin2 = 1 if (lu2 is not None and cut > lu2) else 0
+            base2 = 4 + has_pin2
+            # rest[cut:elide_idx] maps to kept[base2 : base2+(elide_idx-cut)]
+            _stable_elide_inplace(kept, base2, base2 + (elide_idx - cut))
         kept_tok = count_messages_tokens(kept)
         ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
         if kept_tok > ceiling:
