@@ -851,6 +851,7 @@ SUMMARY_BACKFILL_CHARS = _env_int("CTXGATE_SUMMARY_BACKFILL_CHARS", 96000)
 SUMMARY_CHUNK_CHARS = _env_int("CTXGATE_SUMMARY_CHUNK_CHARS", 24000)
 SUMMARY_MAX_CHUNKS = _env_int("CTXGATE_SUMMARY_MAX_CHUNKS", 4)
 WINDOW_TTL_DAYS = _env_int("CTXGATE_WINDOW_TTL_DAYS", 7)
+SSE_HEARTBEAT_INTERVAL = _env_int("CTXGATE_SSE_HEARTBEAT_INTERVAL", 10)
 MAX_OUTPUT = _env_int("CTXGATE_MAX_OUTPUT", 22500)
 SAFETY_MARGIN = _env_int("CTXGATE_SAFETY_MARGIN", 3500)
 MIN_OUTPUT = _env_int("CTXGATE_MIN_OUTPUT", 16000)  # hard floor for the output budget
@@ -3615,7 +3616,15 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                 yield "data: " + json.dumps({"error": body_bytes[:200].decode("utf-8", errors="replace")}) + "\n\n"
                                 yield "data: [DONE]\n\n"
                                 return
-                            async for line in resp.aiter_lines():
+                            _aiter = resp.aiter_lines().__aiter__()
+                            while True:
+                                try:
+                                    line = await asyncio.wait_for(anext(_aiter), timeout=SSE_HEARTBEAT_INTERVAL)
+                                except asyncio.TimeoutError:
+                                    yield ": hb\n\n"
+                                    continue
+                                except StopAsyncIteration:
+                                    break
                                 if not line.startswith("data: "):
                                     continue
                                 data_str = line[6:]
