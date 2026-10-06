@@ -4051,9 +4051,11 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                     reasoning_chars += len(reasoning_piece)
                                     reasoning_tail = (reasoning_tail + reasoning_piece)[-LOOP_TAIL:]
                                     loop_check_acc += len(reasoning_piece)
-                                # --- ToolCallAccumulator: buffer deltas, only forward when complete ---
+                                # --- ToolCallAccumulator: track completeness + forward in real-time ---
                                 if tool_calls_piece:
                                     tc_accum.add_delta(tool_calls_piece)
+                                    tc_chunk = {"id": stream_id, "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"tool_calls": tool_calls_piece}, "finish_reason": None}]}
+                                    yield "data: " + json.dumps(tc_chunk) + "\n\n"
                                 content_piece = delta.get("content", "")
                                 if content_piece:
                                     if seam_active:
@@ -4170,10 +4172,6 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                         log.info("Complete tool-call set - terminating turn (no continuation)")
                         tc_emitted = True
                         metrics["tool_call_complete"] += 1
-                        # Emit the complete tool-call set
-                        tcs = tc_accum.to_tool_calls()
-                        tc_final = {"id": stream_id, "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"tool_calls": tcs}, "finish_reason": "tool_calls"}]}
-                        yield "data: " + json.dumps(tc_final) + "\n\n"
                         finish_reason = "tool_calls"
                         exit_reason = "tool_calls_complete"
                         break
@@ -4335,6 +4333,8 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                     loop_check_acc += len(reasoning_piece)
                                     if tool_calls_piece:
                                         tc_accum.add_delta(tool_calls_piece)
+                                        tc_chunk = {"id": stream_id, "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"tool_calls": tool_calls_piece}, "finish_reason": None}]}
+                                        yield "data: " + json.dumps(tc_chunk) + "\n\n"
                                     content_piece = delta.get("content", "")
                                     if content_piece:
                                         full_content += content_piece
