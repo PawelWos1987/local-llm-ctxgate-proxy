@@ -859,6 +859,7 @@ TRIM_TARGET_TOKENS = _env_int("CTXGATE_TRIM_TARGET_TOKENS", 0)          # absolu
 TRIM_TARGET_FRACTION = _env_float("CTXGATE_TRIM_TARGET_FRACTION", 0.70)
 TRIM_TARGET_FLOOR = _env_int("CTXGATE_TRIM_TARGET_FLOOR", 20000)
 SUMMARY_BACKFILL_CHARS = _env_int("CTXGATE_SUMMARY_BACKFILL_CHARS", 96000)
+KNOWLEDGE_EXTRACT_MIN_CHARS = _env_int("CTXGATE_KNOWLEDGE_EXTRACT_MIN_CHARS", 40)
 SUMMARY_CHUNK_CHARS = _env_int("CTXGATE_SUMMARY_CHUNK_CHARS", 24000)
 SUMMARY_MAX_CHUNKS = _env_int("CTXGATE_SUMMARY_MAX_CHUNKS", 4)
 WINDOW_TTL_DAYS = _env_int("CTXGATE_WINDOW_TTL_DAYS", 7)
@@ -908,6 +909,9 @@ sqlite_lock = asyncio.Lock()  # serializes access to the shared aiosqlite conn (
 
 # Per-session state, keyed by session_key = "{x_session_id}:{content_fp[:8]}"
 session_fingerprints: dict[str, str] = {}
+# Step 2: per-session anchor of the newest user message already extracted, so we
+# extract at most once per user turn. Value = _msg_anchor(newest user msg).
+_last_extract_anchor: dict[str, str] = {}
 session_seeds: dict[str, list] = {}
 session_compactions: dict[str, dict] = {}  # session_key -> frozen [msg0, msg1, msg2] (immutable seed)
 session_tokens: dict[str, dict] = {}  # {in, out, reqs, max_ctx}
@@ -936,6 +940,8 @@ metrics = {
     "prompt_tokens_total": 0,
     "evicted_sessions": 0,
     "extract_shed": 0,
+    "extract_skipped_same_turn": 0,
+    "extract_skipped_short": 0,
     "lm_tokens_by_kind": {
         "knowledge": {"prompt": 0, "completion": 0},
         "phase": {"prompt": 0, "completion": 0},
@@ -2088,9 +2094,48 @@ async def _sync_deliverable_summary(session_id: str):
     except Exception as e:
         log.debug("deliverable summary sync failed for %s: %s", session_id, e)
 
+def _newest_user_anchor(messages: list) -> str | None:
+    """Anchor of the newest user message, ignoring <turn-context> boilerplate.
+
+    Returns None if there is no user message, or the stripped content is shorter
+    than KNOWLEDGE_EXTRACT_MIN_CHARS (trivial turns are not worth extracting).
+    """
+    newest = None
+    for m in messages:
+        if m.get("role") == "user":
+            newest = m
+    if newest is None:
+        return None
+    c = newest.get("content")
+    if isinstance(c, list):
+        c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+    c = str(c or "")
+    c = re.sub(r"<turn-context>.*?</turn-context>", "", c, flags=re.DOTALL).strip()
+    if len(c) < KNOWLEDGE_EXTRACT_MIN_CHARS:
+        return None
+    return _msg_anchor(newest)
+
 async def _fire_and_forget_extract(session_id: str, session_key: str, messages: list):
-    """Background knowledge extraction - never blocks the request path."""
+    """Background knowledge extraction - never blocks the request path.
+
+    Step 2: at most one extraction per user turn. We keep the anchor of the
+    newest user message we last extracted for each session and skip when it has
+    not changed. A kill switch (CTXGATE_KNOWLEDGE_EXTRACT=0) disables it.
+    """
     global _EXTRACT_IN_FLIGHT
+    # Kill switch (read at call time so it can be toggled via env without restart)
+    if os.environ.get("CTXGATE_KNOWLEDGE_EXTRACT", "1") == "0":
+        return
+    # Newest-user-message anchor (None => trivial/short turn, not worth it)
+    anchor = _newest_user_anchor(messages)
+    if anchor is None:
+        metrics["extract_skipped_short"] += 1
+        return
+    # Once per user turn: skip if we already extracted this exact user message
+    if _last_extract_anchor.get(session_key) == anchor:
+        metrics["extract_skipped_same_turn"] += 1
+        return
+    _last_extract_anchor[session_key] = anchor
     async with _EXTRACT_SEM:
         _EXTRACT_IN_FLIGHT += 1
         try:
@@ -2970,6 +3015,7 @@ async def _evict_stale_sessions():
     stale = [k for k, ts in SESSION_LAST_ACTIVE.items() if now - ts > ttl_sec]
     for k in stale:
         session_fingerprints.pop(k, None)
+        _last_extract_anchor.pop(k, None)
         session_seeds.pop(k, None)
         session_compactions.pop(k, None)
         session_tokens.pop(k, None)
