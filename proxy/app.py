@@ -851,6 +851,7 @@ WINDOW_TTL_DAYS = _env_int("CTXGATE_WINDOW_TTL_DAYS", 7)
 MAX_OUTPUT = _env_int("CTXGATE_MAX_OUTPUT", 22500)
 SAFETY_MARGIN = _env_int("CTXGATE_SAFETY_MARGIN", 3500)
 MIN_OUTPUT = _env_int("CTXGATE_MIN_OUTPUT", 16000)  # hard floor for the output budget
+PINNED_USER_MAX_CHARS = _env_int("CTXGATE_PINNED_USER_MAX_CHARS", 16000)  # cap for pinned user copy
 
 WALL_CLOCK_MAX = _env_int("CTXGATE_WALL_CLOCK_MAX", 1800)  # 30 min - large contexts need more time
 MAX_CONTINUATIONS = int(os.environ.get("CTXGATE_MAX_CONTINUATIONS", 5))
@@ -1482,7 +1483,7 @@ def _make_pinned_copy(m: dict) -> dict:
     and the 'newest user missing' check passes) and caps the total at ~6000 chars
     with a truncation marker."""
     c = _norm_content(m.get("content"))
-    CAP = 6000
+    CAP = PINNED_USER_MAX_CHARS
     text = c if len(c) <= CAP else c[:CAP] + "\n[...truncated...]"
     return {"role": "user", "content": text}
 
@@ -1590,7 +1591,9 @@ def _output_budget(input_tokens: int) -> int:
 
 def _protected_indices(work: list) -> set:
     """Indices that _emergency_shrink must never drop: the seed (first 3), the
-    stub (first system after seed), and the pinned newest-user copy (flagged)."""
+    stub (first system after seed), the pinned newest-user copy (flagged), and
+    the newest 6 messages (rounded up to the nearest tool-group boundary so an
+    assistant with tool_calls and ALL its tool results stay together)."""
     protected = set(range(min(3, len(work))))
     for i in range(3, len(work)):
         if work[i].get("role") == "system":
@@ -1600,6 +1603,15 @@ def _protected_indices(work: list) -> set:
         if work[i].get("ctxgate_pinned"):
             protected.add(i)
             break
+    # Newest 6 messages, rounded UP to group boundary
+    if len(work) > 3:
+        tail_start = max(3, len(work) - 6)
+        if work[tail_start].get("role") == "tool":
+            while tail_start > 0 and work[tail_start].get("role") == "tool":
+                tail_start -= 1
+            tail_start = max(3, tail_start)
+        for i in range(tail_start, len(work)):
+            protected.add(i)
     return protected
 
 def _emergency_shrink(kept: list, ceiling: int) -> list:
@@ -2235,7 +2247,7 @@ async def fetch_task_memory(session_id: str, messages: list, task_uuid: str = No
             )
             scored = []
             for r in rows:
-                s = _score_memory(r["key"], r["value"], r["category"], r["importance"], r["updated_at"], terms, blob)
+                s = _score_memory(r["key"], r["value"], r.get("category", "general"), r.get("importance", 5), r.get("updated_at"), terms, blob)
                 if s > 0.1:
                     scored.append((s, r))
             scored.sort(key=lambda x: x[0], reverse=True)
@@ -3146,6 +3158,8 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                 _record_call(session_key, input_tokens, 0, f"vllm_{resp.status_code}", VLLM_MODEL, False, resp.text[:300])
                 return JSONResponse({"error": {"message": "vLLM " + str(resp.status_code), "explanation": explain_status(f"vllm_{resp.status_code}", resp.text[:300])}}, status_code=resp.status_code)
         data = resp.json()
+        if not isinstance(data.get("usage"), dict):
+            data["usage"] = {}
         choices = data.get("choices", [])
         for choice in choices:
             msg = choice.get("message", {})
