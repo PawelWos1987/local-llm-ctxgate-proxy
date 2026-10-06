@@ -1777,9 +1777,14 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
             kept_tok = count_messages_tokens(kept)
             ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
             if kept_tok > ceiling:
-                kept = _emergency_shrink(kept, ceiling)
-                kept_tok = count_messages_tokens(kept)
-            if kept_tok <= MAX_INPUT:
+                # Sticky window exceeded the hard ceiling: bail out of the fast
+                # path and let the slow path re-cut to _trim_target(), update
+                # session_compactions, and kick the summarizer. The old code
+                # called _emergency_shrink here, dropping the oldest groups on
+                # every request while ws["cut"] stayed fixed — the first kept
+                # message changed each turn, killing the vLLM prefix cache.
+                log.info("sticky window over ceiling %d > %d: re-cutting", kept_tok, ceiling)
+            elif kept_tok <= MAX_INPUT:
                 metrics["trim_sticky_reuse"] += 1
                 log.info("Context sticky-reuse: session=%s cut=%d kept_tokens=%d skipped=%d", sk, ws["cut"], kept_tok, ws["cut"])
                 if task_uuid and ws["summarized_through"] < ws.get("dropped_total", ws["cut"]) and not ws.get("in_flight", False):
