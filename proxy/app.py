@@ -364,6 +364,15 @@ async def _lm_do_call(task: dict):
         try:
             data = resp.json()
             actual_tokens = data.get("usage", {}).get("total_tokens", 0)
+            # Accumulate token usage per call kind
+            _kind = task.get("kind", "other")
+            if _kind not in metrics["lm_tokens_by_kind"]:
+                metrics["lm_tokens_by_kind"][_kind] = {"prompt": 0, "completion": 0}
+                metrics["lm_calls_by_kind"][_kind] = 0
+            metrics["lm_calls_by_kind"][_kind] += 1
+            _usage = data.get("usage", {})
+            metrics["lm_tokens_by_kind"][_kind]["prompt"] += _usage.get("prompt_tokens", 0)
+            metrics["lm_tokens_by_kind"][_kind]["completion"] += _usage.get("completion_tokens", 0)
         except Exception:
             pass
     _lm_rate_limiter.release(actual_tokens, estimated_tokens)
@@ -418,7 +427,7 @@ async def _lm_consumer(worker_id: int = 0):
         finally:
             _lm_queue.task_done()
 
-async def _call_4b(messages, max_tokens=2000, json_mode=True, priority=LM_PRI_HIGH, system=None):
+async def _call_4b(messages, max_tokens=2000, json_mode=True, priority=LM_PRI_HIGH, system=None, kind="other"):
     """Submit a Mistral API call to the priority queue. Awaits the result.
 
     Priority: LM_PRI_HIGH (0) for trim summaries, LM_PRI_LOW (2) for knowledge.
@@ -439,6 +448,7 @@ async def _call_4b(messages, max_tokens=2000, json_mode=True, priority=LM_PRI_HI
         "temperature": 0,
         "json_mode": json_mode,
         "system": system,
+        "kind": kind,
         "future": future,
         "enqueued_at": time.time(),
     }
@@ -701,6 +711,7 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
                 phase_result = await _call_4b(
                     [{"role": "user", "content": phase_user_msg}],
                     max_tokens=800, json_mode=False, system=phase_prompt,
+                    kind="phase",
                 )
                 phase_summary = ""
                 if isinstance(phase_result, str) and phase_result.strip():
@@ -748,7 +759,7 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
             if existing and existing["summary"]:
                 prior_summary = existing["summary"]
             root_user_msg = "Prior root summary: " + prior_summary + "\n\nFull phase history" + ((((" [Session: " + session_name + "]") if session_name else ""))) + ":\n" + phase_history
-            root_result = await _call_4b([{"role": "user", "content": root_user_msg}], max_tokens=1500, json_mode=True, system=MISTRAL_SYSTEM_PROMPT)
+            root_result = await _call_4b([{"role": "user", "content": root_user_msg}], max_tokens=1500, json_mode=True, system=MISTRAL_SYSTEM_PROMPT, kind="root")
             root_summary = ""
             if isinstance(root_result, dict):
                 su = root_result.get("state_update", {})
@@ -925,6 +936,15 @@ metrics = {
     "prompt_tokens_total": 0,
     "evicted_sessions": 0,
     "extract_shed": 0,
+    "lm_tokens_by_kind": {
+        "knowledge": {"prompt": 0, "completion": 0},
+        "phase": {"prompt": 0, "completion": 0},
+        "root": {"prompt": 0, "completion": 0},
+        "other": {"prompt": 0, "completion": 0},
+    },
+    "lm_calls_by_kind": {
+        "knowledge": 0, "phase": 0, "root": 0, "other": 0,
+    },
     "recut_user_pinned": 0,
     "emergency_shrink_total": 0,
     "emergency_shrink_groups_dropped": 0,
@@ -2021,7 +2041,7 @@ def explain_status(status: str, detail: str = "") -> str:
 import re as _re
 
 
-async def _call_lm_4b(prompt: str, system: str = "Return only valid JSON. No markdown, no commentary.", temperature: float = 0.3, max_tokens: int = 512, priority: int = LM_PRI_LOW) -> str:
+async def _call_lm_4b(prompt: str, system: str = "Return only valid JSON. No markdown, no commentary.", temperature: float = 0.3, max_tokens: int = 512, priority: int = LM_PRI_LOW, kind: str = "other") -> str:
     """Submit a Mistral API call to the priority queue. Returns raw text or empty string on failure."""
     if _lm_queue is None:
         log.debug("Mistral queue not ready, _call_lm_4b skipped")
@@ -2030,7 +2050,7 @@ async def _call_lm_4b(prompt: str, system: str = "Return only valid JSON. No mar
         {"role": "system", "content": system},
         {"role": "user", "content": prompt},
     ]
-    result = await _call_4b(messages, max_tokens=max_tokens, json_mode=False, priority=priority)
+    result = await _call_4b(messages, max_tokens=max_tokens, json_mode=False, priority=priority, kind=kind)
     if isinstance(result, str):
         return result
     return ""
@@ -2119,7 +2139,7 @@ async def extract_knowledge(session_id: str, session_key: str, messages: list) -
         "importance: 5-10\n"
         "Return [] if nothing is worth preserving.\n\n" + context
     )
-    raw = await _call_lm_4b(gen_prompt, temperature=0.3, max_tokens=512, priority=LM_PRI_LOW)
+    raw = await _call_lm_4b(gen_prompt, temperature=0.3, max_tokens=512, priority=LM_PRI_LOW, kind="knowledge")
     if not raw:
         return []
     try:
@@ -2546,6 +2566,16 @@ async def metrics_prometheus():
         "# TYPE ctxgate_worker_lag_seconds gauge", "ctxgate_worker_lag_seconds %.1f" % _read_worker_status().get("lag_seconds", 0),
         "# TYPE ctxgate_worker_pending gauge", "ctxgate_worker_pending %d" % _worker_pending,
     ]
+    # LM token usage per call kind (knowledge/phase/root/other x prompt/completion)
+    lines.extend([
+        "# TYPE ctxgate_lm_tokens_total counter",
+        *(('ctxgate_lm_tokens_total{kind="%s",direction="%s"} %d' % (k, d, v))
+          for k in ("knowledge", "phase", "root", "other")
+          for d, v in metrics["lm_tokens_by_kind"].get(k, {}).items()),
+        "# TYPE ctxgate_lm_calls_total counter",
+        *((('ctxgate_lm_calls_total{kind="%s"} %d' % (k, v))
+          for k, v in metrics["lm_calls_by_kind"].items())),
+    ])
     return Response("\n".join(lines) + "\n", media_type="text/plain")
 
 @app.get("/api/metrics")
