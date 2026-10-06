@@ -640,6 +640,33 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
                 if isinstance(c, list):
                     c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
                 return c or ""
+
+            def _role_capped_text(m):
+                """Role-aware text for the summarizer chunk. Caps tool output
+                and assistant tool_call args; leaves user/assistant text alone.
+                Never mutates the real message dict."""
+                role = m.get("role", "")
+                t = _mtext(m)
+                if role == "tool" and SUMMARY_TOOL_CAP_CHARS > 0 and len(t) > SUMMARY_TOOL_CAP_CHARS:
+                    omitted = len(t) - 1000
+                    t = t[:600] + "[..." + str(omitted) + " chars omitted...]" + t[-400:]
+                if role == "assistant":
+                    tcs = m.get("tool_calls")
+                    if tcs:
+                        parts = []
+                        for tc in tcs:
+                            fn = tc.get("function", {})
+                            name = fn.get("name", "?")
+                            args = fn.get("arguments", "")
+                            if isinstance(args, dict):
+                                args = json.dumps(args)
+                            if len(args) > 300:
+                                args = args[:300] + "..."
+                            parts.append("[tool_call:" + name + "(" + args + ")]")
+                        if parts:
+                            t = t + " " + " ".join(parts)
+                return t
+
             total_chars = sum(len(_mtext(m)) for m in slice_msgs)
             if total_chars > SUMMARY_BACKFILL_CHARS:
                 acc = 0
@@ -662,10 +689,15 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
                 cur = []
                 cur_len = 0
                 for m in slice_msgs:
-                    t = _mtext(m)
+                    t = _role_capped_text(m)
+                    # A tool message already role-capped to SUMMARY_TOOL_CAP_CHARS is
+                    # left as-is (the role cap is authoritative for tool output); the
+                    # generic per-message cap only applies to non-role-capped text.
+                    _role_capped = (m.get("role") == "tool" and SUMMARY_TOOL_CAP_CHARS > 0
+                                    and len(_mtext(m)) > SUMMARY_TOOL_CAP_CHARS)
                     # BUG 3: keep head (60%) + tail (40%) of the per-message cap
                     # so tool outputs' results (usually at the tail) are not lost.
-                    if len(t) > cap:
+                    if not _role_capped and len(t) > cap:
                         _head = int(cap * 0.6)
                         _tail = cap - _head
                         t = t[:_head] + " ...[truncated]... " + t[-_tail:]
@@ -862,6 +894,7 @@ SUMMARY_BACKFILL_CHARS = _env_int("CTXGATE_SUMMARY_BACKFILL_CHARS", 96000)
 KNOWLEDGE_EXTRACT_MIN_CHARS = _env_int("CTXGATE_KNOWLEDGE_EXTRACT_MIN_CHARS", 40)
 SUMMARY_CHUNK_CHARS = _env_int("CTXGATE_SUMMARY_CHUNK_CHARS", 24000)
 SUMMARY_MAX_CHUNKS = _env_int("CTXGATE_SUMMARY_MAX_CHUNKS", 4)
+SUMMARY_TOOL_CAP_CHARS = _env_int("CTXGATE_SUMMARY_TOOL_CAP_CHARS", 1000)
 WINDOW_TTL_DAYS = _env_int("CTXGATE_WINDOW_TTL_DAYS", 7)
 SSE_HEARTBEAT_INTERVAL = _env_int("CTXGATE_SSE_HEARTBEAT_INTERVAL", 10)
 MAX_OUTPUT = _env_int("CTXGATE_MAX_OUTPUT", 22500)
