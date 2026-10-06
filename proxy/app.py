@@ -289,6 +289,7 @@ _trim_summary_last: dict = {}  # task_uuid -> timestamp of last stored summary
 # --- Rolling-window persistence (P11) ---
 _window_persist_enabled: Optional[bool] = None  # None=undecided, True/False after feature-detect
 _window_persist_warned = False
+_window_persist_cooldown_until: float = 0.0  # monotonic timestamp; skip writes until this time
 _window_locks: dict = {}  # session_key -> asyncio.Lock (decide-and-persist is serialized)
 _summary_task_locks: dict = {}  # task_uuid -> asyncio.Lock (slices run strictly in order)
 _summary_last_attempt: dict = {}  # task_uuid -> (timestamp, cut_at_attempt)
@@ -1679,11 +1680,13 @@ def _emergency_shrink(kept: list, ceiling: int) -> list:
 
 async def _window_persist(session_key: str, ws: dict) -> None:
     """Upsert the window row. Feature-detects the table; a failure never fails a
-    request (switches persistence off for this process, warns once)."""
-    global _window_persist_enabled, _window_persist_warned
+    request (skips persistence for 60s after an error, warns once)."""
+    global _window_persist_enabled, _window_persist_warned, _window_persist_cooldown_until
     if _window_persist_enabled is False:
         return
     if not pool:
+        return
+    if time.monotonic() < _window_persist_cooldown_until:
         return
     try:
         await pool.execute(
@@ -1694,11 +1697,11 @@ async def _window_persist(session_key: str, ws: dict) -> None:
         )
         _window_persist_enabled = True
     except Exception as e:
-        _window_persist_enabled = False
+        _window_persist_cooldown_until = time.monotonic() + 60
         metrics["window_persist_errors"] += 1
         if not _window_persist_warned:
             _window_persist_warned = True
-            log.warning("session_windows persistence disabled for this process: %s", e)
+            log.warning("session_windows persistence cooling down 60s after error: %s", e)
 
 async def _window_load(session_key: str) -> dict:
     """Lazy load of a single window row. Returns {} if missing/absent."""
@@ -1731,17 +1734,19 @@ async def _window_load(session_key: str) -> dict:
 
 async def _window_cleanup_ttl() -> None:
     """Delete window rows older than WINDOW_TTL_DAYS (this table only)."""
-    global _window_persist_enabled, _window_persist_warned
+    global _window_persist_enabled, _window_persist_warned, _window_persist_cooldown_until
     if _window_persist_enabled is False or not pool:
+        return
+    if time.monotonic() < _window_persist_cooldown_until:
         return
     try:
         await pool.execute("DELETE FROM proxy.session_windows WHERE updated_at < (now() - ($1 || ' days')::interval)", str(WINDOW_TTL_DAYS))
     except Exception as e:
-        _window_persist_enabled = False
+        _window_persist_cooldown_until = time.monotonic() + 60
         metrics["window_persist_errors"] += 1
         if not _window_persist_warned:
             _window_persist_warned = True
-            log.warning("session_windows cleanup disabled for this process: %s", e)
+            log.warning("session_windows cleanup cooling down 60s after error: %s", e)
 
 async def build_context(request_messages: list, task_uuid: str = None, session_key: str = None) -> list:
     sk = session_key or ""
