@@ -3851,6 +3851,8 @@ async def _resolve_task(task_ref: str, create: bool = False):
     Uses exact columns from Goose sessions DB: id, name, session_type, working_dir, provider_name.
     This ensures each Goose session gets its own properly-named proxy task.
     """
+    if not pool:
+        return None
     row = await pool.fetchrow("SELECT id, name FROM proxy.tasks WHERE session_id = $1", task_ref)
     if row:
         # Update metadata if it's missing (lazy enrichment)
@@ -3890,6 +3892,8 @@ async def _resolve_task(task_ref: str, create: bool = False):
 @app.post("/knowledge")
 async def knowledge_create(request: Request):
     """Create or update a knowledge item. Cross-session, global."""
+    if not pool:
+        return JSONResponse({"error": "database unavailable"}, status_code=503)
     body = await request.json()
     domain = body.get("domain", "general")
     key = body.get("key", "")
@@ -3911,6 +3915,8 @@ async def knowledge_create(request: Request):
 @app.get("/knowledge/search")
 async def knowledge_search(q: str = "", domain: str = "", limit: int = 20):
     """Search knowledge items by keyword and/or domain."""
+    if not pool:
+        return JSONResponse({"error": "database unavailable"}, status_code=503)
     query_terms = q.split() if q else []
     rows = []
     try:
@@ -3958,6 +3964,8 @@ async def knowledge_search(q: str = "", domain: str = "", limit: int = 20):
 @app.get("/knowledge/stats")
 async def knowledge_stats():
     """Knowledge store statistics."""
+    if not pool:
+        return JSONResponse({"error": "database unavailable"}, status_code=503)
     total = await pool.fetchval("SELECT COUNT(*) FROM proxy.knowledge WHERE active = true")
     by_domain = await pool.fetch(
         "SELECT domain, COUNT(*) as cnt FROM proxy.knowledge WHERE active = true GROUP BY domain ORDER BY cnt DESC"
@@ -4104,6 +4112,8 @@ async def memory_inject(request: Request):
     if not task_ref:
         return JSONResponse({"error": "task_id required"}, status_code=400)
     task_uuid = await _resolve_task(task_ref, create=True)
+    if task_uuid is None:
+        return JSONResponse({"error": "database unavailable"}, status_code=503)
     await pool.execute(
         "INSERT INTO proxy.working_memory (task_id, content, updated_at) VALUES ($1, $2, now()) "
         "ON CONFLICT (task_id) DO UPDATE SET content = $2, updated_at = now()",
