@@ -1146,12 +1146,33 @@ async def lifespan(app: FastAPI):
     watchdog_task = asyncio.create_task(_watchdog_loop())
     log.info("systemd watchdog loop started (10s heartbeat, 60s timeout in unit)")
     yield
+    # Cancel background tasks FIRST so they stop using the pool
+    worker_task.cancel()
+    health_task.cancel()
+    hygiene_task.cancel()
+    watchdog_task.cancel()
+    try:
+        await worker_task
+    except (asyncio.CancelledError, Exception):
+        pass
+    try:
+        await health_task
+    except (asyncio.CancelledError, Exception):
+        pass
+    try:
+        await hygiene_task
+    except (asyncio.CancelledError, Exception):
+        pass
+    try:
+        await watchdog_task
+    except (asyncio.CancelledError, Exception):
+        pass
     # Shutdown Mistral queue + client
     for t in lm_consumer_tasks:
         t.cancel()
         try:
             await t
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, Exception):
             pass
     if _lm_client is not None:
         await _lm_client.aclose()
@@ -1162,28 +1183,9 @@ async def lifespan(app: FastAPI):
         _vllm_client = None
     if sqlite_conn:
         await sqlite_conn.close()
-    await pool.close()
+    if pool:
+        await pool.close()
     log.info("ctxgate-proxy shutdown complete (graceful: pool drained)")
-    worker_task.cancel()
-    health_task.cancel()
-    hygiene_task.cancel()
-    watchdog_task.cancel()
-    try:
-        await worker_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await health_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await hygiene_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await watchdog_task
-    except asyncio.CancelledError:
-        pass
 
 app = FastAPI(title="local-llm-ctxgate-proxy", version="1.0.0", lifespan=lifespan)
 
