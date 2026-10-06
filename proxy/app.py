@@ -813,6 +813,7 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
                     except Exception:
                         pass
             quality_ok = False
+            skip_store = False
             if root_summary:
                 quality_ok = True
                 quality_reason = ""
@@ -825,7 +826,11 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
                 elif not any(c.isalpha() for c in root_summary):
                     quality_ok = False
                     quality_reason = "no alphabetic content"
-                if quality_ok:
+                if not quality_ok and quality_reason == "identical to prior summary" and len(slice_msgs) <= 4:
+                    quality_ok = True
+                    skip_store = True
+                    log.info("Root summary identical, tiny slice (%d msgs) - advancing watermark without storing", len(slice_msgs))
+                if quality_ok and not skip_store:
                     root_capped = root_summary[:6000]
                     await pool.execute("INSERT INTO proxy.session_summaries (task_id, session_key, summary, trimmed_msg_count, trimmed_tokens) VALUES ($1,$2,$3,$4,$5)",
                                       task_uuid, session_key, root_capped, len(slice_msgs), count_tokens(phase_history))
@@ -902,6 +907,8 @@ MAX_OUTPUT = _env_int("CTXGATE_MAX_OUTPUT", 22500)
 SAFETY_MARGIN = _env_int("CTXGATE_SAFETY_MARGIN", 3500)
 MIN_OUTPUT = _env_int("CTXGATE_MIN_OUTPUT", 16000)  # hard floor for the output budget
 PINNED_USER_MAX_CHARS = _env_int("CTXGATE_PINNED_USER_MAX_CHARS", 16000)  # cap for pinned user copy
+PINNED_USER_FAR_CHARS = _env_int("CTXGATE_PINNED_USER_FAR_CHARS", 2000)   # tighter cap when user msg is far before cut
+PINNED_USER_FAR_THRESHOLD = _env_int("CTXGATE_PINNED_USER_FAR_THRESHOLD", 8)  # distance in messages to trigger far cap
 
 WALL_CLOCK_MAX = _env_int("CTXGATE_WALL_CLOCK_MAX", 1800)  # 30 min - large contexts need more time
 MAX_CONTINUATIONS = int(os.environ.get("CTXGATE_MAX_CONTINUATIONS", 5))
@@ -1544,13 +1551,14 @@ def _window_valid(ws: dict, seed: list, rest: list) -> bool:
 
 STUB_TEXT = "[COMPACTED HISTORY] earlier turns archived; see TASK STATE"
 
-def _make_pinned_copy(m: dict) -> dict:
+def _make_pinned_copy(m: dict, distance: int = 0) -> dict:
     """Deterministic pinned copy of a user message. Keeps the first 300 chars
     verbatim (so _msg_anchor, which hashes content[:300], matches the raw message
-    and the 'newest user missing' check passes) and caps the total at ~6000 chars
-    with a truncation marker."""
+    and the 'newest user missing' check passes) and caps the total with a
+    truncation marker. Distance-aware: when the message is far before the cut
+    (distance > PINNED_USER_FAR_THRESHOLD), use a tighter cap."""
     c = _norm_content(m.get("content"))
-    CAP = PINNED_USER_MAX_CHARS
+    CAP = PINNED_USER_FAR_CHARS if distance > PINNED_USER_FAR_THRESHOLD else PINNED_USER_MAX_CHARS
     text = c if len(c) <= CAP else c[:CAP] + "\n[...truncated...]"
     return {"role": "user", "content": text}
 
@@ -1561,7 +1569,7 @@ def _pinned_user_copy(rest: list, cut: int):
     lu = _newest_user_idx(rest)
     if lu is None or lu >= cut:
         return None
-    return _make_pinned_copy(rest[lu])
+    return _make_pinned_copy(rest[lu], distance=cut - lu)
 
 def _kept_messages(seed: list, rest: list, cut: int) -> list:
     """Rebuild the kept window: seed + constant stub + [pinned newest-user copy] +
@@ -1878,7 +1886,7 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
             # cut (same as _kept_messages) so the prefix stays byte-stable between turns.
             lu = _newest_user_idx(rest_raw)
             if lu is not None and lu < ws["cut"]:
-                kept.insert(4, _make_pinned_copy(rest_raw[lu]))
+                kept.insert(4, _make_pinned_copy(rest_raw[lu], distance=ws["cut"] - lu))
             if STABLE_ELIDE:
                 if ws.get("elide_idx") is None:
                     ws["elide_idx"] = _stable_elide_idx(ws["cut"], rest_raw)
