@@ -1,24 +1,33 @@
-# MASTER_STATE
+# MASTER STATE
+Updated: 2026-10-07 11:43
 
-Date: 2026-07-10 (session clock 2026-10-07)
-Phase: 0 (Baseline + safety harness)
-Last green commit: d412fe9 (baseline; dev tree clean, byte-identical to live)
+## Current Phase
+Phase 1b (ADDENDUM_1: output-path integrity + F13 enqueue dedup)
 
 ## Status
-| Item | Status |
-|---|---|
-| Dev copy /home/pawelw/ctxproxy-dev | DONE (cp -a, flattened, git repo intact) |
-| MASTER_PLAN.md saved | DONE |
-| BASELINE.md (hashes) | IN PROGRESS |
-| Re-verify F1-F12 -> PHASE_0_REPORT.md | NOT STARTED |
-| Baseline metrics (prefix ratios, re-cut spacing, vLLM cache, latencies) | NOT STARTED |
-| tests/harness_window.py | NOT STARTED |
-| tests/reference_prefix.json (G-PREFIX reference) | NOT STARTED |
+| Phase | Status | Tag |
+|-------|--------|-----|
+| 0 | DONE | phase-0-ok |
+| 1 | DONE | phase-1-ok |
+| 1b | IN PROGRESS | - |
+| 2 | PENDING | - |
+| 3 | PENDING | - |
+| 4 | PENDING | - |
+| 5 | PENDING | - |
+| 6 | PENDING | - |
+| 7 | PENDING | - |
 
-## Key facts
-- Live tree: /home/pawelw/ctxproxy (git, HEAD d412fe9, clean). NEVER edit/restart.
-- Dev tree: /home/pawelw/ctxproxy-dev (git, same HEAD, clean).
-- app.py 5759 lines, worker.py 965 lines (live == dev, sha256 recorded in BASELINE.md).
-- Work files in /home/pawelw/ctxproxy-dev/work/.
+ADDENDUM_1 active: Phase 1b + Phase 3 extension (INSTRUCTION ledger rows) + F13 fix.
 
-NEXT ACTION: write BASELINE.md (hashes done: app.py 8d033db1..., worker.py 314c02ab...), then grep-verify F1-F12 in dev copies.
+## Key Facts
+- Dev repo: /home/pawelw/ctxproxy-dev (git, baseline d412fe9). Live: /home/pawelw/ctxproxy (DO NOT EDIT/RESTART).
+- Harness: tests/harness_window.py (pool=None, task_uuid=None, deterministic). Reference: tests/reference_prefix.json. G-PREFIX = compare first_diff sequence + mean stable ratio vs reference.
+- Worker file: worker/worker.py. App: proxy/app.py.
+- Test DB: ctxproxy_test (pg_dump --schema-only of live). DSN: postgresql://postgres:11!!AdaMicPaw@127.0.0.1:5432/ctxproxy_test
+
+## NEXT ACTION:
+Phase 1b: Mock vLLM harness (scripted SSE server) + characterization tests for exit_reason=ok path. Then F13 fix (enqueue dedup fingerprint).
+
+## Notes
+- F11: _store_memory_actions/_update_working_memory NEUTRALIZED (fixed async-with, kept functions).
+- Phase 1: all W1-W11 + A1-A2 done. 20/20 tests pass. G-PREFIX unchanged.

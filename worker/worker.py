@@ -1,16 +1,16 @@
-"""local-llm-ctxgate-proxy 4B Memory Worker (asynchronous durable-memory extraction).
+"""Durable-memory worker (asynchronous memory extraction, memory LLM = Mistral).
 
-Polls proxy.memory_jobs (FOR UPDATE SKIP LOCKED, N concurrent consumers), calls the
-Qwen3-4B LM Studio model with a COMPACT payload and a STRICT JSON schema
-(sections 15/16), validates the response, applies deterministic dedupe /
-UPDATE / SUPERSEDE to proxy.memories, updates proxy.working_memory, and marks
-the job done. Qwen (27B) never waits for this worker; it is a pure async
-enhancement. A bad job never kills the worker.
+Polls proxy.memory_jobs (atomic claim: one UPDATE ... WHERE id IN (SELECT ...
+FOR UPDATE SKIP LOCKED), per-task ordering) and calls the memory LLM (Mistral)
+with a COMPACT payload and a STRICT JSON schema, validates the response, applies
+deterministic dedupe / UPDATE / SUPERSEDE to proxy.memories, updates
+proxy.working_memory, and marks the job done. The main 27B agent never waits for
+this worker; it is a pure async enhancement. A bad job never kills the worker.
 
-The 4B's own output NEVER enqueues a new memory job (no loop) - only original
+The worker's own output NEVER enqueues a new memory job (no loop) - only original
 Goose/user/tool events (enqueued by proxy/app.py) create jobs.
 
-Outage handling: if LM Studio is unreachable, jobs stay pending with
+Outage handling: if the memory LLM is unreachable, jobs stay pending with
 exponential backoff for up to CTXGATE_WORKER_OUTAGE_TTL (default 1800s = 30 min).
 Only after that window expires are jobs marked failed.
 """
@@ -44,16 +44,21 @@ MAX_ATTEMPTS = int(os.environ.get("CTXGATE_WORKER_MAX_ATTEMPTS", "3"))
 # Outage TTL: how long to keep retrying before marking jobs failed (seconds)
 OUTAGE_TTL = float(os.environ.get("CTXGATE_WORKER_OUTAGE_TTL", "1800"))
 # Number of concurrent consumers (parallelism). Each consumer claims one job at a time.
-CONSUMERS = int(os.environ.get("CTXGATE_WORKER_CONSUMERS", "10"))
+CONSUMERS = int(os.environ.get("CTXGATE_WORKER_CONSUMERS", "4"))
 # No BASE_URL needed: Mistral is a cloud API (no local model management)
-# Section 18 generation settings (established for this 4B deployment)
-TEMP = 0.7
+# Generation settings (memory LLM = Mistral). Low temperature for extraction.
+TEMP = float(os.environ.get("CTXGATE_WORKER_TEMP", "0.1"))
 TOP_P = 0.9
 MAX_TOKENS = int(os.environ.get("CTXGATE_WORKER_MAX_TOKENS", "2048"))
-# Quality-check settings (self-review loop)
-QC_TEMP = 0.1
-QC_MAX_TOKENS = 256
-QC_MAX_RETRIES = 1  # 1 retry after initial generation; if bad again -> discard
+# Per-call timeout (matches the proxy's MISTRAL_TIMEOUT)
+MISTRAL_TIMEOUT = float(os.environ.get("CTXGATE_WORKER_MISTRAL_TIMEOUT", "120"))
+# Rate control: requests-per-minute cap for the memory LLM (0 = unlimited)
+WORKER_RPM = int(os.environ.get("CTXGATE_WORKER_RPM", "0"))
+# Stuck-job / heartbeat tuning (the worker owns recovery; app.py no longer fails jobs)
+HEARTBEAT_INTERVAL = float(os.environ.get("CTXGATE_WORKER_HEARTBEAT", "30"))
+STUCK_THRESHOLD = float(os.environ.get("CTXGATE_WORKER_STUCK_THRESHOLD", "600"))
+FAILED_RETRY_HOURS = float(os.environ.get("CTXGATE_WORKER_FAILED_RETRY_HOURS", "1"))
+FAILED_HARD_CAP = int(os.environ.get("CTXGATE_WORKER_FAILED_HARD_CAP", str(MAX_ATTEMPTS)))
 # Compact payload budget (section 8: ~500-2000 input tokens)
 EVENT_EXCERPT_CHARS = 2500
 WM_EXCERPT_CHARS = 1500
@@ -101,14 +106,13 @@ MEMORY_SCHEMA: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["action", "type", "importance", "title", "content", "source_event_id"],
+                "required": ["action", "type", "importance", "title", "content"],
                 "properties": {
                     "action": {"type": "string", "enum": ["NEW", "UPDATE", "SUPERSEDE", "DUPLICATE", "NO_CHANGE"]},
                     "type": {"type": "string", "enum": ["DECISION", "FINDING", "FAILURE", "TODO", "CONSTRAINT", "FILE", "STATE", "FACT"]},
                     "importance": {"type": "string", "enum": ["CRITICAL", "HIGH", "NORMAL", "LOW"]},
                     "title": {"type": "string"},
                     "content": {"type": "string"},
-                    "source_event_id": {"type": "string"},
                 },
             },
         },
@@ -160,10 +164,101 @@ def _sig(s, f):
     running = False
 
 def _norm(s: str) -> str:
-    """Normalize a title/key for deterministic matching (case/whitespace/punct)."""
-    s = (s or "").lower()
-    s = re.sub(r"[^a-z0-9]+", " ", s).strip()
-    return re.sub(r"\s+", " ", s)
+    """Normalize a title/key for deterministic matching.
+
+    Unicode-aware: NFKC + casefold, keep letters/digits (re.UNICODE) so Polish
+    diacritics and other scripts survive (the old [^a-z0-9]+ erased them, causing
+    title collisions and empty keys for all-non-ASCII titles). If the result is
+    empty, fall back to a short hash of the raw title so the key is never blank.
+    """
+    import unicodedata
+    import hashlib
+    raw = (s or "").strip()
+    if not raw:
+        return ""
+    n = unicodedata.normalize("NFKC", raw).casefold()
+    n = re.sub(r"\W+", " ", n, flags=re.UNICODE).strip()
+    n = re.sub(r"\s+", " ", n)
+    if not n:
+        n = "h" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+    return n
+
+def _is_near_duplicate(a: str, b: str) -> bool:
+    """Return True if two memory values are near-duplicates (>=80% token overlap)."""
+    if not a or not b:
+        return (a or "") == (b or "")
+    ta = set(re.findall(r"\w+", a.lower()))
+    tb = set(re.findall(r"\w+", b.lower()))
+    if not ta or not tb:
+        return a.strip() == b.strip()
+    union = len(ta | tb)
+    if union == 0:
+        return True
+    return len(ta & tb) / union >= 0.8
+
+def _ground_entries(acts: list, source_text: str) -> list:
+    """W4: Deterministic grounding - drop entries whose path-like or identifier-like
+    tokens do not appear in the source payload. Never discards entries that passed.
+    Returns the filtered list (may be empty)."""
+    if not source_text:
+        return acts  # no source to ground against -> keep all
+    src_lower = source_text.lower()
+    grounded = []
+    for a in acts:
+        title = (a.get("title") or "").lower()
+        content = (a.get("content") or "").lower()
+        # Extract significant tokens (len>=4, alphanumeric+dash+dot+slash)
+        tokens = set(re.findall(r"[\w./-]{4,}", title + " " + content))
+        # Check: at least 50% of significant tokens must appear in source
+        if not tokens:
+            grounded.append(a)  # no tokens to check -> keep
+            continue
+        hits = sum(1 for t in tokens if t in src_lower)
+        if hits / len(tokens) >= 0.5:
+            grounded.append(a)
+        else:
+            log.info("QC grounding: dropped entry %r (%d/%d tokens grounded)",
+                     a.get("title", "?"), hits, len(tokens))
+    return grounded
+
+class _TokenBucket:
+    """Simple async token-bucket rate limiter (W9)."""
+    def __init__(self, rpm: int):
+        self.rpm = rpm
+        self.tokens = float(rpm) if rpm > 0 else 0
+        self.last = time.time()
+        self._lock = asyncio.Lock()
+    async def acquire(self):
+        if self.rpm <= 0:
+            return
+        async with self._lock:
+            while True:
+                now = time.time()
+                self.tokens = min(float(self.rpm), self.tokens + (now - self.last) * self.rpm / 60.0)
+                self.last = now
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
+                await asyncio.sleep(0.5)
+
+_rate_bucket = _TokenBucket(WORKER_RPM)
+
+async def _retry_failed_jobs() -> int:
+    """W10: Reset failed jobs (attempts < hard cap) back to pending for retry."""
+    try:
+        n = await pool.execute(
+            "UPDATE proxy.memory_jobs SET status='pending', attempts=0, "
+            "error=NULL, claimed_at=NULL, started_at=NULL "
+            "WHERE status='failed' AND attempts < $1",
+            FAILED_HARD_CAP,
+        )
+        cnt = int(n.split()[-1]) if n else 0
+        if cnt > 0:
+            log.info("W10: re-queued %d failed jobs", cnt)
+        return cnt
+    except Exception as e:
+        log.warning("W10 retry_failed_jobs: %s", e)
+        return 0
 
 # --- Structural validation (section 16: validate before touching PostgreSQL) ---
 def validate_response(obj: Any) -> bool:
@@ -184,8 +279,6 @@ def validate_response(obj: Any) -> bool:
         if a.get("importance") not in VALID_IMP:
             return False
         if not isinstance(a.get("title"), str) or not isinstance(a.get("content"), str):
-            return False
-        if "source_event_id" not in a:
             return False
     su = obj["state_update"]
     if not isinstance(su, dict):
@@ -299,6 +392,7 @@ async def _wait_for_lm_studio(max_wait: float = 600.0):
 
 
 async def call_4b(payload: str) -> dict:
+    await _rate_bucket.acquire()
     body = {
         "model": LM_MODEL,
         "messages": [
@@ -314,10 +408,12 @@ async def call_4b(payload: str) -> dict:
         },
     }
     t0 = time.time()
-    r = await client.post(LM_URL, json=body, timeout=httpx.Timeout(300, connect=10))
+    r = await client.post(LM_URL, json=body, timeout=httpx.Timeout(MISTRAL_TIMEOUT, connect=10))
     latency_ms = round((time.time() - t0) * 1000, 1)
     if r.status_code == 429:
-        raise RateLimitError("Mistral rate limit (429): %s" % r.text[:200])
+        # W9: honor Retry-After header if present
+        ra = r.headers.get("Retry-After")
+        raise RateLimitError("Mistral rate limit (429) retry_after=%s: %s" % (ra, r.text[:200]))
     if r.status_code != 200:
         raise RuntimeError("Mistral HTTP %d: %s" % (r.status_code, r.text[:200]))
     data = r.json()
@@ -467,12 +563,30 @@ async def _do_apply_memories(conn, task_id: str, event_id: str, resp: dict) -> i
             applied += 1
         else:  # NEW
             if row:
-                # Deterministic dedupe: same (type,title) already active -> refresh, don't duplicate
-                await conn.execute(
-                    "UPDATE proxy.memories SET value=$1,importance=$2,source_event_id=$3,updated_at=now() WHERE id=$4",
-                    content, imp, event_id, row["id"],
+                # W3: never overwrite a different value in place.
+                old_val = await conn.fetchval(
+                    "SELECT value FROM proxy.memories WHERE id=$1", row["id"]
                 )
-                log.info("NEW(dup) -> refresh %s", title)
+                if _is_near_duplicate(old_val, content):
+                    # Near-duplicate: touch timestamp only.
+                    await conn.execute(
+                        "UPDATE proxy.memories SET updated_at=now() WHERE id=$1",
+                        row["id"],
+                    )
+                    log.info("NEW(dup) -> touch %s", title)
+                else:
+                    # Materially different: SUPERSEDE (old row stays, marked superseded).
+                    nid = await conn.fetchval(
+                        "INSERT INTO proxy.memories(task_id,key,value,category,importance,source_event_id,status,model_name,key_norm) "
+                        "VALUES($1,$2,$3,$4,$5,$6,'active',$7,$8) RETURNING id",
+                        task_id, title, content, category, imp, event_id, LM_MODEL, mkey,
+                    )
+                    await conn.execute(
+                        "UPDATE proxy.memories SET active=false, status='superseded', "
+                        "superseded_by=$1, updated_at=now() WHERE id=$2",
+                        nid, row["id"],
+                    )
+                    log.info("NEW(supersede) %s", title)
             else:
                 await conn.execute(
                     "INSERT INTO proxy.memories(task_id,key,value,category,importance,source_event_id,status,model_name,key_norm) "
@@ -484,21 +598,25 @@ async def _do_apply_memories(conn, task_id: str, event_id: str, resp: dict) -> i
     return applied
 
 async def update_working_memory(task_id: str, su: dict, conn=None) -> None:
-    """Refresh working memory. If *conn* is provided, use it (caller manages txn)."""
-    # Refresh WM for every substantive turn - not just when 'changed' is true.
-    # The 4B always returns current_state; we use it to keep WM fresh.
-    state = su.get("current_state") or ""
-    subtask = su.get("current_subtask") or ""
-    if not state and not subtask:
+    """Refresh working memory. If *conn* is provided, use it (caller manages txn).
+
+    W6: write only when the model reports a change AND the state is non-empty.
+    Never overwrite an existing WM with empty/null content.
+    """
+    state = (su.get("current_state") or "").strip()
+    subtask = (su.get("current_subtask") or "").strip()
+    # W6: skip if nothing changed and no new state
+    if not su.get("changed") and not state and not subtask:
         return
+    if not state and not subtask:
+        return  # never overwrite with empty
     content = "STATE: " + state + (" | SUBTASK: " + subtask if subtask else "")
     c = conn if conn is not None else pool
     await c.execute(
         "INSERT INTO proxy.working_memory(task_id,content,updated_at) VALUES($1,$2,now()) "
         "ON CONFLICT(task_id) DO UPDATE SET content=$2,updated_at=now()",
-        task_id, content[:2000],
+        task_id, content,
     )
-    log.info("WM updated: %s", content[:120])
 async def prune_memories(pool) -> None:
     """Slow-cycle prune: hard-expire past expires_at, age-prune stale non-critical rows.
 
@@ -525,26 +643,51 @@ async def prune_memories(pool) -> None:
     except Exception as e:
         log.warning("memory prune failed (non-fatal): %s", e)
 
+_claim_lock = asyncio.Lock()
+inflight_tasks: set = set()
+
 async def claim_jobs(n: int = 1) -> list:
-    """Claim up to N pending jobs with row locking (FOR UPDATE SKIP LOCKED).
-    With N consumers, we claim N jobs in one query so each consumer gets one.
-    Sets claimed_at so stuck-job recovery can detect crashed consumers."""
-    rows = await pool.fetch(
-        "SELECT id, task_id, event_id, attempts FROM proxy.memory_jobs "
-        "WHERE status='pending' ORDER BY created_at LIMIT $1 FOR UPDATE SKIP LOCKED",
-        n
-    )
-    if rows:
-        ids = [str(r["id"]) for r in rows]
-        placeholders = ",".join("$" + str(i+1) for i in range(len(ids)))
-        await pool.execute(
-            "UPDATE proxy.memory_jobs SET status='processing', started_at=now(), claimed_at=now() "
-            "WHERE id IN (" + placeholders + ")",
-            *ids,
-        )
+    """Atomically claim up to N pending jobs (single UPDATE ... WHERE id IN
+    (SELECT ... FOR UPDATE SKIP LOCKED) - the row lock and status flip happen
+    in one statement, so no second consumer can claim the same job).
+
+    Per-task ordering: tasks that already have a job in flight (inflight_tasks,
+    guarded by _claim_lock) are excluded from the candidate set, so at most one
+    job per task is processed at a time. The DB 'processing' state provides
+    crash-recovery for jobs whose consumer died before clearing the set.
+    """
+    async with _claim_lock:
+        excl = sorted(inflight_tasks)
+        if excl:
+            ph = ",".join("$" + str(i + 1) for i in range(len(excl)))
+            sql = (
+                "UPDATE proxy.memory_jobs SET status='processing', started_at=now(), claimed_at=now() "
+                "WHERE id IN ("
+                "  SELECT id FROM proxy.memory_jobs "
+                "  WHERE status='pending' AND task_id NOT IN (" + ph + ") "
+                "  ORDER BY task_id, created_at LIMIT " + str(n) + " "
+                "  FOR UPDATE SKIP LOCKED"
+                ") "
+                "RETURNING id, task_id, event_id, attempts"
+            )
+            rows = await pool.fetch(sql, *excl)
+        else:
+            sql = (
+                "UPDATE proxy.memory_jobs SET status='processing', started_at=now(), claimed_at=now() "
+                "WHERE id IN ("
+                "  SELECT id FROM proxy.memory_jobs "
+                "  WHERE status='pending' "
+                "  ORDER BY task_id, created_at LIMIT " + str(n) + " "
+                "  FOR UPDATE SKIP LOCKED"
+                ") "
+                "RETURNING id, task_id, event_id, attempts"
+            )
+            rows = await pool.fetch(sql)
+        for r in rows:
+            inflight_tasks.add(str(r["task_id"]))
     return list(rows)
 
-async def recover_stuck_jobs(stale_seconds: float = 300.0) -> int:
+async def recover_stuck_jobs(stale_seconds: float = 600.0) -> int:
     """Recover jobs stuck in 'processing' (worker crashed mid-claim).
 
     Resets jobs whose claimed_at is older than *stale_seconds* back to 'pending'.
@@ -587,14 +730,24 @@ async def process_job(job) -> None:
     """
     global outage_since, last_completion, jobs_done_total, consecutive_lm_failures, model_loaded
     jid, task_id, event_id = str(job["id"]), str(job["task_id"]), str(job["event_id"]) if job["event_id"] else None
-    # Safety net: ensure claimed_at is set (claim_jobs already does this, but guard against edge cases)
-    await pool.execute("UPDATE proxy.memory_jobs SET status='processing',started_at=now(),claimed_at=COALESCE(claimed_at,now()) WHERE id=$1", jid)
+    # W1: claim_jobs already set status='processing' + claimed_at atomically; no re-UPDATE needed.
     try:
         # Load current task + working memory + event (compact)
         task_desc = ""
         trow = await pool.fetchrow("SELECT session_id, status FROM proxy.tasks WHERE id=$1", task_id)
         if trow:
             task_desc = "session=" + str(trow["session_id"])
+        # W5: add the first user event of the task (seq lowest, <=1500 chars)
+        try:
+            eurow = await pool.fetchrow(
+                "SELECT content FROM proxy.events WHERE task_id=$1 AND role='user' "
+                "ORDER BY seq LIMIT 1",
+                task_id,
+            )
+            if eurow and eurow["content"]:
+                task_desc += "\n" + eurow["content"][:1500]
+        except Exception:
+            pass
         wm = ""
         wrow = await pool.fetchrow("SELECT content FROM proxy.working_memory WHERE task_id=$1", task_id)
         if wrow:
@@ -617,26 +770,13 @@ async def process_job(job) -> None:
         outage_since = None
         consecutive_lm_failures = 0
 
-        # --- Quality-check loop: self-review, retry once, discard if bad again ---
+        # --- W4: Deterministic grounding (replaces LLM self-QC) ---
         acts = resp.get("memory_actions", [])
-        if acts:  # only check if there are entries to review
-            for qc_attempt in range(QC_MAX_RETRIES + 1):  # 0=initial check, 1=retry check
-                await _wait_for_lm_studio()
-                qc = await call_4b_quality_check(acts)
-                if qc.get("quality") == "good":
-                    log.info("Quality check PASSED (attempt %d): %s", qc_attempt + 1, qc.get("reason", ""))
-                    break
-                log.warning("Quality check FAILED (attempt %d/%d): %s", qc_attempt + 1, QC_MAX_RETRIES + 1, qc.get("reason", ""))
-                if qc_attempt < QC_MAX_RETRIES:
-                    # Regenerate
-                    await _wait_for_lm_studio()
-                    resp = await call_4b(payload)
-                    acts = resp.get("memory_actions", [])
-                else:
-                    # Bad again -> discard all entries
-                    log.info("Quality check failed twice -> discarding all memory entries")
-                    resp = {"memory_actions": [], "state_update": resp.get("state_update", {"changed": False, "current_state": None, "current_subtask": None})}
-                    acts = []
+        if acts:
+            acts = _ground_entries(acts, event.get("content") or "")
+            resp["memory_actions"] = acts
+            if not acts:
+                log.info("All entries dropped by grounding")
 
         if not validate_response(resp):
             raise ValueError("4B response failed schema validation")
@@ -781,8 +921,22 @@ async def poll():
                 last_prune = now
             # Periodic stuck-job recovery (every 60s)
             if now - last_recovery > 60.0:
-                await recover_stuck_jobs(stale_seconds=300.0)
+                await recover_stuck_jobs(stale_seconds=STUCK_THRESHOLD)
                 last_recovery = now
+            # W8: heartbeat - refresh claimed_at of in-flight jobs every 30s
+            if now - getattr(poll, "_last_hb", 0) > HEARTBEAT_INTERVAL:
+                try:
+                    await pool.execute(
+                        "UPDATE proxy.memory_jobs SET claimed_at=now() "
+                        "WHERE status='processing'"
+                    )
+                except Exception:
+                    pass
+                poll._last_hb = now
+            # W10: hourly retry of failed jobs
+            if now - getattr(poll, "_last_retry", 0) > FAILED_RETRY_HOURS * 3600:
+                await _retry_failed_jobs()
+                poll._last_retry = now
             # Refresh pending job count (every 5s) for the status file
             if now - last_pending_count > 5.0:
                 try:
@@ -821,7 +975,7 @@ def _atomic_write(path: str, text: str) -> None:
             os.fsync(f.fileno())
         os.replace(tmp, path)
     except OSError as e:
-        log.warning("atomic write failed for %s", path, e)
+        log.warning("atomic write failed for %s: %s", path, e)
 
 def _write_lock(pid: int, ts: float) -> None:
     try:
@@ -945,6 +1099,9 @@ async def main():
         signal.signal(signal.SIGINT, _sig)
     if not acquire_single_instance_lock():
         return
+    # W11: warn (do not crash) if DSN contains a placeholder
+    if "CHANGE_ME" in DSN:
+        log.warning("DSN contains CHANGE_ME - check your database credentials")
     _sd_notify("READY=1")
     pool = await asyncpg.create_pool(DSN, min_size=1, max_size=max(5, CONSUMERS * 2))
     client = httpx.AsyncClient(headers={"Authorization": f"Bearer {LM_API_KEY}"}) if LM_API_KEY else httpx.AsyncClient()

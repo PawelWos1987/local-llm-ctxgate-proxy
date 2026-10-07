@@ -472,129 +472,17 @@ def _is_near_duplicate(existing_value: str, new_value: str) -> bool:
     overlap = len(ex_toks & new_toks)
     return overlap >= max(2, int(0.7 * min(len(ex_toks), len(new_toks))))
 
-async def _store_memory_actions(task_uuid, actions, source_event_id):
-    if not pool or not actions:
-        return
-    stored = 0
-    for act in actions:
-        action = act.get("action", "NEW")
-        if action in ("NO_CHANGE", "DUPLICATE"):
-            continue
-        mtype = act.get("type", "FACT")
-        importance = _IMPORTANCE_MAP.get(act.get("importance", "NORMAL"), 5)
-        title = act.get("title", "")[:200]
-        content = act.get("content", "")[:2000]
-        if not title or not content:
-            continue
-        if action == "NEW":
-            existing = await pool.fetchrow(
-                "SELECT value FROM proxy.memories WHERE task_id=$1 AND active=true AND key ILIKE $2 LIMIT 1",
-                task_uuid, "%" + title[:30] + "%"
-            )
-            if existing and _is_near_duplicate(existing["value"], content):
-                log.debug("Skipping near-duplicate: %s", title)
-                continue
-            await pool.execute(
-                "INSERT INTO proxy.memories (task_id, key, value, category, importance, active, source_event_id, status, model_name) "
-                "VALUES ($1,$2,$3,$4,$5,true,$6,'active',$7)",
-                task_uuid, title, content, mtype, importance, source_event_id, MISTRAL_MODEL
-            )
-            stored += 1
-        elif action == "UPDATE":
-            row = await pool.fetchrow(
-                "SELECT id, value FROM proxy.memories WHERE task_id=$1 AND key=$2 AND active=true LIMIT 1",
-                task_uuid, title
-            )
-            if row:
-                if _is_near_duplicate(row["value"], content):
-                    log.debug("Skipping no-op update: %s", title)
-                    continue
-                await pool.execute(
-                    "UPDATE proxy.memories SET value=$3, importance=$4, updated_at=now() WHERE id=$5",
-                    content, importance, row["id"]
-                )
-            else:
-                await pool.execute(
-                    "INSERT INTO proxy.memories (task_id, key, value, category, importance, active, source_event_id, status, model_name) "
-                    "VALUES ($1,$2,$3,$4,$5,true,$6,'active',$7)",
-                    task_uuid, title, content, mtype, importance, source_event_id, MISTRAL_MODEL
-                )
-            stored += 1
-        elif action == "SUPERSEDE":
-            old = await pool.fetchrow(
-                "SELECT id FROM proxy.memories WHERE task_id=$1 AND key=$2 AND active=true LIMIT 1",
-                task_uuid, title
-            )
-            with pool.acquire() as conn:
-                async with conn.transaction():
-                    new_id = await conn.fetchval(
-                        "INSERT INTO proxy.memories (task_id, key, value, category, importance, active, source_event_id, status, model_name) "
-                        "VALUES ($1,$2,$3,$4,$5,true,$6,'active',$7) RETURNING id",
-                        task_uuid, title, content, mtype, importance, source_event_id, MISTRAL_MODEL
-                    )
-                    if old:
-                        await conn.execute(
-                            "UPDATE proxy.memories SET active=false, superseded_by=$2, updated_at=now() WHERE id=$1",
-                            old["id"], new_id
-                        )
-            stored += 1
-    if stored:
-        log.info("Stored %d memory actions for task %s", stored, task_uuid)
-
-
-async def _update_working_memory(task_uuid, state_update):
-    if not pool:
-        return
-    changed = state_update.get("changed", False)
-    if not changed:
-        return
-    state = (state_update.get("current_state") or "").strip()
-    subtask = (state_update.get("current_subtask") or "").strip()
-    # Strip any existing STATE:/SUBTASK: prefix from model output to avoid doubling
-    if state.startswith("STATE:"):
-        state = state[len("STATE:"):].strip()
-    if subtask.startswith("SUBTASK:"):
-        subtask = subtask[len("SUBTASK:"):].strip()
-    content_str = "STATE: " + state + " | SUBTASK: " + subtask
-    await pool.execute(
-        "INSERT INTO proxy.working_memory (task_id, content, updated_at) VALUES ($1, $2, now()) "
-        "ON CONFLICT (task_id) DO UPDATE SET content=$2, updated_at=now()",
-        task_uuid, content_str
-    )
-
-# NOTE: _process_memory_job removed. Memory extraction is handled by
-# worker/worker.py (dedicated process). The in-proxy _memory_worker_loop
-# only resets stuck jobs. See worker.py for the 4B call pipeline.
-
-
 async def _memory_worker_loop():
     """DEPRECATED: Memory extraction is handled by worker/worker.py (dedicated process).
     This loop is kept as a no-op to avoid racing with the dedicated worker.
     The dedicated worker uses FOR UPDATE SKIP LOCKED for safe concurrent access.
     """
-    log.info("Memory worker loop: DISABLED (dedicated worker.py handles extraction)")
+    log.info("Memory worker loop: DISABLED (dedicated worker.py handles extraction + recovery)")
+    # A1: The worker owns stuck-job recovery (heartbeat + recover_stuck_jobs).
+    # The proxy no longer marks jobs as failed - that was racing with the worker's
+    # legitimate 3-4 sequential LLM calls (300s timeouts + 429 backoff).
     while True:
-        try:
-            await asyncio.sleep(5)
-            if not pool:
-                continue
-            # Only do recovery (reset stuck jobs), do NOT pick up pending jobs
-            # (the dedicated worker.py handles that)
-            stuck = await pool.fetch(
-                "SELECT id FROM proxy.memory_jobs WHERE status='processing' AND started_at < now() - interval '120 seconds'"
-            )
-            for s in stuck:
-                log.warning("Resetting stuck memory job %s", s["id"])
-                await pool.execute(
-                    "UPDATE proxy.memory_jobs SET status='failed', error='stuck_timeout', completed_at=now() WHERE id=$1",
-                    s["id"]
-                )
-        except asyncio.CancelledError:
-            log.info("Memory worker loop cancelled")
-            break
-        except Exception as e:
-            log.warning("Memory worker loop error: %s", e)
-            await asyncio.sleep(10)
+        await asyncio.sleep(60)
 
 
 async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name: str = "", pending_cut: int = None):
