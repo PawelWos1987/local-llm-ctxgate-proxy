@@ -1310,7 +1310,10 @@ def _detect_loop(text: str) -> int:
     prev = tail.rfind(probe, 0, len(tail) - 40)
     p = (len(tail) - 40) - prev if prev >= 0 else 0
     if p >= 20 and len(tail) >= 4 * p and tail[-4 * p:] == tail[-p:] * LOOP_REPEATS:
-        return p
+        # F14: reject multi-line periods (tables, code blocks, test output)
+        unit = tail[-p:]
+        if unit.count("\n") <= 1:
+            return p
     sents = [re.sub(r"\s+", " ", x.strip().lower()) for x in re.split(r"(?<=[.!?])\s+|\n+", tail[-4000:])]
     counts = {}
     for x in sents:
@@ -1318,6 +1321,19 @@ def _detect_loop(text: str) -> int:
             counts[x] = counts.get(x, 0) + 1
             if counts[x] >= LOOP_SENTENCE_REPEATS:
                 return len(x)
+    # F14: consecutive word repetition (catches "hello hello hello ..." where
+    # the period is < 20 chars and the sentence is < 30 chars).
+    # Only triggers when the SAME word appears 10+ times CONSECUTIVELY.
+    words = re.findall(r"[a-zA-Z\u00C0-\u024F]{3,}", tail[-4000:].lower())
+    if len(words) >= 10:
+        run_len = 1
+        for i in range(1, len(words)):
+            if words[i] == words[i - 1]:
+                run_len += 1
+                if run_len >= 10:
+                    return len(words[i])
+            else:
+                run_len = 1
     return 0
 
 
@@ -3783,6 +3799,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
         loop_in_reasoning = False
         loop_in_content = False
         reasoning_overflow = False
+        reasoning_chars_first = 0  # O2: preserve first-attempt reasoning chars
         notice = ""
         # --- ToolCallAccumulator replaces the old seg_tool_calls_seen boolean ---
         tc_accum = ToolCallAccumulator()
@@ -3816,10 +3833,11 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             seam_active = False
 
         def _emit_ctxgate_final(fr: str, reason: str, conts: int, out_toks: int,
-                                 tc_complete: bool, tc_emitted_n: int, tc_truncated: bool = False):
+                                 tc_complete: bool, tc_emitted_n: int, tc_truncated: bool = False,
+                                 truncated_override: bool = False):
             """Build and yield the final ctxgate chunk + [DONE]."""
             meta = ctxgate_meta(
-                truncated=(reason != "ok"),
+                truncated=truncated_override if truncated_override else (reason != "ok"),
                 reason=reason,
                 continuations_used=conts,
                 total_output_tokens=out_toks,
@@ -3827,6 +3845,8 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                 tool_calls_emitted=tc_emitted_n,
                 tool_call_truncated=tc_truncated,
             )
+            if reason != "ok":
+                meta["ctxgate"]["reasoning_chars"] = reasoning_chars
             final_chunk = {
                 "id": stream_id, "object": "chat.completion.chunk", "created": 0,
                 "model": VLLM_MODEL,
@@ -4026,8 +4046,9 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                         current_body["top_p"] = RETRY_TOP_P
                         current_body["presence_penalty"] = RETRY_PRESENCE_PENALTY
                         sent_temperature = RETRY_TEMPERATURE
-                        if "stream_options" in current_body:
-                            del current_body["stream_options"]
+                        # O2: keep stream_options so vLLM sends usage chunk
+                        if "stream_options" not in current_body:
+                            current_body["stream_options"] = {"include_usage": True}
                         reasoning_tail = ""
                         content_tail = ""
                         reasoning_chars = 0
@@ -4098,6 +4119,10 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                     finish_reason = "length"
                 break
 
+            # O2: save first-attempt reasoning chars before any retry resets them
+            if loop_retries == 0 and reasoning_chars > 0:
+                reasoning_chars_first = reasoning_chars
+
             # Empty-response recovery
             if (not notice and not full_content and not tc_accum.count()
                     and finish_reason == "stop" and reasoning_chars > 500
@@ -4123,8 +4148,9 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                 current_body["top_p"] = RETRY_TOP_P
                 current_body["presence_penalty"] = RETRY_PRESENCE_PENALTY
                 sent_temperature = RETRY_TEMPERATURE
-                if "stream_options" in current_body:
-                    del current_body["stream_options"]
+                # O2: keep stream_options so vLLM sends usage chunk
+                if "stream_options" not in current_body:
+                    current_body["stream_options"] = {"include_usage": True}
                 reasoning_tail = ""
                 content_tail = ""
                 reasoning_chars = 0
@@ -4273,6 +4299,9 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                 elif loop_in_reasoning or reasoning_overflow:
                     exit_reason = "reasoning_overflow"
                     finish_reason = "length"
+                elif finish_reason == "length":
+                    # O3: retry segment hit max_tokens without completing
+                    exit_reason = "retry_length"
                 else:
                     exit_reason = "loop_recovered"
 
@@ -4280,12 +4309,29 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             if exit_reason in ("ok", "loop_recovered") and not full_content and not tc_accum.count():
                 exit_reason = "empty"
 
+            # --- Phase 1b: fix exit_reason for loop/overflow recovery ---
+            if loop_in_content:
+                exit_reason = "content_loop"
+            elif loop_in_reasoning:
+                exit_reason = "reasoning_loop"
+            elif exit_reason == "reasoning_overflow" and not loop_in_reasoning and not loop_in_content:
+                if full_content or tc_accum.count():
+                    exit_reason = "ok"
+                else:
+                    exit_reason = "reasoning_loop"
+
             # --- Final ctxgate chunk + [DONE] ---
             tc_complete = tc_accum.is_complete() if tc_accum.count() > 0 else False
             tc_truncated = tc_accum.count() > 0 and not tc_complete
             tc_emitted_n = tc_accum.count() if tc_complete else 0
             if tc_truncated:
                 metrics["tool_call_truncated"] += 1
+                # O4: per-session tool call truncation visibility
+                _tc_names = []
+                for _idx, _tc in tc_accum._calls.items():
+                    _tc_names.append(_tc.get("name", "?"))
+                log.warning("O4 tool_call_truncated session=%s names=%s max_tokens=%d",
+                           session_key, _tc_names, current_body.get("max_tokens", "?"))
             if tc_complete:
                 metrics["tool_call_complete"] += 1
             # Determine final finish_reason
@@ -4317,16 +4363,17 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                          cached_tokens=total_cached_tokens)
 
             # One concise diagnostic line
-            log.info("NS-DIAG session=%s exit=%s finish=%s truncated=%s conts=%d total_out=%d tc_seen=%d tc_complete=%d tc_emitted=%d reasoning_chars=%d",
+            log.info("NS-DIAG session=%s exit=%s finish=%s truncated=%s conts=%d total_out=%d tc_seen=%d tc_complete=%d tc_emitted=%d reasoning_chars=%d reasoning_chars_first=%d",
                      session_key, exit_reason, finish_reason,
-                     exit_reason != "ok", continuation_count, total_output_tokens,
-                     tc_accum.count(), tc_complete, tc_emitted_n, reasoning_chars)
+                     _stream_truncated, continuation_count, total_output_tokens,
+                     tc_accum.count(), tc_complete, tc_emitted_n, reasoning_chars, reasoning_chars_first)
 
             # Flush any remaining seam text BEFORE the final marker
             for x in _flush_seam():
                 yield x
 
-            for _cg in _emit_ctxgate_final(finish_reason, exit_reason, continuation_count, total_output_tokens, tc_complete, tc_emitted_n, tc_truncated):
+            _stream_truncated = (exit_reason != "ok") or loop_in_content or loop_in_reasoning
+            for _cg in _emit_ctxgate_final(finish_reason, exit_reason, continuation_count, total_output_tokens, tc_complete, tc_emitted_n, tc_truncated, truncated_override=_stream_truncated):
                 yield _cg
         except ContextCapacityError as e:
             metrics["requests_error"] += 1
@@ -4427,17 +4474,7 @@ async def _enqueue_memory_job(session_id, user_content):
         task_uuid = await _resolve_task(session_id, create=True)
         if task_uuid is None:
             return
-        # --- Dedup: skip if last event has same content fingerprint ---
-        last_row = await pool.fetchrow(
-            'SELECT content FROM proxy.events WHERE task_id=$1 ORDER BY seq DESC, id DESC LIMIT 1',
-            task_uuid)
-        if last_row:
-            last_fp = hashlib.sha256(last_row['content'][:5000].encode()).hexdigest()[:16]
-            new_fp = hashlib.sha256(cleaned[:5000].encode()).hexdigest()[:16]
-            if last_fp == new_fp:
-                log.debug('Dedup: skipping duplicate enqueue for session %s', session_id)
-                return
-        # --- Bounded canonical envelope: if > 5000 chars, store head+tail+marker ---
+        # --- F13: compute the canonical envelope FIRST, then fingerprint it ---
         if len(cleaned) > 5000:
             head = cleaned[:3000]
             tail = cleaned[-1500:]
@@ -4445,6 +4482,25 @@ async def _enqueue_memory_job(session_id, user_content):
             stored = head + "\n[..." + str(omitted) + " chars omitted...\n" + tail
         else:
             stored = cleaned
+        new_fp = hashlib.sha256(stored.encode()).hexdigest()[:16]
+        # --- Dedup: skip if last event has same content fingerprint ---
+        last_row = await pool.fetchrow(
+            'SELECT content FROM proxy.events WHERE task_id=$1 ORDER BY seq DESC, id DESC LIMIT 1',
+            task_uuid)
+        if last_row:
+            # F13: fingerprint the stored content the same way (envelope of the stored string)
+            last_content = last_row['content']
+            if len(last_content) > 5000:
+                l_head = last_content[:3000]
+                l_tail = last_content[-1500:]
+                l_omitted = len(last_content) - 4500
+                last_envelope = l_head + "\n[..." + str(l_omitted) + " chars omitted...\n" + l_tail
+            else:
+                last_envelope = last_content
+            last_fp = hashlib.sha256(last_envelope.encode()).hexdigest()[:16]
+            if last_fp == new_fp:
+                log.debug('Dedup: skipping duplicate enqueue for session %s', session_id)
+                return
         # --- Seq fix: COALESCE(MAX(seq),-1)+1 ---
         seq_row = await pool.fetchrow(
             'SELECT COALESCE(MAX(seq),-1) + 1 AS ns FROM proxy.events WHERE task_id=$1', task_uuid)

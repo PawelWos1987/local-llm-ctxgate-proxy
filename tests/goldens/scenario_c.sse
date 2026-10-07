@@ -1,0 +1,12 @@
+data: {"id": "mock-c1", "object": "chat.completion.chunk", "created": 0, "model": "Qwen3.8-27B", "choices": [{"index": 0, "delta": {"reasoning_content": "Let me analyze the problem step by step. First, I need to understand the requirements. The user wants a summary of the project status. I should look at the files that were created recently and check the test results. Let me think about what to include in the summary. The key deliverables are the FMEA documents and the implementation plan. I should also mention the test coverage and any remaining issues."}, "finish_reason": null}]}
+
+data: {"id": "mock-c2", "object": "chat.completion.chunk", "created": 0, "model": "Qwen3.8-27B", "choices": [{"index": 0, "delta": {"content": "Here is the summary."}, "finish_reason": null}]}
+
+data: {"id": "mock-c2", "object": "chat.completion.chunk", "created": 0, "model": "Qwen3.8-27B", "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_c1", "type": "function", "function": {"name": "write_file", "arguments": ""}}]}, "finish_reason": null}]}
+
+data: {"id": "mock-c2", "object": "chat.completion.chunk", "created": 0, "model": "Qwen3.8-27B", "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_c1", "type": "function", "function": {"name": "", "arguments": "{\"path\": \"/tmp/out.txt\", \"content\": \"hello\"}"}}]}, "finish_reason": null}]}
+
+data: {"id": "mock-c2", "object": "chat.completion.chunk", "created": 0, "model": "Qwen3.8-27B", "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}], "ctxgate": {"truncated": true, "reason": "error", "continuations_used": 0, "total_output_tokens": 250, "tool_calls_complete": false, "tool_calls_emitted": 0, "reasoning_chars": 0}, "usage": {"prompt_tokens": 100, "completion_tokens": 250, "total_tokens": 350, "prompt_tokens_details": {"cached_tokens": 0}}}
+
+data: [DONE]
+

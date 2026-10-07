@@ -1,0 +1,8 @@
+data: {"id": "mock-b1", "object": "chat.completion.chunk", "created": 0, "model": "Qwen3.8-27B", "choices": [{"index": 0, "delta": {"content": "The project structure consists of three main modules. The first module handles data ingestion from various sources. The second module processes the data through a pipeline. The third module serves the results via an API endpoint. Each module has its own configuration file and test suite. The data flows from ingestion through processing to serving."}, "finish_reason": null}]}
+
+data: {"id": "mock-b2", "object": "chat.completion.chunk", "created": 0, "model": "Qwen3.8-27B", "choices": [{"index": 0, "delta": {"content": " The overall architecture follows a clean separation of concerns."}, "finish_reason": null}]}
+
+data: {"id": "mock-b2", "object": "chat.completion.chunk", "created": 0, "model": "Qwen3.8-27B", "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}], "ctxgate": {"truncated": true, "reason": "error", "continuations_used": 1, "total_output_tokens": 160, "tool_calls_complete": false, "tool_calls_emitted": 0, "reasoning_chars": 0}, "usage": {"prompt_tokens": 100, "completion_tokens": 160, "total_tokens": 260, "prompt_tokens_details": {"cached_tokens": 0}}}
+
+data: [DONE]
+

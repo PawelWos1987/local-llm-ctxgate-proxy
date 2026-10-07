@@ -1,0 +1,8 @@
+data: {"id": "mock-g", "object": "chat.completion.chunk", "created": 0, "model": "Qwen3.8-27B", "choices": [{"index": 0, "delta": {"content": "This is some content that will be "}, "finish_reason": null}]}
+
+data: {"id": "mock-g", "object": "chat.completion.chunk", "created": 0, "model": "Qwen3.8-27B", "choices": [{"index": 0, "delta": {"content": "interrupted mid-stream."}, "finish_reason": null}]}
+
+data: {"id": "mock-g", "object": "chat.completion.chunk", "created": 0, "model": "Qwen3.8-27B", "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}], "ctxgate": {"truncated": true, "reason": "error", "continuations_used": 5, "total_output_tokens": 0, "tool_calls_complete": false, "tool_calls_emitted": 0, "reasoning_chars": 0}}
+
+data: [DONE]
+
