@@ -3610,9 +3610,27 @@ async def chat_completions(request: Request):
                 if _digest:
                     _ctx_parts.append("Session digest:" + chr(10) + _digest)
                 
+                # Phase 4: budget the injection block
+                _inject_budget = int(os.environ.get("CTXGATE_INJECT_MAX_TOKENS", "3000"))
+                if _recap:
+                    _inject_budget = int(os.environ.get("CTXGATE_INJECT_MAX_TOKENS_RECAP", "5000"))
+                # Hard-clamp: never exceed ceiling - 500 (ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT))
+                _ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
+                _inject_budget = min(_inject_budget, _ceiling - 500)
+                
                 _block = ""
                 if _ctx_parts:
-                    _block = chr(10) + chr(10) + chr(10).join(_ctx_parts)
+                    # Priority: 0=digest (newest, keep), 1=task memory, 2=knowledge (oldest, drop first)
+                    _prio_map = {"Relevant knowledge:": 2, "Task memory:": 1, "Session digest:": 0}
+                    _sections = []
+                    for part in _ctx_parts:
+                        _prio = 1
+                        for prefix, p in _prio_map.items():
+                            if part.startswith(prefix):
+                                _prio = p
+                                break
+                        _sections.append((_prio, part))
+                    _block = _fit_to_budget(_sections, _inject_budget)
                 
                 # Cache the block in window state
                 if _ws_for_epoch is not None:
