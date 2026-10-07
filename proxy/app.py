@@ -485,6 +485,158 @@ async def _memory_worker_loop():
         await asyncio.sleep(60)
 
 
+# Phase 3: Deterministic ledger extractor
+import hashlib as _hashlib
+
+def _extract_ledger_entries(msgs: list, slice_start: int, slice_end: int, task_uuid) -> list:
+    """Deterministic extractor: scan messages for tool calls/results."""
+    entries = []
+    tc_map = {}
+    for m in msgs:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                tcid = tc.get("id", "")
+                fn = tc.get("function", {})
+                tc_map[tcid] = (fn.get("name", ""), fn.get("arguments", ""))
+    import re as _re
+    for m in msgs:
+        if m.get("role") != "tool":
+            continue
+        tcid = m.get("tool_call_id", "")
+        content_t = m.get("content", "")
+        if not isinstance(content_t, str):
+            content_t = json.dumps(content_t)
+        if not content_t:
+            continue
+        fn_name, fn_args = tc_map.get(tcid, ("", ""))
+        try:
+            args = json.loads(fn_args) if fn_args else {}
+        except Exception:
+            args = {}
+        path_v = ""
+        for key in ("path", "file_path", "filename", "file", "target"):
+            if key in args and isinstance(args[key], str):
+                path_v = args[key]
+                break
+        if not path_v and "command" in args:
+            cmd = args["command"]
+            m_path = _re.search(r"(?:>|>>|tee\s+|cp\s+\S+\s+|mv\s+\S+\s+)(/\S+)", cmd)
+            if m_path:
+                path_v = m_path.group(1)
+        kind = None
+        title = ""
+        detail = ""
+        evidence = ""
+        test_match = _re.search(r"(Tests run:\s*(\d+).*?Failures:\s*(\d+)|\b(\d+)\s+passed\b|BUILD (SUCCESS|FAILURE))", content_t)
+        if test_match:
+            kind = "TEST_RESULT"
+            title = "Test/Build result"
+            detail = content_t[:200]
+            evidence = fn_name + ":" + (path_v or "shell")
+        elif _re.search(r"(Error:|Exception:|FAILED|Traceback|non-zero exit)", content_t):
+            kind = "FAILURE"
+            title = "Error in " + (fn_name or "tool")
+            detail = content_t[:200]
+            evidence = fn_name + ":" + (path_v or "")
+        elif path_v and fn_name in ("write_file", "str_replace", "write", "edit", "create_file", "shell"):
+            kind = "ARTIFACT"
+            title = path_v
+            detail = fn_name + " " + path_v
+            evidence = fn_name + ":" + path_v
+        if kind:
+            dedupe = _hashlib.sha1(("|".join([kind, path_v, fn_name, detail[:100]])).encode()).hexdigest()
+            entries.append({
+                "kind": kind, "title": title, "detail": detail,
+                "evidence": evidence, "source": "tool:" + fn_name,
+                "dedupe_hash": dedupe,
+                "slice_start": slice_start, "slice_end": slice_end,
+            })
+    # ADDENDUM_1: INSTRUCTION entries from user messages
+    for m in msgs:
+        if m.get("role") != "user":
+            continue
+        uc = m.get("content", "")
+        if not isinstance(uc, str):
+            uc = json.dumps(uc)
+        if len(uc) < 30:
+            continue
+        if _re.search(r"\b(do|implement|create|write|fix|add|remove|change|update|build|test|deploy|refactor|optimize|extract|migrate)\b", uc, _re.IGNORECASE):
+            title_u = uc[:100].strip()
+            dedupe_u = _hashlib.sha1(("INSTRUCTION|" + title_u).encode()).hexdigest()
+            entries.append({
+                "kind": "INSTRUCTION", "title": title_u,
+                "detail": uc[:500], "evidence": "user_message",
+                "source": "user", "dedupe_hash": dedupe_u,
+                "slice_start": slice_start, "slice_end": slice_end,
+            })
+    return entries
+
+async def _persist_ledger_entries(entries: list, task_uuid):
+    """Insert ledger entries with ON CONFLICT DO NOTHING (idempotent)."""
+    if not pool or not entries:
+        return 0
+    inserted = 0
+    for e in entries:
+        try:
+            await pool.execute(
+                "INSERT INTO proxy.session_ledger "
+                "(task_id, kind, title, detail, evidence, source, slice_start, slice_end, dedupe_hash) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) "
+                "ON CONFLICT (task_id, dedupe_hash) DO NOTHING",
+                task_uuid, e["kind"], e["title"], e["detail"], e.get("evidence", ""),
+                e.get("source", ""), e.get("slice_start", 0), e.get("slice_end", 0), e["dedupe_hash"]
+            )
+            inserted += 1
+        except Exception as ex:
+            log.debug("Ledger insert failed: %s", ex)
+    return inserted
+
+async def _build_session_digest(task_uuid, session_key: str = "") -> str:
+    """Phase 3: Deterministic session digest from ledger + phase summaries."""
+    if not pool:
+        return ""
+    try:
+        parts = []
+        ledger_rows = await pool.fetch(
+            "SELECT kind, title, detail FROM proxy.session_ledger WHERE task_id=$1 AND status='active' ORDER BY id",
+            task_uuid
+        )
+        if ledger_rows:
+            ledger_lines = []
+            for lr in ledger_rows:
+                line = lr["kind"] + ": " + (lr["title"] or "")
+                if lr["detail"] and lr["detail"] != lr["title"]:
+                    line += " - " + lr["detail"][:100]
+                ledger_lines.append(line)
+            if ledger_lines:
+                parts.append("LEDGER:" + chr(10) + chr(10).join(ledger_lines))
+        phase_rows = await pool.fetch(
+            "SELECT phase_number, summary FROM proxy.phase_summaries WHERE task_id=$1 ORDER BY phase_number DESC",
+            task_uuid
+        )
+        if phase_rows:
+            newest = phase_rows[0]
+            parts.append("LATEST PHASE (phase " + str(newest["phase_number"]) + "):" + chr(10) + newest["summary"])
+            older = []
+            for pr in phase_rows[1:]:
+                for line in pr["summary"].split(chr(10)):
+                    if line.startswith("COMPLETED:") or line.startswith("DECISIONS"):
+                        older.append("  " + line.strip())
+            if older:
+                parts.append("EARLIER PHASES:" + chr(10) + chr(10).join(older[:30]))
+        if not parts:
+            return ""
+        digest = (chr(10) + chr(10) + chr(10)).join(parts)[:6000]
+        await pool.execute(
+            "INSERT INTO proxy.session_summaries (task_id, session_key, summary, trimmed_msg_count, trimmed_tokens) VALUES ($1,$2,$3,$4,$5)",
+            task_uuid, session_key, digest, 0, len(digest) // 4
+        )
+        log.info("Session digest built: %d chars, %d ledger rows, %d phases", len(digest), len(ledger_rows), len(phase_rows))
+        return digest
+    except Exception as e:
+        log.warning("_build_session_digest failed: %s", e)
+        return ""
+
 async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name: str = "", pending_cut: int = None):
     """Exactly-once, restart-safe summarization of the dropped region.
 
@@ -623,7 +775,9 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
                            "'NEXT STEP: ' (the single concrete next action); "
                            "'DECISIONS/CONSTRAINTS: ' (decisions made and constraints that must hold); "
                            "'DO NOT REDO: ' (work already finished that must not be repeated). "
-                           "Be precise and factual. No commentary. At most 400 words.")
+                           "'ARTIFACTS: ' (every file created or modified in this phase, one line each with its purpose); "
+                           "'VERIFICATION: ' (test results, build outcomes, or other verification seen in this phase); "
+                           "Be precise and factual. No commentary. At most 500 words.")
             async def _do_chunk(ci: int, chunk: str):
                 new_phase = last_phase + 1 + ci
                 session_tag = (" [Session: " + session_name + "]") if session_name else ""
@@ -652,6 +806,15 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
                 log.info("Phase %d summary stored: %d msgs, %d tokens, %d chars", new_phase, len(slice_msgs), count_tokens(chunk), len(phase_summary))
                 return phase_summary
 
+            # Phase 3: Run deterministic extractor on the full-fidelity slice
+            try:
+                ledger_entries = _extract_ledger_entries(rest[start_idx:end_idx], start_idx, end_idx, task_uuid)
+                if ledger_entries:
+                    n_inserted = await _persist_ledger_entries(ledger_entries, task_uuid)
+                    log.info('Ledger: %d entries, %d inserted (start=%d end=%d)', len(ledger_entries), n_inserted, start_idx, end_idx)
+            except Exception as e:
+                log.warning('Ledger extraction failed (non-fatal): %s', e)
+
             chunk_results = await asyncio.gather(
                 *[_do_chunk(ci, chunk) for ci, chunk in enumerate(chunks)],
                 return_exceptions=True,
@@ -668,64 +831,14 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
                 log.warning("Slice summarization produced no phases (start=%d end=%d) - watermark NOT advanced", start_idx, end_idx)
                 return
 
-            phase_rows = await pool.fetch("SELECT phase_number, summary FROM proxy.phase_summaries WHERE task_id=$1 ORDER BY phase_number", task_uuid)
-            phase_history = ""
-            for pr in phase_rows:
-                phase_history += "Phase " + str(pr["phase_number"]) + ": " + pr["summary"] + "\n"
-            if len(phase_history) > 6000:
-                phase_history = phase_history[-6000:]
-            prior_summary = "No prior summary."
-            existing = await pool.fetchrow("SELECT summary FROM proxy.session_summaries WHERE task_id=$1 ORDER BY created_at DESC LIMIT 1", task_uuid)
-            if existing and existing["summary"]:
-                prior_summary = existing["summary"]
-            root_user_msg = "Prior root summary: " + prior_summary + "\n\nFull phase history" + ((((" [Session: " + session_name + "]") if session_name else ""))) + ":\n" + phase_history
-            root_result = await _call_4b([{"role": "user", "content": root_user_msg}], max_tokens=1500, json_mode=True, system=MISTRAL_SYSTEM_PROMPT, kind="root")
-            root_summary = ""
-            if isinstance(root_result, dict):
-                su = root_result.get("state_update", {})
-                if isinstance(su, dict) and su.get("current_state"):
-                    root_summary = su["current_state"].strip()
-                if not root_summary:
-                    actions = root_result.get("memory_actions", [])
-                    if actions and isinstance(actions[0], dict) and actions[0].get("content"):
-                        root_summary = actions[0]["content"].strip()
-            elif isinstance(root_result, str) and root_result.strip():
-                root_summary = root_result.strip()
-                if root_summary.startswith("{"):
-                    try:
-                        parsed = json.loads(root_summary)
-                        if isinstance(parsed, dict):
-                            su = parsed.get("state_update", {})
-                            if isinstance(su, dict) and su.get("current_state"):
-                                root_summary = su["current_state"].strip()
-                    except Exception:
-                        pass
-            quality_ok = False
-            skip_store = False
-            if root_summary:
-                quality_ok = True
-                quality_reason = ""
-                if len(root_summary) < 50:
-                    quality_ok = False
-                    quality_reason = "too short (%d chars)" % len(root_summary)
-                elif root_summary == prior_summary.strip():
-                    quality_ok = False
-                    quality_reason = "identical to prior summary"
-                elif not any(c.isalpha() for c in root_summary):
-                    quality_ok = False
-                    quality_reason = "no alphabetic content"
-                if not quality_ok and quality_reason == "identical to prior summary" and len(slice_msgs) <= 4:
-                    quality_ok = True
-                    skip_store = True
-                    log.info("Root summary identical, tiny slice (%d msgs) - advancing watermark without storing", len(slice_msgs))
-                if quality_ok and not skip_store:
-                    root_capped = root_summary[:6000]
-                    await pool.execute("INSERT INTO proxy.session_summaries (task_id, session_key, summary, trimmed_msg_count, trimmed_tokens) VALUES ($1,$2,$3,$4,$5)",
-                                      task_uuid, session_key, root_capped, len(slice_msgs), count_tokens(phase_history))
+            # Phase 3: Replace LLM root step with deterministic digest
+            try:
+                digest = await _build_session_digest(task_uuid, session_key)
+                if digest:
                     _trim_summary_last[task_uuid] = time.time()
-                    log.info("Root summary stored: %d phases total, summary=%d chars", len(phase_rows), len(root_capped))
-                else:
-                    log.info("Root summary discarded (quality): %s", quality_reason)
+                    log.info('Session digest stored: %d chars', len(digest))
+            except Exception as e:
+                log.warning('Session digest build failed (non-fatal): %s', e)
 
             if quality_ok and end_idx > ws.get("summarized_through", 0):
                 ws["summarized_through"] = end_idx
@@ -1097,6 +1210,33 @@ async def lifespan(app: FastAPI):
             if _attempt == 59:
                 raise RuntimeError("Cannot connect to PostgreSQL after 120s") from _e
     log.info("DB pool connected")
+    # Phase 3: additive migrations
+    try:
+        _ddl = ("""
+            CREATE TABLE IF NOT EXISTS proxy.session_ledger (
+                id BIGSERIAL PRIMARY KEY,
+                task_id UUID NOT NULL,
+                kind TEXT NOT NULL,
+                title TEXT,
+                detail TEXT,
+                evidence TEXT,
+                status TEXT DEFAULT 'active',
+                source TEXT,
+                slice_start INT,
+                slice_end INT,
+                phase_number INT,
+                dedupe_hash TEXT,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                UNIQUE(task_id, dedupe_hash)
+            )""")
+        await pool.execute(_ddl)
+        await pool.execute("CREATE INDEX IF NOT EXISTS idx_ledger_task_id ON proxy.session_ledger(task_id, id)")
+        await pool.execute("ALTER TABLE proxy.phase_summaries ADD COLUMN IF NOT EXISTS slice_start INT")
+        await pool.execute("ALTER TABLE proxy.phase_summaries ADD COLUMN IF NOT EXISTS slice_end INT")
+        await pool.execute("ALTER TABLE proxy.phase_summaries ADD COLUMN IF NOT EXISTS chunk_idx INT")
+        log.info("Phase 3 migrations applied")
+    except Exception as e:
+        log.warning("Phase 3 migration failed: %s", e)
     tok_name = "cl100k_base (fallback)"
     try:
         enc = tokenizers.Tokenizer.from_file(QWEN_TOKENIZER_PATH)
