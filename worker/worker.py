@@ -299,7 +299,9 @@ def build_payload(task_desc: str, wm: str, event: dict) -> str:
     state changes that would otherwise be lost.
     """
     role = event.get("role", "user")
-    content = (event.get("content") or "")[:EVENT_EXCERPT_CHARS]
+    # Phase 5: context_slice events get a larger budget (full chunk text)
+    _max_chars = int(os.environ.get("CTXGATE_WORKER_SLICE_CHARS", "12000")) if role == "context_slice" else EVENT_EXCERPT_CHARS
+    content = (event.get("content") or "")[:_max_chars]
     tool = event.get("tool_calls")
     tool_txt = ""
     if tool:
@@ -314,6 +316,8 @@ def build_payload(task_desc: str, wm: str, event: dict) -> str:
         event_label = "ASSISTANT MESSAGE (decisions, findings, state changes, plan updates)"
     elif role == "tool":
         event_label = "TOOL RESULT (findings, file paths, errors, state changes, command output)"
+    elif role == "context_slice":
+        event_label = "CONTEXT SLICE (conversation history that left the window - extract durable facts, decisions, artifacts, test results)"
     else:
         event_label = "USER MESSAGE"
 

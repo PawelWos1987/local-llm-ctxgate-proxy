@@ -637,6 +637,36 @@ async def _build_session_digest(task_uuid, session_key: str = "") -> str:
         log.warning("_build_session_digest failed: %s", e)
         return ""
 
+async def _enqueue_context_slices(task_uuid, session_key, chunks, start_idx, end_idx):
+    # Phase 5: Enqueue one events row + memory_jobs row per chunk for the worker.
+    # Idempotent: keyed by (task_id, context_slice, slice_start, slice_end, chunk_idx).
+    if not pool:
+        return
+    slice_chars = int(os.environ.get("CTXGATE_WORKER_SLICE_CHARS", "12000"))
+    for ci, chunk in enumerate(chunks):
+        c = chunk[:slice_chars] if len(chunk) > slice_chars else chunk
+        dedupe_key = "ctx_slice|" + str(task_uuid) + "|" + str(start_idx) + "|" + str(end_idx) + "|" + str(ci)
+        try:
+            existing = await pool.fetchrow(
+                "SELECT id FROM proxy.events WHERE task_id=$1 AND role=$2 AND meta->>'dedupe_key'=$3 LIMIT 1",
+                task_uuid, "context_slice", dedupe_key
+            )
+            if existing:
+                continue
+            event_id = await pool.fetchval(
+                "INSERT INTO proxy.events (task_id, role, content, meta) VALUES ($1,$2,$3,$4) RETURNING id",
+                task_uuid, "context_slice", c,
+                json.dumps({"slice_start": start_idx, "slice_end": end_idx, "chunk_idx": ci, "dedupe_key": dedupe_key})
+            )
+            await pool.execute(
+                "INSERT INTO proxy.memory_jobs (task_id, event_id, status) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
+                task_uuid, event_id, "pending"
+            )
+            log.info("Enqueued context_slice: task=%s slice=[%d,%d) chunk=%d event=%s",
+                     task_uuid, start_idx, end_idx, ci, event_id)
+        except Exception as e:
+            log.warning("Failed to enqueue context_slice (non-fatal): %s", e)
+
 async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name: str = "", pending_cut: int = None):
     """Exactly-once, restart-safe summarization of the dropped region.
 
@@ -762,6 +792,11 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
                 chunks = _build_chunks(per_cap)
             if not chunks:
                 return
+            # Phase 5: Enqueue context slices for the worker
+            try:
+                await _enqueue_context_slices(task_uuid, session_key, chunks, start_idx, end_idx)
+            except Exception as e:
+                log.warning('Context slice enqueue failed (non-fatal): %s', e)
 
             last_phase_row = await pool.fetchrow("SELECT MAX(phase_number) as mp FROM proxy.phase_summaries WHERE task_id=$1", task_uuid)
             last_phase = (last_phase_row["mp"] or 0) if last_phase_row else 0
@@ -1234,7 +1269,8 @@ async def lifespan(app: FastAPI):
         await pool.execute("ALTER TABLE proxy.phase_summaries ADD COLUMN IF NOT EXISTS slice_start INT")
         await pool.execute("ALTER TABLE proxy.phase_summaries ADD COLUMN IF NOT EXISTS slice_end INT")
         await pool.execute("ALTER TABLE proxy.phase_summaries ADD COLUMN IF NOT EXISTS chunk_idx INT")
-        log.info("Phase 3 migrations applied")
+        await pool.execute("ALTER TABLE proxy.events ADD COLUMN IF NOT EXISTS meta jsonb")
+        log.info("Phase 3+5 migrations applied")
     except Exception as e:
         log.warning("Phase 3 migration failed: %s", e)
     tok_name = "cl100k_base (fallback)"
