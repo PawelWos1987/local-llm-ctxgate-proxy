@@ -836,6 +836,7 @@ LOOP_SENTENCE_REPEATS = _env_int("CTXGATE_LOOP_SENTENCE_REPEATS", 6)
 LOOP_TAIL = 4000
 LOOP_CHECK_EVERY = 256
 MAX_REASONING_TOKENS = _env_int("CTXGATE_MAX_REASONING_TOKENS", 12000)
+REPAIR_DANGLING_TOOLCALLS = _env_int("CTXGATE_REPAIR_DANGLING_TOOLCALLS", 1)
 LOOP_RETRIES = _env_int("CTXGATE_LOOP_RETRIES", 1)
 RETRY_TEMPERATURE = _env_float("CTXGATE_RETRY_TEMPERATURE", 0.7)
 RETRY_TOP_P = _env_float("CTXGATE_RETRY_TOP_P", 0.8)
@@ -1292,6 +1293,89 @@ def check_prefix(session_key: str, messages: list) -> None:
 # --- D10: Reasoning stripping ---
 
 # --- D9: Malformed tool-call sanitization ---
+
+# Phase 2: Repair dangling tool calls in the seed
+_DANGLING_PLACEHOLDER = "[earlier tool call archived]"
+
+def _repair_dangling_tool_calls(msgs: list) -> list:
+    """Return a copy of msgs with dangling tool_calls removed.
+
+    A tool_call is "dangling" if its tool_call_id has no matching
+    role="tool" message later in the list. This happens when the seed
+    (first 3 messages) includes an assistant message with a tool_call
+    whose result was cut by the window.
+
+    - Pure function: never mutates the input.
+    - Idempotent: running it twice gives the same result.
+    - Byte-identical: same input always produces same output.
+    - Only affects assistant messages with dangling tool_calls.
+    - If all tool_calls are dangling, the key is removed.
+    - If content is empty after removal, a placeholder is inserted.
+
+    Env: CTXGATE_REPAIR_DANGLING_TOOLCALLS (default 1).
+    """
+    if not REPAIR_DANGLING_TOOLCALLS:
+        return msgs
+    if not msgs:
+        return msgs
+
+    # Collect all tool_call_ids that HAVE a matching tool result
+    resolved_ids = set()
+    for m in msgs:
+        if m.get("role") == "tool":
+            tcid = m.get("tool_call_id")
+            if tcid:
+                resolved_ids.add(tcid)
+
+    # Check if any repair is needed
+    needs_repair = False
+    for m in msgs:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                tcid = tc.get("id", "")
+                if tcid and tcid not in resolved_ids:
+                    needs_repair = True
+                    break
+            if needs_repair:
+                break
+
+    if not needs_repair:
+        return msgs
+
+    # Build the repaired copy
+    result = []
+    for m in msgs:
+        if m.get("role") != "assistant" or not m.get("tool_calls"):
+            result.append(m)
+            continue
+
+        # Filter out dangling tool_calls
+        kept_calls = []
+        for tc in m["tool_calls"]:
+            tcid = tc.get("id", "")
+            if tcid and tcid not in resolved_ids:
+                continue  # dangling - drop it
+            kept_calls.append(tc)
+
+        if len(kept_calls) == len(m["tool_calls"]):
+            # No dangling calls - keep as-is
+            result.append(m)
+            continue
+
+        # Create a copy with dangling calls removed
+        new_m = dict(m)
+        if kept_calls:
+            new_m["tool_calls"] = kept_calls
+        else:
+            new_m.pop("tool_calls", None)
+            # If content is empty, add a deterministic placeholder
+            content = new_m.get("content", "")
+            if not content or (isinstance(content, str) and not content.strip()):
+                new_m["content"] = _DANGLING_PLACEHOLDER
+        result.append(new_m)
+
+    return result
+
 def _detect_loop(text: str) -> int:
     """Detect a repetition loop in the recent tail of generated text.
 
@@ -3220,6 +3304,9 @@ async def chat_completions(request: Request):
 
         # --- Injection / utilization instrumentation (lightweight, no DB) ---
         _record_injection(x_sid, tm, kn)
+
+        # Phase 2: repair dangling tool calls before fingerprint + vLLM body
+        built = _repair_dangling_tool_calls(built)
 
         # Per-session prefix check (single hash)
         fp = hashlib.sha256(_prefix_raw(built).encode()).hexdigest()[:16]
