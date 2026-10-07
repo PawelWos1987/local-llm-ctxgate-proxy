@@ -106,4 +106,5 @@ check("multimodal_kept", "tool_calls" not in result9[2])
 check("multimodal_content_intact", result9[2].get("content") == [{"type": "text", "text": "let me check"}])
 
 print(f"\n=== Phase 2: {passed} passed, {failed} failed ===")
-sys.exit(0 if failed == 0 else 1)
+if __name__ == "__main__":
+    sys.exit(0 if failed == 0 else 1)
