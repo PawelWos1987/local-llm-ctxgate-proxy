@@ -1,33 +1,35 @@
 # MASTER STATE
-Last updated: 2026-10-07 12:10
+Last updated: 2026-10-07 12:25
 
-## Current Phase: 5 (Worker sees the work that left the window)
+## Current Phase: RETROFIT (ADDENDUM_1: F13 fix + Phase 1b)
 Status: STARTING
+
+## ADDENDUM_1 active: Phase 1b + Phase 3 extension (INSTRUCTION) + F13 fix
 
 ## Status Table
 | Phase | Status | Tag |
 |-------|--------|-----|
 | 0 | DONE | phase-0-ok |
 | 1 | DONE | phase-1-ok |
+| 1b | STARTING (retrofit) | - |
 | 2 | DONE | phase-2-ok |
 | 3 | DONE | phase-3-ok |
+| 3-ext | VERIFY (INSTRUCTION kind) | - |
 | 4 | DONE | phase-4-ok |
-| 5 | STARTING | - |
+| 5 | DONE | phase-5-ok |
 | 6 | PENDING | - |
 | 7 | PENDING | - |
 
 ## Last Green Commit
-29dc35c Phase 4: cache-safe injection, epoch freeze, recap path (tag: phase-4-ok)
+946a9fd Phase 5: worker sees context slices (tag: phase-5-ok)
 
 ## NEXT ACTION:
-Phase 5: Worker sees the work that left the window
-1. Enqueue context_slice events per chunk in _summarize_trimmed_messages
-2. Worker build_payload: handle context_slice role
-3. Add meta jsonb column to events table
-4. CTXGATE_WORKER_SLICE_CHARS env (default 12000)
-5. Check MILESTONE category constraint
-6. Tests: exactly-once enqueue, per-task ordering, no loop
+1. F13 fix: fingerprint same representation on both sides in _enqueue_memory_job
+2. Phase 1b: mock vLLM harness, golden tests, O1-O4 fixes
+3. Verify Phase 3 INSTRUCTION kind in extractor
+4. Re-run gates
 
 ## Key Files
-- proxy/app.py: 6092 lines (dev copy)
-- worker/worker.py: 965 lines (dev copy)
+- proxy/app.py: 6127 lines (dev copy)
+- worker/worker.py: ~970 lines (dev copy)
+- work/ADDENDUM_1.md: F13-F18 + Phase 1b + Phase 3 ext

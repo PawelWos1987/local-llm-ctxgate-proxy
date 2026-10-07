@@ -3522,8 +3522,8 @@ async def chat_completions(request: Request):
             _epoch_key = _compute_epoch_key(session_key, _ws_for_epoch, _newest_user_anchor, _recap)
             
             # Check if we have a cached block for this epoch
-            _cached_block = ws.get("injected_block") if ws else None
-            _cached_epoch = ws.get("injected_epoch") if ws else None
+            _cached_block = _ws_for_epoch.get("injected_block") if _ws_for_epoch else None
+            _cached_epoch = _ws_for_epoch.get("injected_epoch") if _ws_for_epoch else None
             
             if _cached_epoch == _epoch_key and _cached_block is not None:
                 # Reuse the exact same block (byte-for-byte)
@@ -3570,9 +3570,9 @@ async def chat_completions(request: Request):
                     _block = chr(10) + chr(10) + chr(10).join(_ctx_parts)
                 
                 # Cache the block in window state
-                if ws is not None:
-                    ws["injected_block"] = _block
-                    ws["injected_epoch"] = _epoch_key
+                if _ws_for_epoch is not None:
+                    _ws_for_epoch["injected_block"] = _block
+                    _ws_for_epoch["injected_epoch"] = _epoch_key
                 
                 log.debug("Epoch freeze: new injection block (%d chars) for %s (kn=%dch tm=%dch dig=%dch)",
                          len(_block), _epoch_key[:40], len(kn), len(tm), len(_digest))
@@ -4786,6 +4786,8 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                          "" if exit_reason == "ok" else "stream ended: " + exit_reason,
                          cached_tokens=total_cached_tokens)
 
+
+            _stream_truncated = (exit_reason != "ok") or loop_in_content or loop_in_reasoning
             # One concise diagnostic line
             log.info("NS-DIAG session=%s exit=%s finish=%s truncated=%s conts=%d total_out=%d tc_seen=%d tc_complete=%d tc_emitted=%d reasoning_chars=%d reasoning_chars_first=%d",
                      session_key, exit_reason, finish_reason,
