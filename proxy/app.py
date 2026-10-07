@@ -1707,6 +1707,70 @@ def _window_lock(session_key: str) -> asyncio.Lock:
         _window_locks[session_key] = lk
     return lk
 
+# Phase 4: Cache-safe injection helpers
+
+def _fit_to_budget(sections: list, budget_tokens: int) -> str:
+    """Fit sections into a token budget. Drop OLDEST first, never cut mid-line.
+    
+    sections: list of (priority, text) tuples, priority 0 = newest (keep), higher = older (drop first).
+    Returns the joined string that fits within budget_tokens.
+    """
+    if not sections:
+        return ""
+    # Sort by priority (0 = keep, higher = drop first)
+    sorted_secs = sorted(sections, key=lambda x: x[0])
+    parts = []
+    total = 0
+    for prio, text in sorted_secs:
+        t = count_tokens(text)
+        if total + t > budget_tokens and parts:
+            break
+        parts.append(text)
+        total += t
+    return "\n\n".join(parts)
+
+def _detect_recap_intent(text: str) -> bool:
+    """Deterministic recap intent detection (English + Polish)."""
+    if not text:
+        return False
+    t = text.lower().strip()
+    # English patterns
+    en_patterns = [
+        r"^what did we (do|make|build|create|finish)",
+        r"^summarize (the )?session",
+        r"^recap",
+        r"^status (report|update|check)?$",
+        r"^what (is|are) (done|finished|completed)",
+        r"^what have we (done|finished|completed)",
+        r"^give me a (summary|recap|status)",
+        r"^what (did|has) the (agent|model) (do|finish|complete)",
+    ]
+    # Polish patterns
+    pl_patterns = [
+        r"^co zrobili",
+        r"^podsumuj",
+        r"^co jest zrobione",
+        r"^co zostalo zrobione",
+        r"^status (pracy|projektu|sesji)?$",
+        r"^daj (mi )?(podsumowanie|recap|status)",
+        r"^co sie stalo",
+    ]
+    for p in en_patterns + pl_patterns:
+        if _re.search(p, t):
+            return True
+    return False
+
+def _compute_epoch_key(session_key: str, ws: dict, newest_user_anchor: str, recap: bool) -> str:
+    """Compute the epoch key for injection block caching.
+    
+    The key changes when:
+    - ws.cut changes (re-cut)
+    - newest user message anchor changes (new user message)
+    - recap flag changes
+    """
+    cut = ws.get("cut", 0) if ws else 0
+    return session_key + "|" + str(cut) + "|" + newest_user_anchor + "|" + ("R" if recap else "N")
+
 def _new_window_state(cut: int, rest: list, seed: list, summarized_through: int) -> dict:
     ca = _msg_anchor(rest[cut]) if 0 <= cut < len(rest) else ""
     cp = _msg_anchor(rest[cut - 1]) if 0 <= cut - 1 < len(rest) else ""
@@ -1720,6 +1784,8 @@ def _new_window_state(cut: int, rest: list, seed: list, summarized_through: int)
         "pending_cut": cut,
         "in_flight": False,
         "elide_idx": None,
+        "injected_block": None,
+        "injected_epoch": None,
     }
 
 def _window_valid(ws: dict, seed: list, rest: list) -> bool:
@@ -2849,7 +2915,7 @@ def _score_memory(key, value, category, importance, updated_at, context_terms, c
     dec = 1.0 if category == 'DECISION' else 0.0
     return 0.5 * overlap + 0.2 * imp + 0.1 * rec + 0.2 * dec
 
-async def fetch_task_memory(session_id: str, messages: list, task_uuid: str = None, wm_budget: int = 1200, mem_budget: int = 3300, total_budget: int = 6000) -> str:
+async def fetch_task_memory(session_id: str, messages: list, task_uuid: str = None, wm_budget: int = 1200, mem_budget: int = 3300, total_budget: int = 6000, recap: bool = False) -> str:
     """Section 13/14: per-task durable memory as a SMALL CONDITIONAL supplement.
 
     Final-architecture rules:
@@ -2875,6 +2941,16 @@ async def fetch_task_memory(session_id: str, messages: list, task_uuid: str = No
     # 1. Working memory (current working state) - inject only if not already in context
     # 1+1b+2. Working memory + session summary + durable memories (parallel)
     async def _fetch_rel_mem():
+        if recap:
+            # Phase 4: recap mode - fetch ALL typed memories chronologically
+            rows = await pool.fetch(
+                "SELECT id, key, value, category, importance, updated_at FROM proxy.memories "
+                "WHERE task_id=$1 AND active=true "
+                "AND category IN ('DECISION','FAILURE','MILESTONE') "
+                "ORDER BY updated_at ASC LIMIT 20",
+                task_uuid
+            )
+            return list(rows)
         if terms:
             rows = await pool.fetch(
                 "SELECT id, key, value, category, importance, updated_at FROM proxy.memories "
@@ -2920,7 +2996,7 @@ async def fetch_task_memory(session_id: str, messages: list, task_uuid: str = No
             parts.append(line)
             total += t
 
-    if summary and not _already_in_context(summary, blob):
+    if summary:  # Phase 4: digest is never suppressed by _already_in_context
         line = ("TASK STATE (background only; the NEWEST user message is the live instruction - never resume the first prompt unless the newest message asks for it. "
                 "Where an older message says something is not yet done but this state or the files on disk say it is, trust this state and the disk): " + summary)
         t = count_tokens(line)
@@ -3395,55 +3471,140 @@ async def chat_completions(request: Request):
         tm = ""
         kn = ""
 
-        # --- Knowledge + memory injection (parallel) ---
-        _t0 = time.monotonic()
-        kn, tm = await asyncio.gather(
-            fetch_relevant_knowledge(messages, max_items=5, max_tokens=400),
-            fetch_task_memory(x_sid, built, task_uuid=task_uuid),
-            return_exceptions=True
-        )
-        _dt = (time.monotonic() - _t0) * 1000
-        if _dt > 50:
-            log.warning("SLOW: knowledge+memory fetch %.0fms", _dt)
-        # Phase 1: kn/tm are APPENDED as separate messages after history, before current turn.
-        # The system prompt is NEVER mutated — prefix stays byte-identical for cache stability.
-        if isinstance(kn, Exception):
-            log.warning("Knowledge injection failed: %s", kn)
-            kn = ""
-        if isinstance(tm, Exception):
-            log.warning("Task memory injection failed: %s", tm)
-            tm = ""
-        if kn or tm:
-            last_user_idx = len(built) - 1
-            for i in range(len(built) - 1, -1, -1):
-                if built[i].get("role") == "user":
-                    last_user_idx = i
-                    break
-            # FIX: refuse to inject if the live user message was lost in the cut
-            _raw_last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
-            if _raw_last_user is not None and _msg_anchor(built[last_user_idx]) != _msg_anchor(_raw_last_user):
-                log.error("Newest user message missing from built context (session=%s) - skipping memory injection", session_key)
-                metrics["inject_skipped_stale_user"] += 1
-                kn = tm = ""
-        if kn or tm:
-            _ctx_parts = []
-            if kn:
-                _ctx_parts.append("Relevant knowledge:" + chr(10) + kn)
-            if tm:
-                _ctx_parts.append("Task memory:" + chr(10) + tm)
-            if _ctx_parts:
-                # Append to last user msg content (not a separate message) to prevent
-                # the model from treating it as a standalone turn to acknowledge.
-                _block = chr(10) + chr(10) + chr(10).join(_ctx_parts)
-                existing = built[last_user_idx].get("content", "")
-                if isinstance(existing, str):
-                    built[last_user_idx]["content"] = existing + _block
+        # --- Phase 4: Epoch-freeze injection ---
+        # The injected block (knowledge + task memory + digest) is computed ONCE per epoch
+        # and reused byte-for-byte until the epoch key changes. This prevents prefix cache
+        # busting from per-request DB reads (F7 fix).
+        _epoch_freeze = os.environ.get("CTXGATE_INJECT_EPOCH_FREEZE", "1") == "1"
+        
+        if _epoch_freeze:
+            # Compute epoch key
+            _raw_last_user_e = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+            _newest_user_anchor = _msg_anchor(_raw_last_user_e) if _raw_last_user_e else ""
+            _recap = _detect_recap_intent(_raw_last_user_e.get("content", "") if _raw_last_user_e and isinstance(_raw_last_user_e.get("content"), str) else "")
+            _ws_for_epoch = session_compactions.get(session_key)
+            _epoch_key = _compute_epoch_key(session_key, _ws_for_epoch, _newest_user_anchor, _recap)
+            
+            # Check if we have a cached block for this epoch
+            _cached_block = ws.get("injected_block") if ws else None
+            _cached_epoch = ws.get("injected_epoch") if ws else None
+            
+            if _cached_epoch == _epoch_key and _cached_block is not None:
+                # Reuse the exact same block (byte-for-byte)
+                kn = ""
+                tm = ""
+                _block = _cached_block
+                log.debug("Epoch freeze: reusing cached injection block (%d chars) for %s", len(_block), _epoch_key[:40])
+            else:
+                # New epoch: compute the block
+                _t0 = time.monotonic()
+                kn, tm = await asyncio.gather(
+                    fetch_relevant_knowledge(messages, max_items=5, max_tokens=400),
+                    fetch_task_memory(x_sid, built, task_uuid=task_uuid, recap=_recap),
+                    return_exceptions=True
+                )
+                _dt = (time.monotonic() - _t0) * 1000
+                if _dt > 50:
+                    log.warning("SLOW: knowledge+memory fetch %.0fms", _dt)
+                if isinstance(kn, Exception):
+                    log.warning("Knowledge injection failed: %s", kn)
+                    kn = ""
+                if isinstance(tm, Exception):
+                    log.warning("Task memory injection failed: %s", tm)
+                    tm = ""
+                
+                # Phase 3: Include session digest in the injection
+                _digest = ""
+                try:
+                    _digest = await _build_session_digest(task_uuid, session_key)
+                except Exception as e:
+                    log.debug("Digest fetch failed: %s", e)
+                
+                # Assemble the block
+                _ctx_parts = []
+                if kn:
+                    _ctx_parts.append("Relevant knowledge:" + chr(10) + kn)
+                if tm:
+                    _ctx_parts.append("Task memory:" + chr(10) + tm)
+                if _digest:
+                    _ctx_parts.append("Session digest:" + chr(10) + _digest)
+                
+                _block = ""
+                if _ctx_parts:
+                    _block = chr(10) + chr(10) + chr(10).join(_ctx_parts)
+                
+                # Cache the block in window state
+                if ws is not None:
+                    ws["injected_block"] = _block
+                    ws["injected_epoch"] = _epoch_key
+                
+                log.debug("Epoch freeze: new injection block (%d chars) for %s (kn=%dch tm=%dch dig=%dch)",
+                         len(_block), _epoch_key[:40], len(kn), len(tm), len(_digest))
+            
+            # Apply the block to the last user message
+            if _block:
+                last_user_idx = len(built) - 1
+                for i in range(len(built) - 1, -1, -1):
+                    if built[i].get("role") == "user":
+                        last_user_idx = i
+                        break
+                _raw_last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+                if _raw_last_user is not None and _msg_anchor(built[last_user_idx]) != _msg_anchor(_raw_last_user):
+                    log.error("Newest user message missing from built context (session=%s) - skipping memory injection", session_key)
+                    metrics["inject_skipped_stale_user"] += 1
                 else:
-                    built[last_user_idx]["content"] = list(existing) + [{"type": "text", "text": _block}]
-                log.debug("Memory blocks appended to last user msg at pos %d (kn=%dch tm=%dch)", last_user_idx, len(kn), len(tm))
-
-        # --- Injection / utilization instrumentation (lightweight, no DB) ---
-        _record_injection(x_sid, tm, kn)
+                    existing = built[last_user_idx].get("content", "")
+                    if isinstance(existing, str):
+                        built[last_user_idx]["content"] = existing + _block
+                    else:
+                        built[last_user_idx]["content"] = list(existing) + [{"type": "text", "text": _block}]
+                    log.debug("Memory blocks appended to last user msg at pos %d (%dch)", last_user_idx, len(_block))
+            
+            # Instrumentation
+            _record_injection(x_sid, tm if not isinstance(tm, Exception) else "", kn if not isinstance(kn, Exception) else "")
+        else:
+            # Old path (fallback)
+            _t0 = time.monotonic()
+            kn, tm = await asyncio.gather(
+                fetch_relevant_knowledge(messages, max_items=5, max_tokens=400),
+                fetch_task_memory(x_sid, built, task_uuid=task_uuid),
+                return_exceptions=True
+            )
+            _dt = (time.monotonic() - _t0) * 1000
+            if _dt > 50:
+                log.warning("SLOW: knowledge+memory fetch %.0fms", _dt)
+            if isinstance(kn, Exception):
+                log.warning("Knowledge injection failed: %s", kn)
+                kn = ""
+            if isinstance(tm, Exception):
+                log.warning("Task memory injection failed: %s", tm)
+                tm = ""
+            if kn or tm:
+                last_user_idx = len(built) - 1
+                for i in range(len(built) - 1, -1, -1):
+                    if built[i].get("role") == "user":
+                        last_user_idx = i
+                        break
+                _raw_last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+                if _raw_last_user is not None and _msg_anchor(built[last_user_idx]) != _msg_anchor(_raw_last_user):
+                    log.error("Newest user message missing from built context (session=%s) - skipping memory injection", session_key)
+                    metrics["inject_skipped_stale_user"] += 1
+                    kn = tm = ""
+            if kn or tm:
+                _ctx_parts = []
+                if kn:
+                    _ctx_parts.append("Relevant knowledge:" + chr(10) + kn)
+                if tm:
+                    _ctx_parts.append("Task memory:" + chr(10) + tm)
+                if _ctx_parts:
+                    _block = chr(10) + chr(10) + chr(10).join(_ctx_parts)
+                    existing = built[last_user_idx].get("content", "")
+                    if isinstance(existing, str):
+                        built[last_user_idx]["content"] = existing + _block
+                    else:
+                        built[last_user_idx]["content"] = list(existing) + [{"type": "text", "text": _block}]
+                    log.debug("Memory blocks appended to last user msg at pos %d (kn=%dch tm=%dch)", last_user_idx, len(kn), len(tm))
+            _record_injection(x_sid, tm if not isinstance(tm, Exception) else "", kn if not isinstance(kn, Exception) else "")
 
         # Phase 2: repair dangling tool calls before fingerprint + vLLM body
         built = _repair_dangling_tool_calls(built)

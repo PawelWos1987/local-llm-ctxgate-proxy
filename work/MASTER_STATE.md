@@ -1,38 +1,35 @@
-# MASTER_STATE
+# MASTER STATE
+Last updated: 2026-10-07 11:55
 
-## Current Phase: 2 COMPLETE → Phase 3 (Ledger + Summarizer)
+## Current Phase: 4 (Cache-safe injection + recap path)
+Status: STARTING
 
-## Status
-| Phase | Status | Gate |
-|-------|--------|------|
-| 0 | DONE | G-PREFIX baseline captured |
-| 1 | DONE | 20/20 tests, G-PREFIX unchanged |
-| 1b | DONE | 9/9 goldens, 10/10 F14, G-PREFIX unchanged |
-| 2 | DONE | 13/13 tests, G-PREFIX unchanged |
-| 3 | PENDING | - |
-| 4 | PENDING | - |
+## Status Table
+| Phase | Status | Tag |
+|-------|--------|-----|
+| 0 | DONE | phase-0-ok |
+| 1 | DONE | phase-1-ok |
+| 2 | DONE | phase-2-ok |
+| 3 | DONE | phase-3-ok |
+| 4 | STARTING | - |
 | 5 | PENDING | - |
 | 6 | PENDING | - |
 | 7 | PENDING | - |
 
-ADDENDUM_1 active: Phase 1b + Phase 3 extension (INSTRUCTION ledger rows) + F13 fix.
-
-## Key Facts
-- Dev repo: /home/pawelw/ctxproxy-dev (git, baseline d412fe9, phase-2-ok). Live: /home/pawelw/ctxproxy (DO NOT EDIT/RESTART).
-- Harness: tests/harness_window.py. Reference: tests/reference_prefix.json.
-- Worker: worker/worker.py. App: proxy/app.py.
-- Test DB: ctxproxy_test. DSN: postgresql://postgres:11!!AdaMicPaw@127.0.0.1:5432/ctxproxy_test
+## Last Green Commit
+47b6ff8 Phase 3: deterministic ledger, digest, summarizer fixes (tag: phase-3-ok)
 
 ## NEXT ACTION:
-Phase 3: Durable deterministic ledger + summarizer fixes.
-1. Migration: proxy.session_ledger table + phase_summaries columns
-2. Deterministic extractor (tool calls → ARTIFACT/TEST_RESULT/FAILURE)
-3. Summarizer: idempotent phases, watermark independence, better prompt
-4. _build_session_digest (replaces root step)
-5. ADDENDUM_1: INSTRUCTION ledger rows for user messages
+Phase 4: Cache-safe injection + recap path
+1. Epoch freeze: compute injected block once per epoch key, store in window state
+2. Re-cut synchronicity: run extractor on newly dropped slice at re-cut time
+3. Digest budgeting: _fit_to_budget function
+4. Recap intent detection (English + Polish)
+5. Suppression fix: _already_in_context must not suppress digest/ledger
+6. Env flag CTXGATE_INJECT_EPOCH_FREEZE (default 1)
 
-## Notes
-- Phase 2: _repair_dangling_tool_calls applied before fingerprint+vLLM body.
-  Invariant warning still fires (runs in build_context before repair) - cosmetic.
-- F14: _detect_loop fixed (multi-line rejection + consecutive-word test).
-- F13: dedup fingerprints canonical envelope.
+## Key Files
+- proxy/app.py: 5915 lines (dev copy)
+- worker/worker.py: 965 lines (dev copy)
+- work/MASTER_PLAN.md: the brief
+- work/ADDENDUM_1.md: F13 + Phase 1b + Phase 3/5 extensions
