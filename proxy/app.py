@@ -551,24 +551,28 @@ def _extract_ledger_entries(msgs: list, slice_start: int, slice_end: int, task_u
                 "dedupe_hash": dedupe,
                 "slice_start": slice_start, "slice_end": slice_end,
             })
-    # ADDENDUM_1: INSTRUCTION entries from user messages
+    # ADDENDUM_1: INSTRUCTION entries from user messages (every real user message
+    # dropped from the window; not tool results, not <turn-context> boilerplate).
+    # First 600 chars + total length + sha1; dedupe by sha1 of full content.
     for m in msgs:
         if m.get("role") != "user":
             continue
         uc = m.get("content", "")
         if not isinstance(uc, str):
             uc = json.dumps(uc)
-        if len(uc) < 30:
+        # Strip <turn-context> boilerplate (not a real instruction)
+        uc_clean = _re.sub(r"<turn-context>.*?</turn-context>", "", uc, flags=_re.DOTALL).strip()
+        if len(uc_clean) < 30:
             continue
-        if _re.search(r"\b(do|implement|create|write|fix|add|remove|change|update|build|test|deploy|refactor|optimize|extract|migrate)\b", uc, _re.IGNORECASE):
-            title_u = uc[:100].strip()
-            dedupe_u = _hashlib.sha1(("INSTRUCTION|" + title_u).encode()).hexdigest()
-            entries.append({
-                "kind": "INSTRUCTION", "title": title_u,
-                "detail": uc[:500], "evidence": "user_message",
-                "source": "user", "dedupe_hash": dedupe_u,
-                "slice_start": slice_start, "slice_end": slice_end,
-            })
+        title_u = uc_clean[:100].strip()
+        sha1_u = _hashlib.sha1(uc_clean.encode()).hexdigest()
+        entries.append({
+            "kind": "INSTRUCTION", "title": title_u,
+            "detail": uc_clean[:600] + " (total %d chars, sha1=%s)" % (len(uc_clean), sha1_u[:12]),
+            "evidence": "user_message",
+            "source": "user", "dedupe_hash": sha1_u,
+            "slice_start": slice_start, "slice_end": slice_end,
+        })
     return entries
 
 async def _persist_ledger_entries(entries: list, task_uuid):
