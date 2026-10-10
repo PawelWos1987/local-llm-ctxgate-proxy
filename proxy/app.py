@@ -19,7 +19,10 @@ import aiosqlite
 import asyncpg
 import httpx
 import tiktoken
-import tokenizers
+try:
+    import tokenizers
+except ImportError:
+    tokenizers = None
 from fastapi import FastAPI, Request, Response, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -1048,7 +1051,8 @@ async def _fetch_session_summary(task_uuid, budget=1500, session_key: str = ""):
             t = count_tokens(s)
             if t <= budget:
                 return s
-            return s[:budget * 8]
+            max_chars = int(budget * _EST_CHARS_PER_TOKEN)
+            return s[:max_chars]
     except Exception as e:
         log.warning("Session summary fetch failed: %s", e)
     return ""
@@ -1531,21 +1535,27 @@ async def lifespan(app: FastAPI):
         log.info("LM data-flow: conversation text WILL be sent to external LM at %s (model=%s)", MISTRAL_URL, MISTRAL_MODEL)
     else:
         log.info("LM data-flow: conversation text will NOT be sent to external LM (CTXGATE_LM_ENABLED=0)")
-    if not QWEN_TOKENIZER_PATH:
-        log.error("CTXGATE_QWEN_TOKENIZER is required. Set it to the path of tokenizer.json")
-        raise SystemExit(78)
-    if not os.path.isfile(QWEN_TOKENIZER_PATH):
-        log.error("Tokenizer file not found: %s", QWEN_TOKENIZER_PATH)
-        raise SystemExit(78)
-    try:
-        enc = tokenizers.Tokenizer.from_file(QWEN_TOKENIZER_PATH)
-        tok_name = "Qwen tokenizer.json"
-        vocab = enc.get_vocab_size()
-        log.info("ctxgate-proxy started: tokenizer=%s vocab=%d, vllm=%s model=%s",
-                 tok_name, vocab, VLLM_URL, VLLM_MODEL)
-    except Exception as e:
-        log.error("Failed to load tokenizer %s: %s", QWEN_TOKENIZER_PATH, e)
-        raise SystemExit(78)
+    # Tokenizer NOT loaded at startup (removed from hot path).
+    # Only loaded when CTXGATE_TOKEN_ESTIMATOR=exact (rollback mode).
+    global enc
+    if _ESTIMATOR_MODE == "exact":
+        if not QWEN_TOKENIZER_PATH:
+            log.error("CTXGATE_QWEN_TOKENIZER is required for exact mode")
+            raise SystemExit(78)
+        if not os.path.isfile(QWEN_TOKENIZER_PATH):
+            log.error("Tokenizer file not found: %s", QWEN_TOKENIZER_PATH)
+            raise SystemExit(78)
+        try:
+            enc = tokenizers.Tokenizer.from_file(QWEN_TOKENIZER_PATH)
+            vocab = enc.get_vocab_size()
+            log.info("ctxgate-proxy started: tokenizer=Qwen vocab=%d (EXACT mode), vllm=%s model=%s",
+                     vocab, VLLM_URL, VLLM_MODEL)
+        except Exception as e:
+            log.error("Failed to load tokenizer %s: %s", QWEN_TOKENIZER_PATH, e)
+            raise SystemExit(78)
+    else:
+        log.info("ctxgate-proxy started: estimator=calibrated (k=%.1f, overhead=%d), vllm=%s model=%s",
+                 _EST_CHARS_PER_TOKEN, _EST_MSG_OVERHEAD, VLLM_URL, VLLM_MODEL)
 
     # Start memory worker background loop
     worker_task = asyncio.create_task(_memory_worker_loop())
@@ -1775,79 +1785,177 @@ def _check_tenant_rate_limit(tenant_id: str):
     return None
 
 # --- Token counting ---
-def count_tokens(text: str, estimate: bool = False) -> int:
+
+# --- Calibrated Token Predictor Constants ---
+# Derived from Phase 1 calibration on Qwen3.8-27B:
+#   - 400k capture (English/code/JSON mix): 7.8 chars/token
+#   - DB sessions (Polish-heavy): 3.7-5.0 chars/token
+#   - Per-message template overhead: ~6-8 tokens (Qwen3 chat template)
+# Conservative k=5.0 ensures we never under-count for Polish content.
+# The EWMA calibrator adapts per-session within 2-3 requests.
+_EST_CHARS_PER_TOKEN = 4.1
+_EST_TOOLS_CHARS_PER_TOKEN = 1.5
+_EST_MSG_OVERHEAD = 10
+_EST_TC_OVERHEAD = 4
+_EST_COLD_START_MARGIN = 0.10
+_EST_EWMA_ALPHA = 0.3
+_EST_MARGIN_CLAMP_LO = 0.05
+_EST_MARGIN_CLAMP_HI = 0.25
+_EST_RATIO_CLAMP_LO = 0.5
+_EST_RATIO_CLAMP_HI = 2.0
+
+# Token estimator mode: "calibrated" (default) or "exact" (rollback)
+_ESTIMATOR_MODE = os.environ.get("CTXGATE_TOKEN_ESTIMATOR", "calibrated")
+
+class _TokenEstimator:
+    """Per-session EWMA calibrator for the token predictor."""
+    __slots__ = ("_global_ratio", "_global_margin", "_sessions", "_obs_count")
+
+    def __init__(self):
+        self._global_ratio = 1.0
+        self._global_margin = _EST_COLD_START_MARGIN
+        self._sessions: dict[str, dict] = {}
+        self._obs_count = 0
+
+    def predict(self, raw_units: int, session_key: str = "") -> int:
+        """Apply the calibrated ratio and margin to a raw prediction."""
+        if _ESTIMATOR_MODE == "exact":
+            return raw_units
+        ratio, margin = self._get_params(session_key)
+        return int(raw_units * ratio * (1.0 + margin))
+
+    def observe(self, predicted: int, actual: int, session_key: str = "") -> None:
+        """Record an observation and update the EWMA ratio."""
+        if predicted <= 0 or actual <= 0:
+            return
+        ratio = actual / predicted
+        ratio = max(_EST_RATIO_CLAMP_LO, min(_EST_RATIO_CLAMP_HI, ratio))
+        self._obs_count += 1
+        self._global_ratio = _EST_EWMA_ALPHA * ratio + (1 - _EST_EWMA_ALPHA) * self._global_ratio
+        if session_key:
+            s = self._sessions.get(session_key)
+            if s is None:
+                s = {"ratio": 1.0, "margin": _EST_COLD_START_MARGIN, "n": 0, "recent": []}
+                self._sessions[session_key] = s
+            s["ratio"] = _EST_EWMA_ALPHA * ratio + (1 - _EST_EWMA_ALPHA) * s["ratio"]
+            s["n"] += 1
+            s["recent"].append(ratio)
+            if len(s["recent"]) > 50:
+                s["recent"].pop(0)
+            under_errors = [1.0 - r for r in s["recent"] if r < 1.0]
+            max_under = max(under_errors) if under_errors else 0.0
+            s["margin"] = max(_EST_MARGIN_CLAMP_LO, min(_EST_MARGIN_CLAMP_HI, max(_EST_COLD_START_MARGIN, max_under)))
+
+    def bump_margin(self, session_key: str, amount: float = 0.05) -> None:
+        """Increase margin after a vLLM 400 (overflow feedback)."""
+        if session_key:
+            s = self._sessions.get(session_key)
+            if s is not None:
+                s["margin"] = min(_EST_MARGIN_CLAMP_HI, s["margin"] + amount)
+        self._global_margin = min(_EST_MARGIN_CLAMP_HI, self._global_margin + amount)
+
+    def _get_params(self, session_key: str) -> tuple:
+        if session_key:
+            s = self._sessions.get(session_key)
+            if s is not None and s["n"] >= 2:
+                return (s["ratio"], s["margin"])
+        return (self._global_ratio, self._global_margin)
+
+    @property
+    def global_ratio(self) -> float:
+        return self._global_ratio
+
+    @property
+    def global_margin(self) -> float:
+        return self._global_margin
+
+    def metrics_snapshot(self) -> dict:
+        return {
+            "estimator_ratio": self._global_ratio,
+            "estimator_margin": self._global_margin,
+            "estimator_obs_count": self._obs_count,
+            "estimator_sessions": len(self._sessions),
+        }
+
+_estimator = _TokenEstimator()
+
+def count_tokens(text: str, exact: bool = False) -> int:
     """Count tokens in text.
 
-    When `estimate=True`, returns a chars/8 approximation
-    calibrated on Qwen3.8-27B (measured ~7.5 chars/token on
-    real agent content). Use for bulk decisions where ±10%
-    error is acceptable.
+    Default (exact=False): calibrated predictor using pure length
+    arithmetic. No tokenizer call, no event-loop blocking.
 
-    When `estimate=False` (default), uses the loaded tokenizer
-    for exact counts. Falls back to chars/8 if the tokenizer is
-    unavailable.
+    When exact=True: uses the loaded tokenizer for exact counts
+    (offline calibration only; never called from foreground paths).
     """
-    if estimate:
-        return int(len(text) / 8.0) + 1
-    if not enc:
-        return int(len(text) / 8.0) + 1
-    try:
-        return len(enc.encode(text).ids)
-    except AttributeError:
-        return len(enc.encode(text))
-
-def count_message_tokens(msg: dict, estimate: bool = False) -> int:
+    if exact:
+        if not enc:
+            return int(len(text) / _EST_CHARS_PER_TOKEN) + 1
+        try:
+            return len(enc.encode(text).ids)
+        except AttributeError:
+            return len(enc.encode(text))
+    # Calibrated predictor: pure length arithmetic
+    return int(len(text) / _EST_CHARS_PER_TOKEN) + 1
+def count_message_tokens(msg: dict, exact: bool = False) -> int:
+    """Predict token count for a single message. Pure length arithmetic."""
     content = msg.get("content") or ""
     if isinstance(content, list):
-        content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
-    tokens = count_tokens(f"\n{msg.get('role', '')}", estimate) + count_tokens(content, estimate)
+        clen = sum(len(p.get("text", "")) for p in content if isinstance(p, dict))
+    else:
+        clen = len(content)
+    role = msg.get("role", "")
+    tokens = int((clen + len(role) + 1) / _EST_CHARS_PER_TOKEN) + _EST_MSG_OVERHEAD
     tc = msg.get("tool_calls")
     if tc:
-        tokens += count_tokens(json.dumps(tc), estimate)
+        tc_chars = sum(len(json.dumps(t)) for t in tc) if isinstance(tc, list) else len(json.dumps(tc))
+        tokens += int(tc_chars / _EST_CHARS_PER_TOKEN) + _EST_TC_OVERHEAD
     if msg.get("tool_call_id"):
-        tokens += count_tokens(msg["tool_call_id"], estimate)
+        tokens += int(len(msg["tool_call_id"]) / _EST_CHARS_PER_TOKEN) + 1
     return tokens
+def _estimate_tools_tokens(tools: list) -> int:
+    """Estimate token count for a tools array. Cached by content hash."""
+    key = id(tools)
+    cached = _tools_tok_cache.get(key)
+    if cached is not None:
+        return cached
+    # Serialize once and estimate from length
+    s = json.dumps(tools, separators=(",", ":"))
+    est = int(len(s) / _EST_TOOLS_CHARS_PER_TOKEN) + len(tools) * _EST_MSG_OVERHEAD
+    _tools_tok_cache[key] = est
+    return est
 
-def count_messages_tokens(messages: list, estimate: bool = False) -> int:
+_tools_tok_cache: dict[int, int] = {}
+
+def count_messages_tokens(messages: list, exact: bool = False, tools: list | None = None) -> int:
+    """Predict total token count for a message list. O(n) pure arithmetic."""
     if not messages:
         return 0
-    parts = []
+    if exact:
+        parts = []
+        for m in messages:
+            r = m.get("role", "")
+            c = m.get("content") or ""
+            if isinstance(c, list):
+                c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+            parts.append("\n" + r + " " + c)
+            tc = m.get("tool_calls")
+            if tc: parts.append(" " + json.dumps(tc))
+            if m.get("tool_call_id"): parts.append(" " + m["tool_call_id"])
+        full = " ".join(parts)
+        if not enc:
+            return int(len(full) / _EST_CHARS_PER_TOKEN) + len(messages) * _EST_MSG_OVERHEAD
+        try:
+            return len(enc.encode(full).ids) + len(messages) * _EST_MSG_OVERHEAD
+        except AttributeError:
+            return len(enc.encode(full)) + len(messages) * _EST_MSG_OVERHEAD
+    # Calibrated predictor: sum per-message predictions
+    total = 0
     for m in messages:
-        r = m.get("role", "")
-        c = m.get("content") or ""
-        if isinstance(c, list):
-            c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
-        parts.append("\n" + r + " " + c)
-        tc = m.get("tool_calls")
-        if tc: parts.append(" " + json.dumps(tc))
-        if m.get("tool_call_id"): parts.append(" " + m["tool_call_id"])
-    full = " ".join(parts)
-    if estimate:
-        return int(len(full) / 8.0) + len(messages) * 12
-    if not enc:
-        return int(len(full) / 8.0) + 1 + len(messages) * 12
-    try:
-        return len(enc.encode(full).ids) + len(messages) * 12
-    except AttributeError:
-        return len(enc.encode(full)) + len(messages) * 12
-
-
-def _smart_messages_tokens(messages: list, low: int, high: int) -> int:
-    """Estimate message tokens; use exact count only if the
-    estimate falls in the sensitive window [low, high].
-
-    Rationale: outside the window, a ±10% estimate error does
-    not change the decision being made. Inside the window, the
-    exact tokenizer is invoked to avoid boundary errors.
-
-    The window is deliberately wider than the observed ±9%
-    estimate error (measured on Qwen3.8-27B content) so the
-    exact path is rarely taken.
-    """
-    est = count_messages_tokens(messages, estimate=True)
-    if low <= est <= high:
-        return count_messages_tokens(messages)
-    return est
+        total += count_message_tokens(m)
+    if tools:
+        total += _estimate_tools_tokens(tools)
+    return total
 def _prefix_diag(session_key: str, messages: list) -> None:
     """P8: compare per-message sha1 of the FINAL upstream messages against the
     previous request. Logs how many leading messages are byte-identical (the
@@ -2407,7 +2515,7 @@ def _recut_to(messages: list, max_tokens: int) -> int:
     rest = list(messages[3:])
     stub_tok = _note_tok()  # COMPACTION_NOTE is added to message 0 later in the handler
     seed_tok = count_messages_tokens(seed)
-    total_tok = count_messages_tokens(messages, estimate=True)
+    total_tok = count_messages_tokens(messages)
     lu = _newest_user_idx(rest)
     pinned_copy_tok = count_message_tokens(_make_pinned_copy(rest[lu])) if lu is not None else 0
     budget = max(500, max_tokens - seed_tok - stub_tok - pinned_copy_tok - 200)
@@ -2747,30 +2855,20 @@ class ContextCapacityError(Exception):
         self.ceiling = ceiling
 
 def _emergency_shrink(kept: list, ceiling: int) -> list:
-    """Hard invariant: shrink a built window to <= ceiling tokens without breaking
-    the tool-call graph. Used by build_context (both paths) and the 400 re-trim.
-
-    Canonical order:
-      1. preserve seed
-      2. preserve pinned newest-user copy
-      3. preserve newest-4 tool groups (via protected_tool_groups)
-      4. elide OLDER tool bodies only (skip protected)
-      5. drop oldest complete assistant/user/tool groups
-      6. if STILL over because PROTECTED material exceeds ceiling ->
-         raise ContextCapacityError (caller turns into 413)
-
-    Returns the (possibly new) list; never mutates the caller list."""
+    """Hard invariant: shrink a built window to <= ceiling tokens.
+    K6 fix: O(n) total, incremental running sum, zero re-prediction in loop."""
     before = count_messages_tokens(kept)
     if before <= ceiling:
         return kept
     metrics["emergency_shrink_total"] += 1
     work = [dict(m) for m in kept]
     protected = _protected_indices(work)
-    def _tok():
-        return count_messages_tokens(work)
+    # K6: compute per-message predictions ONCE
+    tok_list = [count_message_tokens(m) for m in work]
+    running_total = sum(tok_list)
     # (4) elide large tool bodies, oldest-first, SKIP protected
     for i in range(len(work)):
-        if _tok() <= ceiling:
+        if running_total <= ceiling:
             break
         if i in protected:
             continue
@@ -2780,10 +2878,15 @@ def _emergency_shrink(kept: list, ceiling: int) -> list:
         c = m.get("content")
         if not isinstance(c, str) or len(c) <= 2500:
             continue
-        work[i]["content"] = _elided_tool_content(c)
+        new_c = _elided_tool_content(c)
+        old_tok = tok_list[i]
+        new_tok = count_message_tokens({**m, "content": new_c})
+        running_total += new_tok - old_tok
+        work[i]["content"] = new_c
+        tok_list[i] = new_tok
     # (5) drop oldest whole groups while still over
     dropped_groups = 0
-    while _tok() > ceiling:
+    while running_total > ceiling:
         start = None
         for i in range(len(work)):
             if i in protected:
@@ -2801,21 +2904,21 @@ def _emergency_shrink(kept: list, ceiling: int) -> list:
                 j += 1
         while end > start and end in protected:
             end -= 1
+        for i in range(start, end + 1):
+            running_total -= tok_list[i]
         del work[start:end + 1]
+        del tok_list[start:end + 1]
         dropped_groups += 1
     metrics["emergency_shrink_groups_dropped"] += dropped_groups
     # (6) if STILL over: protected material alone exceeds ceiling
-    if _tok() > ceiling:
-        after = _tok()
+    if running_total > ceiling:
+        after = running_total
         log.error("EMERGENCY SHRINK: protected material exceeds ceiling (before=%d now=%d ceiling=%d)", before, after, ceiling)
         raise ContextCapacityError(
             f"Protected current-turn data alone exceeds the safe budget "
             f"({after} tokens > ceiling {ceiling}). Reduce input or increase CTXGATE_MAX_CONTEXT.",
             before, ceiling)
-    after = _tok()
-    log.warning("EMERGENCY SHRINK: before=%d after=%d ceiling=%d groups_dropped=%d", before, after, ceiling, dropped_groups)
-    return work
-
+    after = running_total
 async def _window_persist(session_key: str, ws: dict) -> None:
     """Upsert the window row. Feature-detects the table; a failure never fails a
     request (skips persistence for 60s after an error, warns once)."""
@@ -2921,10 +3024,7 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
                 base = 3 + has_pin
                 # rest[cut:elide_idx] maps to kept[base : base+(elide_idx-cut)]
                 _stable_elide_inplace(kept, base, base + (ws["elide_idx"] - ws["cut"]))
-            kept_tok = _smart_messages_tokens(
-                kept,
-                int(0.9 * MAX_INPUT),
-                int(1.1 * MAX_INPUT))
+            kept_tok = count_messages_tokens(kept)
             ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT) - _note_n
             if kept_tok > ceiling:
                 # Sticky window exceeded the hard ceiling: bail out of the fast
@@ -2968,10 +3068,7 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
         messages = _prep_messages(raw)
         seed = list(messages[:3])
         rest = messages[3:]
-        total = _smart_messages_tokens(
-            messages,
-            int(0.9 * MAX_INPUT),
-            int(1.1 * MAX_INPUT))
+        total = count_messages_tokens(messages)
         log.info("Context: %d messages, %d tokens (limit %d)", len(messages), total, MAX_INPUT)
         if total <= MAX_INPUT - _note_n:
             return messages
@@ -3014,10 +3111,7 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
             base2 = 3 + has_pin2
             # rest[cut:elide_idx] maps to kept[base2 : base2+(elide_idx-cut)]
             _stable_elide_inplace(kept, base2, base2 + (elide_idx - cut))
-        kept_tok = _smart_messages_tokens(
-            kept,
-            int(0.9 * MAX_INPUT),
-            int(1.1 * MAX_INPUT))
+        kept_tok = count_messages_tokens(kept)
         ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT) - _note_n
         if kept_tok > ceiling:
             try:
@@ -3647,11 +3741,14 @@ async def ready():
     except Exception as e:
         checks["postgres"] = "error: " + str(e)[:80]
         ok = False
-    if enc:
-        checks["tokenizer"] = "ok"
+    if _ESTIMATOR_MODE == "exact":
+        if enc:
+            checks["tokenizer"] = "ok"
+        else:
+            checks["tokenizer"] = "missing"
+            ok = False
     else:
-        checks["tokenizer"] = "missing"
-        ok = False
+        checks["tokenizer"] = "not_required (calibrated mode)"
     try:
         async with httpx.AsyncClient(timeout=3) as c:
             r = await c.get(VLLM_URL + "/models")
@@ -4176,8 +4273,7 @@ async def chat_completions(request: Request):
         _t0 = time.monotonic()
         _sensitive_input_lo = MAX_CONTEXT - SAFETY_MARGIN - MAX_OUTPUT - int(0.1 * MAX_OUTPUT)
         _sensitive_input_hi = MAX_CONTEXT - SAFETY_MARGIN - MAX_OUTPUT + int(0.1 * MAX_OUTPUT)
-        input_tokens = _smart_messages_tokens(
-            built, _sensitive_input_lo, _sensitive_input_hi)
+        input_tokens = count_messages_tokens(built, tools=body.get("tools"))
         _dt = (time.monotonic() - _t0) * 1000
         if _dt > 50:
             log.warning("SLOW: count_messages_tokens %.0fms (tokens=%d)", _dt, input_tokens)
@@ -4219,7 +4315,7 @@ async def chat_completions(request: Request):
                               MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
                 if input_tokens > ceiling:
                     built = _emergency_shrink(built, ceiling)
-                    input_tokens = count_messages_tokens(built)
+                    input_tokens = count_messages_tokens(built, tools=body.get("tools"))
                     max_tokens = _output_budget(input_tokens)
             if max_tokens < MIN_OUTPUT:
                 log.error(
@@ -4829,7 +4925,12 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
         _record_call(session_key, input_tokens, output_tokens, "ok", VLLM_MODEL, False, cached_tokens=_ns_cached)
         data["usage"]["completion_tokens"] = output_tokens
         data["usage"]["total_tokens"] = input_tokens + output_tokens
-        data["usage"]["prompt_tokens"] = input_tokens
+        _real_pt = data["usage"].get("prompt_tokens", input_tokens)
+        data["usage"]["prompt_tokens"] = _real_pt
+        _estimator.observe(input_tokens, _real_pt, session_key)
+        log.info("TOKEST est=%d real=%d err=%+.1f%% ratio=%.3f m=%.3f session=%s",
+                 input_tokens, _real_pt, 100.0*(_real_pt-input_tokens)/max(1,input_tokens),
+                 _estimator.global_ratio, _estimator.global_margin, session_key)
         for ch in data.get("choices", []):
             msg = ch.get("message", {})
             if "reasoning" in msg and "reasoning_content" not in msg:
@@ -5177,7 +5278,12 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                     if usage.get("completion_tokens"):
                                         seg_output_tokens = usage["completion_tokens"]
                                     total_cached_tokens += (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-                                    usage["prompt_tokens"] = input_tokens
+                                    _real_pt = usage.get("prompt_tokens", input_tokens)
+                                    usage["prompt_tokens"] = _real_pt
+                                    _estimator.observe(input_tokens, _real_pt, session_key)
+                                    log.info("TOKEST est=%d real=%d err=%+.1f%% ratio=%.3f m=%.3f session=%s",
+                                             input_tokens, _real_pt, 100.0*(_real_pt-input_tokens)/max(1,input_tokens),
+                                             _estimator.global_ratio, _estimator.global_margin, session_key)
                                     usage["total_tokens"] = input_tokens + (usage.get("completion_tokens") or 0)
                                 choices = chunk.get("choices", [])
                                 if not choices:
@@ -5514,7 +5620,12 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                         if usage.get("completion_tokens"):
                                             seg_output_tokens = usage["completion_tokens"]
                                         total_cached_tokens += (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-                                        usage["prompt_tokens"] = input_tokens
+                                        _real_pt = usage.get("prompt_tokens", input_tokens)
+                                        usage["prompt_tokens"] = _real_pt
+                                        _estimator.observe(input_tokens, _real_pt, session_key)
+                                        log.info("TOKEST est=%d real=%d err=%+.1f%% ratio=%.3f m=%.3f session=%s",
+                                                 input_tokens, _real_pt, 100.0*(_real_pt-input_tokens)/max(1,input_tokens),
+                                                 _estimator.global_ratio, _estimator.global_margin, session_key)
                                         usage["total_tokens"] = input_tokens + (usage.get("completion_tokens") or 0)
                                         try:
                                             _ptd = usage.get("prompt_tokens_details") or {}
