@@ -28,14 +28,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 class _AccessLogFilter(logging.Filter):
     """Drop uvicorn access-log records for the dashboard's
     high-frequency poll endpoints. Everything else passes."""
-    _SILENT_PATHS = ("/health",)
+    _SILENT_PATHS = ("/health", "/v1/chat/completions")
     def filter(self, record):
         try:
             args = record.args
             # uvicorn logs: (client_addr, method, path, http_version, status)
             if args and len(args) >= 3:
                 method, path = args[1], args[2]
-                if method == "GET":
+                if method in ("GET", "POST"):
                     for p in self._SILENT_PATHS:
                         if path == p or path.startswith(p + "?"):
                             return False
@@ -4789,9 +4789,10 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             msg = ch.get("message", {})
             if "reasoning" in msg and "reasoning_content" not in msg:
                 msg["reasoning_content"] = msg.pop("reasoning")
-        log.info("NS-DIAG session=%s exit=%s finish=%s truncated=%s conts=%d total_out=%d tc_seen=%d tc_complete=%d tc_emitted=%d",
-                 session_key, exit_reason, choices[0].get("finish_reason","?") if choices else "?",
-                 truncated, cont_count, total_output_tokens, tool_calls_emitted, tool_calls_complete, tool_calls_emitted)
+        if exit_reason not in ("ok", "tool_calls_complete"):
+            log.warning("NS-DIAG session=%s exit=%s finish=%s truncated=%s conts=%d total_out=%d tc_seen=%d tc_complete=%d tc_emitted=%d",
+                        session_key, exit_reason, choices[0].get("finish_reason","?") if choices else "?",
+                        truncated, cont_count, total_output_tokens, tool_calls_emitted, tool_calls_complete, tool_calls_emitted)
         return JSONResponse(data)
     except httpx.TimeoutException:
         metrics["requests_error"] += 1
@@ -5684,10 +5685,11 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
 
             _stream_truncated = (exit_reason != "ok" and exit_reason != "tool_calls_complete") or loop_in_content or loop_in_reasoning
             # One concise diagnostic line
-            log.info("NS-DIAG session=%s exit=%s finish=%s truncated=%s conts=%d total_out=%d tc_seen=%d tc_complete=%d tc_emitted=%d reasoning_chars=%d reasoning_chars_first=%d",
-                     session_key, exit_reason, finish_reason,
-                     _stream_truncated, continuation_count, total_output_tokens,
-                     tc_accum.count(), tc_complete, tc_emitted_n, reasoning_chars, reasoning_chars_first)
+            if exit_reason not in ("ok", "tool_calls_complete"):
+                log.warning("NS-DIAG session=%s exit=%s finish=%s truncated=%s conts=%d total_out=%d tc_seen=%d tc_complete=%d tc_emitted=%d reasoning_chars=%d reasoning_chars_first=%d",
+                           session_key, exit_reason, finish_reason,
+                           _stream_truncated, continuation_count, total_output_tokens,
+                           tc_accum.count(), tc_complete, tc_emitted_n, reasoning_chars, reasoning_chars_first)
 
             # Flush any remaining seam text BEFORE the final marker
             for x in _flush_seam():
