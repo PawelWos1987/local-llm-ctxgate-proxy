@@ -4196,9 +4196,6 @@ async def chat_completions(request: Request):
             "messages": built,
             "max_tokens": max_tokens,
             "stream": stream,
-            # Internal: disables auto-continuation for clients that
-            # provided their own max_tokens cap.
-            "_ctxgate_no_continue": _client_cap is not None,
         }
         # Sampling: send temperature ONLY when the client sent one and it is at/above
         # the floor. Otherwise omit it so the server's tuned default (1.0) applies.
@@ -4240,10 +4237,23 @@ async def chat_completions(request: Request):
             _prefix_diag(session_key, vllm_body.get("messages", []))
 
         _t0 = time.monotonic()
-        if stream:
-            result = await stream_to_vllm(vllm_body, input_tokens, session_key)
+        if _client_cap is not None:
+            # Fallback path: raw passthrough, no Goose protections.
+            if stream:
+                result = await stream_to_vllm_passthrough(
+                    vllm_body, input_tokens, session_key)
+            else:
+                result = await forward_to_vllm_passthrough(
+                    vllm_body, input_tokens, session_key)
         else:
-            result = await forward_to_vllm(vllm_body, input_tokens, session_key)
+            # Goose path: full protections (loop detection, retries,
+            # continuation, seam dedup, ctxgate_meta).
+            if stream:
+                result = await stream_to_vllm(
+                    vllm_body, input_tokens, session_key)
+            else:
+                result = await forward_to_vllm(
+                    vllm_body, input_tokens, session_key)
         _dt = (time.monotonic() - _t0) * 1000
         if _dt > 50:
             log.warning("SLOW: vllm_call %.0fms (in=%d stream=%s)", _dt, input_tokens, stream)
@@ -4449,12 +4459,82 @@ def _normalize_system_messages(messages):
 _vllm_client = None
 
 
+async def forward_to_vllm_passthrough(vllm_body: dict,
+                                      input_tokens: int,
+                                      session_key: str):
+    """Raw JSON passthrough for client-capped (fallback) requests.
+
+    One POST to vLLM. No loop detection, no retries, no
+    continuation, no ctxgate metadata. Forwards vLLM's JSON
+    response verbatim (only injects prompt_tokens for
+    consistency). Tracks usage for metrics.
+    """
+    try:
+        client = _vllm_client
+        _check_vllm_breaker()
+        body = {k: v for k, v in vllm_body.items()
+                if not k.startswith("_ctxgate_")}
+        resp = await client.post(
+            VLLM_URL + "/chat/completions", json=body)
+        if resp.status_code != 200:
+            _vllm_breaker.record_failure()
+            metrics["requests_error"] += 1
+            _record_call(session_key, input_tokens, 0,
+                         f"vllm_{resp.status_code}",
+                         VLLM_MODEL, False, resp.text[:300])
+            return JSONResponse(
+                {"error": {"message":
+                 "vLLM " + str(resp.status_code),
+                 "explanation": explain_status(
+                     f"vllm_{resp.status_code}",
+                     resp.text[:300])}},
+                status_code=resp.status_code)
+        _vllm_breaker.record_success()
+        data = resp.json()
+        if not isinstance(data.get("usage"), dict):
+            data["usage"] = {}
+        out_tok = data["usage"].get("completion_tokens", 0)
+        cached = (data["usage"].get(
+            "prompt_tokens_details") or {}).get("cached_tokens", 0)
+        data["usage"]["prompt_tokens"] = input_tokens
+        data["usage"]["total_tokens"] = input_tokens + out_tok
+        metrics["requests_ok"] += 1
+        metrics["tokens_out_total"] += out_tok
+        metrics["cached_tokens_total"] += cached
+        metrics["prompt_tokens_total"] += input_tokens
+        _track_session_tokens(session_key, 0, out_tok,
+                              count_req=False)
+        _record_call(session_key, input_tokens, out_tok, "ok",
+                     VLLM_MODEL, False, cached_tokens=cached)
+        log.info("PASSTHROUGH-JSON session=%s in=%d out=%d",
+                 session_key, input_tokens, out_tok)
+        return JSONResponse(data)
+    except httpx.TimeoutException:
+        metrics["requests_error"] += 1
+        _vllm_breaker.record_failure()
+        _record_call(session_key, input_tokens, 0, "timeout",
+                     VLLM_MODEL, False, "vLLM timeout")
+        return JSONResponse(
+            {"error": {"message": "vLLM timeout",
+             "explanation": explain_status("timeout")}},
+            status_code=504)
+    except Exception as e:
+        metrics["requests_error"] += 1
+        _vllm_breaker.record_failure()
+        log.exception("PASSTHROUGH-JSON session=%s error: %s",
+                      session_key, e)
+        _record_call(session_key, input_tokens, 0, "error",
+                     VLLM_MODEL, False, str(e)[:300])
+        return JSONResponse(
+            {"error": {"message": str(e)[:200],
+             "explanation": explain_status("error", str(e)[:300])}},
+            status_code=500)
+
+
 async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
     global metrics
     try:
         client = _vllm_client
-        _no_continue = vllm_body.pop("_ctxgate_no_continue", False)
-        _send_body = {k: v for k, v in vllm_body.items() if not k.startswith("_ctxgate_")}
         # --- Total output budget tracking ---
         total_output_tokens = 0
         cont_count = 0
@@ -4467,23 +4547,15 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
         _caller_cap = vllm_body.get("max_tokens") or 0
         if _caller_cap > 0:
             max_tokens = min(max_tokens, _caller_cap)
-        if _no_continue:
-            # Client-capped path: MIN_OUTPUT does not apply.
-            # Only reject if there is literally no room for output.
-            if max_tokens < 1:
-                log.info("Non-stream: client-capped, no room for output (max_tokens=%d)", max_tokens)
-                return JSONResponse({"error": {"message": "Output budget exhausted", "explanation": explain_status("budget")}}, status_code=413)
-        else:
-            if max_tokens < MIN_OUTPUT:
-                log.info("Non-stream: output budget %d < MIN_OUTPUT %d - stopping", max_tokens, MIN_OUTPUT)
-                return JSONResponse({"error": {"message": "Output budget exhausted", "explanation": explain_status("budget")}}, status_code=413)
+        if max_tokens < MIN_OUTPUT:
+            log.info("Non-stream: output budget %d < MIN_OUTPUT %d - stopping", max_tokens, MIN_OUTPUT)
+            return JSONResponse({"error": {"message": "Output budget exhausted", "explanation": explain_status("budget")}}, status_code=413)
         vllm_body["max_tokens"] = max_tokens
         metrics["output_max_tokens_seen"] = max(metrics["output_max_tokens_seen"], max_tokens)
         while True:
             _attempts += 1
             _t0 = time.monotonic()
-            _send_body = {k: v for k, v in vllm_body.items() if not k.startswith("_ctxgate_")}
-            resp = await client.post(VLLM_URL + "/chat/completions", json=_send_body)
+            resp = await client.post(VLLM_URL + "/chat/completions", json=vllm_body)
             _dt = time.monotonic() - _t0
             if _dt > 2.0:
                 log.warning("vLLM pool-wait: %.1fs (possible pool saturation)", _dt)
@@ -4506,8 +4578,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                 max_tokens = min(_budget, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT)
                 vllm_body["max_tokens"] = max_tokens
                 input_tokens = new_input_tokens
-                _send_body = {k: v for k, v in vllm_body.items() if not k.startswith("_ctxgate_")}
-                resp = await client.post(VLLM_URL + "/chat/completions", json=_send_body)
+                resp = await client.post(VLLM_URL + "/chat/completions", json=vllm_body)
                 if resp.status_code != 200:
                     metrics["requests_error"] += 1
                     log.error("vLLM retry also failed %d: %s", resp.status_code, resp.text[:500])
@@ -4610,10 +4681,6 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
         # --- Auto-continuation with total output budget ---
         ns_wall_start = time.time()
         while choices and choices[0].get("finish_reason") == "length" and cont_count < MAX_CONTINUATIONS:
-            if _no_continue:
-                log.info("No-continue flag: stopping after first segment (client capped)")
-                exit_reason = "client_capped"
-                break
             if time.time() - ns_wall_start > WALL_CLOCK_MAX:
                 log.warning("Wall clock %ds exceeded - stopping non-stream", WALL_CLOCK_MAX)
                 exit_reason = "wall_clock"
@@ -4792,12 +4859,106 @@ async def _lines_with_heartbeat(resp, interval: float):
                 pass
 
 
+async def stream_to_vllm_passthrough(vllm_body: dict,
+                                     input_tokens: int,
+                                     session_key: str):
+    """Raw SSE passthrough for client-capped (fallback) requests.
+
+    One POST to vLLM. No loop detection, no retries, no
+    continuation, no seam dedup, no ctxgate metadata. Forwards
+    vLLM's SSE stream line-for-line so token_ids and any
+    vendor-specific fields survive. Tracks usage for metrics.
+    """
+    async def generate():
+        import time as _t
+        t0 = _t.monotonic()
+        total_out = 0
+        total_cached = 0
+        try:
+            client = _vllm_client
+            _check_vllm_breaker()
+            body = {k: v for k, v in vllm_body.items()
+                    if not k.startswith("_ctxgate_")}
+            async with client.stream(
+                    "POST", VLLM_URL + "/chat/completions",
+                    json=body) as resp:
+                if resp.status_code != 200:
+                    body_bytes = await resp.aread()
+                    _vllm_breaker.record_failure()
+                    metrics["requests_error"] += 1
+                    _record_call(session_key, input_tokens, 0,
+                                 f"vllm_{resp.status_code}",
+                                 VLLM_MODEL, True,
+                                 body_bytes[:300].decode(
+                                     "utf-8", errors="replace"))
+                    yield "data: " + json.dumps({
+                        "error": body_bytes[:200].decode(
+                            "utf-8", errors="replace")
+                    }) + "\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                _vllm_breaker.record_success()
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        if line.strip():
+                            yield line + "\n\n"
+                        continue
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        yield "data: [DONE]\n\n"
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except (json.JSONDecodeError, ValueError):
+                        yield line + "\n\n"
+                        continue
+                    usage = chunk.get("usage")
+                    if usage:
+                        total_out = usage.get(
+                            "completion_tokens", total_out)
+                        total_cached += (usage.get(
+                            "prompt_tokens_details") or {}).get(
+                            "cached_tokens", 0)
+                    yield line + "\n\n"
+            wall = _t.monotonic() - t0
+            metrics["requests_ok"] += 1
+            metrics["tokens_out_total"] += total_out
+            metrics["cached_tokens_total"] += total_cached
+            metrics["prompt_tokens_total"] += input_tokens
+            _track_session_tokens(session_key, 0, total_out,
+                                  count_req=False)
+            _record_call(session_key, input_tokens, total_out,
+                         "ok", VLLM_MODEL, True,
+                         cached_tokens=total_cached)
+            log.info(
+                "PASSTHROUGH-STREAM session=%s in=%d out=%d "
+                "wall=%.2fs", session_key, input_tokens,
+                total_out, wall)
+        except asyncio.CancelledError:
+            log.info("PASSTHROUGH-STREAM session=%s client "
+                     "disconnected", session_key)
+            raise
+        except Exception as e:
+            metrics["requests_error"] += 1
+            _vllm_breaker.record_failure()
+            log.warning(
+                "PASSTHROUGH-STREAM session=%s error: %s",
+                session_key, e)
+            _record_call(session_key, input_tokens, 0,
+                         "error", VLLM_MODEL, True, str(e)[:300])
+            yield "data: " + json.dumps(
+                {"error": str(e)[:200]}) + "\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generate(),
+                             media_type="text/event-stream")
+
+
 async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
     global metrics
     async def generate():
         global metrics
         nonlocal input_tokens
-        _no_continue = vllm_body.pop("_ctxgate_no_continue", False)
         # Content is forwarded immediately. The only text ever held back is
         # the first SEAM_WINDOW chars of a continuation segment (to trim overlap
         # with what the client already has), and it is flushed on every exit path.
@@ -4895,30 +5056,17 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             _caller_cap = vllm_body.get("max_tokens") or 0
             if _caller_cap > 0:
                 max_tokens = min(max_tokens, _caller_cap)
-            if _no_continue:
-                if max_tokens < 1:
-                    log.info("Stream: client-capped, no room for output (max_tokens=%d)", max_tokens)
-                    exit_reason = "total_output_budget"
-                    metrics["output_total_budget_exhausted"] += 1
-                    for x in _flush_seam():
-                        yield x
-                    for _cg in _emit_ctxgate_final("length", exit_reason, 0, total_output_tokens, False, 0):
-                        yield _cg
-                    metrics["requests_error"] += 1
-                    _record_call(session_key, input_tokens, 0, "budget", VLLM_MODEL, True, "initial budget exhausted")
-                    return
-            else:
-                if max_tokens < MIN_OUTPUT:
-                    log.info("Stream: initial output budget %d < MIN_OUTPUT %d - stopping", max_tokens, MIN_OUTPUT)
-                    exit_reason = "total_output_budget"
-                    metrics["output_total_budget_exhausted"] += 1
-                    for x in _flush_seam():
-                        yield x
-                    for _cg in _emit_ctxgate_final("length", exit_reason, 0, total_output_tokens, False, 0):
-                        yield _cg
-                    metrics["requests_error"] += 1
-                    _record_call(session_key, input_tokens, 0, "budget", VLLM_MODEL, True, "initial budget exhausted")
-                    return
+            if max_tokens < MIN_OUTPUT:
+                log.info("Stream: initial output budget %d < MIN_OUTPUT %d - stopping", max_tokens, MIN_OUTPUT)
+                exit_reason = "total_output_budget"
+                metrics["output_total_budget_exhausted"] += 1
+                for x in _flush_seam():
+                    yield x
+                for _cg in _emit_ctxgate_final("length", exit_reason, 0, total_output_tokens, False, 0):
+                    yield _cg
+                metrics["requests_error"] += 1
+                _record_call(session_key, input_tokens, 0, "budget", VLLM_MODEL, True, "initial budget exhausted")
+                return
             current_body["max_tokens"] = max_tokens
             metrics["output_max_tokens_seen"] = max(metrics["output_max_tokens_seen"], max_tokens)
 
@@ -4936,8 +5084,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                 tc_buffer = []
                 _check_vllm_breaker()
                 try:
-                    _send = {k: v for k, v in current_body.items() if not k.startswith("_ctxgate_")}
-                    async with client.stream("POST", VLLM_URL + "/chat/completions", json=_send) as resp:
+                    async with client.stream("POST", VLLM_URL + "/chat/completions", json=current_body) as resp:
                         if resp.status_code != 200:
                             body_bytes = await resp.aread()
                             _et = body_bytes[:500].decode("utf-8", errors="replace").lower()
@@ -5156,11 +5303,6 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                         break
 
                 # --- Continuation state machine ---
-                if _no_continue and finish_reason == "length":
-                    log.info("No-continue flag: ending stream after first segment")
-                    exit_reason = "client_capped"
-                    finish_reason = "length"
-                    break
                 if finish_reason == "length" and continuation_count < MAX_CONTINUATIONS:
                     # Incomplete tool call -> NO continuation
                     if tc_incomplete:
@@ -5277,8 +5419,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                     _check_vllm_breaker()
                     _retry_t0 = time.monotonic()
                     try:
-                        _send = {k: v for k, v in current_body.items() if not k.startswith("_ctxgate_")}
-                        async with client.stream("POST", VLLM_URL + "/chat/completions", json=_send) as resp:
+                        async with client.stream("POST", VLLM_URL + "/chat/completions", json=current_body) as resp:
                             if loop_retries > 0:
                                 log.info("CACHE retry_ttft=%.3f", time.monotonic() - _retry_t0)
                             if resp.status_code != 200:
@@ -5438,11 +5579,6 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                 if tc_complete_r:
                                     finish_reason = 'tool_calls'
                                     exit_reason = 'tool_calls_complete'
-                    if _no_continue and finish_reason == "length":
-                        log.info("No-continue flag: ending stream after retry segment")
-                        exit_reason = "client_capped"
-                        finish_reason = "length"
-                        break
                     if interrupted and exit_reason not in ("tool_calls_complete", "unsafe_loop_blocked"):
                         log.warning("Retry stream interrupted after %d chars: %s", len(full_content), interrupted)
                         exit_reason = "interrupted"
