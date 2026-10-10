@@ -1,0 +1,32 @@
+# ctxgate-worker.service - Example systemd unit
+[Unit]
+Description=ctxgate memory extraction worker
+After=network.target postgresql.service ctxgate-proxy.service
+Wants=postgresql.service
+
+[Service]
+# Type=notify: readiness after pool init + stuck-job recovery
+Type=notify
+User=ctxgate
+Group=ctxgate
+WorkingDirectory=/home/pawelw/ctxproxy
+EnvironmentFile=-/home/pawelw/ctxproxy/.env
+ExecStart=/opt/ctxgate-proxy/.venv/bin/python -u /home/pawelw/ctxproxy/worker/worker.py
+Restart=on-failure
+RestartSec=2
+RestartPreventExitStatus=78
+TimeoutStartSec=90
+# Worker pings via _heartbeat() every 30s
+WatchdogSec=60
+LimitNOFILE=65536
+MemoryMax=4G
+StandardOutput=append:/home/pawelw/ctxproxy/worker.log
+StandardError=append:/home/pawelw/ctxproxy/worker.log
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/pawelw/ctxproxy
+
+[Install]
+WantedBy=default.target

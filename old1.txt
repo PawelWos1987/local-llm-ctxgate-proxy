@@ -1,0 +1,2 @@
+        tc_emitted = False  # True once we've forwarded a complete tool-call set
+        tc_buffer: list = []  # buffered tool-call chunks (flushed after safety check)

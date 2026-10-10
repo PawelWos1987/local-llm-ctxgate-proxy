@@ -1,0 +1,1 @@
+            _stream_truncated = (exit_reason != "ok") or loop_in_content or loop_in_reasoning

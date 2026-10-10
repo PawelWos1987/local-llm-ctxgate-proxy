@@ -1,0 +1,8 @@
+data: {"id": "mock-f", "object": "chat.completion.chunk", "created": 0, "model": "Qwen3.8-27B", "choices": [{"index": 0, "delta": {"content": "Writing the file."}, "finish_reason": null}]}
+
+data: {"id": "mock-f", "object": "chat.completion.chunk", "created": 0, "model": "Qwen3.8-27B", "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_f1", "type": "function", "function": {"name": "write_file", "arguments": "{\"path\": \"/tmp/incomplete"}}]}, "finish_reason": null}]}
+
+data: {"id": "mock-f", "object": "chat.completion.chunk", "created": 0, "model": "Qwen3.8-27B", "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}], "ctxgate": {"truncated": true, "reason": "error", "continuations_used": 0, "total_output_tokens": 50, "tool_calls_complete": false, "tool_calls_emitted": 0, "reasoning_chars": 0}, "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150, "prompt_tokens_details": {"cached_tokens": 0}}}
+
+data: [DONE]
+

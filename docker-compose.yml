@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: ctxproxy-pg
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ctxproxy
+      POSTGRES_PASSWORD: ctxproxy
+      POSTGRES_DB: ctxproxy
+    volumes:
+      - ctxproxy-pgdata:/var/lib/postgresql/data
+      - ./schema/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql
+      - ./schema/002_knowledge.sql:/docker-entrypoint-initdb.d/002_knowledge.sql
+      - ./schema/003_memory_worker.sql:/docker-entrypoint-initdb.d/003_memory_worker.sql
+      - ./schema/004_memory_ttl.sql:/docker-entrypoint-initdb.d/004_memory_ttl.sql
+      - ./schema/005_seed_knowledge.sql:/docker-entrypoint-initdb.d/005_seed_knowledge.sql
+      - ./schema/006_deliverables.sql:/docker-entrypoint-initdb.d/006_deliverables.sql
+      - ./schema/007_memory_scoring.sql:/docker-entrypoint-initdb.d/007_memory_scoring.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ctxproxy"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  ctxproxy-pgdata:

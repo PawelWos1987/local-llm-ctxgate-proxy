@@ -1,0 +1,40 @@
+                    if interrupted:
+                        log.warning("Retry stream interrupted after %d chars: %s", len(full_content), interrupted)
+                        exit_reason = "interrupted"
+                        finish_reason = "length"
+                    # --- Flush buffered tool calls from retry (after safety check) ---
+                    if tc_buffer:
+                        _unsafe_tc = False
+                        tc_complete_r = tc_accum.is_complete() if tc_accum.count() > 0 else False
+                        if tc_complete_r and BLOCK_UNBOUNDED_LOOPS:
+                            for _idx, _tc in tc_accum._calls.items():
+                                if _tc.get("name") == "execute_typescript":
+                                    try:
+                                        _args = json.loads(_tc.get("arguments", "{}"))
+                                    except Exception:
+                                        _args = {}
+                                    if _unbounded_replace_loop(_args.get("code", "")):
+                                        _unsafe_tc = True
+                                        break
+                        if _unsafe_tc:
+                            metrics["unsafe_loop_blocked"] += 1
+                            log.warning("Stream retry: blocked unbounded replace-loop (session=%s)", session_key)
+                            tc_buffer.clear()
+                            tc_accum = ToolCallAccumulator()
+                            _err_text = "BLOCKED: execute_typescript code contains an unbounded while(var.includes(X)) { var = var.replace(X, Y) } loop. Use s.replaceAll(A, B) or s.split(A).join(B) instead. Any loop must have an explicit iteration cap."
+                            _err_chunk = {"id": stream_id, "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"content": _err_text}, "finish_reason": None}]}
+                            yield "data: " + json.dumps(_err_chunk) + "\n\n"
+                            finish_reason = "stop"
+                            exit_reason = "unsafe_loop_blocked"
+                        elif tc_complete_r:
+                            for _tc_chunk in tc_buffer:
+                                yield "data: " + json.dumps(_tc_chunk) + "\n\n"
+                            tc_emitted_count += len(tc_buffer)
+                            tc_buffer.clear()
+                            finish_reason = "tool_calls"
+                            exit_reason = "tool_calls_complete"
+                        else:
+                            # Incomplete: do not emit partial tool-call chunks
+                            tc_buffer.clear()
+                            finish_reason = "length"
+                    break

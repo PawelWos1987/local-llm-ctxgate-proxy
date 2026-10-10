@@ -1,0 +1,2 @@
+        # --- Race-safe seq allocation via _insert_event_row ---
+        ev_id = await _insert_event_row(task_uuid, 'user', stored)

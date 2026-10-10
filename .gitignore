@@ -1,0 +1,79 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs and diagnostics
+*.log
+logs/
+*.diag
+*.trace
+
+# Worker state
+.worker_status.json
+.worker.lock
+*.lock
+worker.pid
+cleanse.pid
+_test_proxy_9302.pid
+
+# Task artifacts
+tasks/rwfix/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+.obsidian/
+
+# Backup files
+*.bak
+*.bak-*
+*.bak_*
+proxy/app.py.bak*
+proxy/app.py_pawel*.bak
+dashboard/dashboard.py.bak*
+tests/test_*.py.bak*
+
+# Patch files
+patch_*.txt
+
+# Research notes (local)
+NOTES-*.md
+PROMPT.md
+RESEARCH-*.md
+_local/
+probes/
+config.yaml
+orchestrator.py
+apply_*.py
+injection_metrics.json
+.coverage
+
+# Test result artifacts
+tests/autocont_results.json
+tests/integration_results.json
+tests/test_results.json
+tests/tool_results.json
+
+# Schema migration drafts (not part of repo)
+schema/012_session_windows.sql
+
+# Goose
+.goosehints

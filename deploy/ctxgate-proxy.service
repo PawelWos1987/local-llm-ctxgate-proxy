@@ -1,0 +1,37 @@
+# ctxgate-proxy.service - Example systemd unit
+[Unit]
+Description=ctxgate rolling-window context proxy
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+# Type=notify: readiness via sd_notify after full init
+Type=notify
+User=ctxgate
+Group=ctxgate
+WorkingDirectory=/home/pawelw/ctxproxy
+# Load environment from .env
+EnvironmentFile=-/home/pawelw/ctxproxy/.env
+# Start proxy (unbuffered)
+ExecStart=/opt/ctxgate-proxy/.venv/bin/python -u /home/pawelw/ctxproxy/proxy/app.py
+# Restart on failure
+Restart=on-failure
+RestartSec=1
+# Exit 78 = config error, do NOT restart
+RestartPreventExitStatus=78
+# Startup must complete within 90s
+TimeoutStartSec=90
+# Watchdog ping required every 60s
+WatchdogSec=60
+LimitNOFILE=65536
+MemoryMax=4G
+StandardOutput=append:/home/pawelw/ctxproxy/proxy.log
+StandardError=append:/home/pawelw/ctxproxy/proxy.log
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/pawelw/ctxproxy
+
+[Install]
+WantedBy=default.target

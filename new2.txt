@@ -1,0 +1,7 @@
+                    else:
+                        for _tc_chunk in tc_buffer:
+                            yield "data: " + json.dumps(_tc_chunk) + "\n\n"
+                        tc_emitted_count += len(tc_buffer)
+                        tc_buffer.clear()
+
+                if interrupted and not loop_intentional:

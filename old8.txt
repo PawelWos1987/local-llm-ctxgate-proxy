@@ -1,0 +1,5 @@
+            event_id = await pool.fetchval(
+                "INSERT INTO proxy.events (task_id, role, content, meta) VALUES ($1,$2,$3,$4) RETURNING id",
+                task_uuid, "context_slice", c,
+                json.dumps({"slice_start": start_idx, "slice_end": end_idx, "chunk_idx": ci, "dedupe_key": dedupe_key})
+            )

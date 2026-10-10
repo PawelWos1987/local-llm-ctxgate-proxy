@@ -1,0 +1,7 @@
+        # --- Seq fix: COALESCE(MAX(seq),-1)+1 ---
+        seq_row = await pool.fetchrow(
+            'SELECT COALESCE(MAX(seq),-1) + 1 AS ns FROM proxy.events WHERE task_id=$1', task_uuid)
+        ns = seq_row['ns'] if seq_row else 0
+        ev_id = await pool.fetchval(
+            'INSERT INTO proxy.events (task_id, seq, role, content) VALUES ($1,$2,$3,$4) RETURNING id',
+            task_uuid, ns, 'user', stored)

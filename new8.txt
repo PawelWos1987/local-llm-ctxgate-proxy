@@ -1,0 +1,4 @@
+            event_id = await _insert_event_row(
+                task_uuid, "context_slice", c,
+                json.dumps({"slice_start": start_idx, "slice_end": end_idx, "chunk_idx": ci, "dedupe_key": dedupe_key})
+            )

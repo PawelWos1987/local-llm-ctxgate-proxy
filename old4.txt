@@ -1,0 +1,13 @@
+                if loop_in_content:
+                    exit_reason = "loop"
+                    finish_reason = "length"
+                elif loop_in_reasoning or reasoning_overflow:
+                    exit_reason = "reasoning_overflow"
+                    finish_reason = "length"
+                elif finish_reason == "length":
+                    # O3: retry segment hit max_tokens without completing
+                    exit_reason = "retry_length"
+                else:
+                    exit_reason = "loop_recovered"
+
+            # Classify empty responses

@@ -1,0 +1,15 @@
+[Unit]
+Description=ctxproxy session syncer (Goose sessions -> PostgreSQL tasks)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%H/ctxproxy
+ExecStart=/usr/bin/python3 %H/ctxproxy/syncer/session_sync.py
+Restart=on-failure
+RestartSec=30
+EnvironmentFile=-%H/ctxproxy/.env
+
+[Install]
+WantedBy=default.target
+

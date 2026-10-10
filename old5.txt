@@ -1,0 +1,4 @@
+            tc_complete = tc_accum.is_complete() if tc_accum.count() > 0 else False
+            tc_truncated = tc_accum.count() > 0 and not tc_complete
+            tc_emitted_n = tc_accum.count() if tc_complete else 0
+            if tc_truncated:
