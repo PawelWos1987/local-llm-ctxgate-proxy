@@ -1,0 +1,62 @@
+{
+  "A": {
+    "pass": true,
+    "s1": {
+      "sw": "",
+      "ps": "0",
+      "pm": ""
+    },
+    "s3": {
+      "sw": "",
+      "ps": "0",
+      "pm": ""
+    },
+    "dropped": 1,
+    "seed": 0,
+    "h3pop": 0
+  },
+  "B": {
+    "pass": true,
+    "sb": {
+      "sw": "",
+      "ps": "0",
+      "pm": ""
+    },
+    "loaded": 0,
+    "resum": 0
+  },
+  "C": {
+    "defect": true,
+    "sc1": {
+      "sw": "",
+      "ps": "0",
+      "pm": ""
+    },
+    "sc3": {
+      "sw": "",
+      "ps": "0",
+      "pm": ""
+    },
+    "h3pop": 0,
+    "seed": 2
+  },
+  "R1": {
+    "pass": true,
+    "h3pop": 0,
+    "seed": 0
+  },
+  "R2": {
+    "corrupt": false,
+    "flap": true,
+    "seed": 2,
+    "h3pop": 0
+  },
+  "R3": {
+    "total": 32,
+    "title_like": 0
+  },
+  "P4": {
+    "pass": true,
+    "rc": 0
+  }
+}

@@ -1,0 +1,1458 @@
+=== CHAT_COMPLETIONS (3850-4250) ===
+        #   - agent-session-id / X-Session-ID present -> Goose session,
+        #     uuid5(namespace, goose_id) as task_uuid
+        #   - otherwise -> ONE fixed "dummy" task for all non-Goose traffic
+        # No fingerprinting. No SQLite resolver on the hot path. No
+        # per-request row creation.
+        # --- Session identity: two deterministic paths ---
+        # Goose  : uuid5(ns, goose_id)          — from agent-session-id
+        # Fallback: uuid5(ns, "fallback:<fp>") — from content fingerprint
+        # Both paths compute uuid5 synchronously. The task row is
+        # created by a spawned background coroutine (see below).
+        _goose_id_header = (
+            request.headers.get('agent-session-id', '')
+            or request.headers.get('X-Session-ID', '')
+            or ''
+        ).strip()
+
+        # Client cap only applies to the fallback path.
+        _client_cap = None
+        if not _goose_id_header:
+            _cm = body.get("max_tokens")
+            if isinstance(_cm, int) and _cm > 0:
+                _client_cap = _cm
+
+        if _goose_id_header:
+            _goose_meta = {
+                "id": _goose_id_header,
+                "uuid": str(uuid.uuid5(
+                    GOOSE_SESSION_UUID_NAMESPACE, _goose_id_header)),
+                "name": _goose_id_header,
+                "session_type": "",
+                "working_dir": "",
+                "provider_name": "",
+            }
+            try:
+                _info = await _get_goose_session_info(_goose_id_header)
+                if _info:
+                    _goose_meta.update({
+                        "name": _info.get("name") or _goose_id_header,
+                        "session_type": _info.get("session_type") or "",
+                        "working_dir": _info.get("working_dir") or "",
+                        "provider_name": _info.get("provider_name") or "",
+                    })
+            except Exception as e:
+                log.debug(
+                    "goose session metadata enrichment failed (non-fatal): %s",
+                    e)
+            _log_label = "GOOSE-HEADER"
+        else:
+            _fb_fp = _fallback_fingerprint(messages)
+            if not _fb_fp:
+                # No user message — should not happen (upstream rejects
+                # empty message lists), but be defensive.
+                _fb_fp = "empty"
+            _fallback_id = f"fallback:{_fb_fp}"
+            _goose_meta = {
+                "id": _fallback_id,
+                "uuid": str(uuid.uuid5(
+                    GOOSE_SESSION_UUID_NAMESPACE, _fallback_id)),
+                "name": "fallback",
+                "session_type": "fallback",
+                "working_dir": "",
+                "provider_name": "",
+            }
+            _log_label = "FALLBACK"
+
+        session_key = f"goose:{_goose_meta['id']}"
+        task_uuid = _goose_meta["uuid"]
+        x_sid = _goose_meta["id"]
+        log.info("%s sid=%s session_key=%s task=%s cap=%s",
+                 _log_label, _goose_meta["id"], session_key, task_uuid,
+                 _client_cap)
+
+        # Memory job — chained background init (INSERT then enqueue).
+        last_user_content = ''
+        for m in reversed(messages):
+            if m.get('role') == 'user':
+                uc = m.get('content', '')
+                if isinstance(uc, list):
+                    last_user_content = ' '.join(
+                        p.get('text', '') for p in uc
+                        if isinstance(p, dict))
+                else:
+                    last_user_content = uc or ''
+                break
+        if last_user_content:
+            _spawn(_bg_ensure_task_and_enqueue(
+                _goose_meta, tenant_id, x_sid, last_user_content))
+
+        _t0 = time.monotonic()
+        try:
+            built = await build_context(messages, task_uuid=task_uuid, session_key=session_key)
+        except ContextCapacityError as cce:
+            metrics["requests_error"] += 1
+            log.error("Context capacity: %s", cce)
+            return JSONResponse({"error": {"message": str(cce), "explanation": "Protected current-turn data exceeds the safe context budget. Reduce input size or increase CTXGATE_MAX_CONTEXT."}, "ctxgate": ctxgate_meta(True, "context_capacity", 0, 0, False, 0)["ctxgate"]}, status_code=413)
+        _dt = (time.monotonic() - _t0) * 1000
+        if _dt > 50:
+            log.warning("SLOW: build_context %.0fms (msgs=%d)", _dt, len(messages))
+
+
+        # Phase 1: Freeze seed pair [0][1][2] per session.
+        # First 3 messages (system + seed user + seed assistant) are immutable for session lifetime.
+        # If Goose compacts and changes them, we detect it, log a deliberate miss, and re-freeze.
+        if session_key not in session_seeds:
+            if len(built) >= 3:
+                session_seeds[session_key] = [dict(m) for m in built[:3]]
+                log.info("Seed frozen session=%s (3 msgs)", session_key)
+        elif len(built) >= 3:
+            frozen = session_seeds[session_key]
+            for i, fm in enumerate(frozen):
+                if i < len(built):
+                    fc = fm.get("content", "")
+                    nc = built[i].get("content", "")
+                    if isinstance(fc, list):
+                        fc = " ".join(p.get("text", "") for p in fc if isinstance(p, dict))
+                    if isinstance(nc, list):
+                        nc = " ".join(p.get("text", "") for p in nc if isinstance(p, dict))
+                    if fc != nc:
+                        log.warning("SEED CHANGED session=%s pos=%d - re-freezing (deliberate miss)", session_key, i)
+                        session_seeds[session_key] = [dict(m) for m in built[:3]]
+                        session_compactions.pop(session_key, None)
+                        break
+        # Safe defaults: guard _record_injection against a fetch exception leaving tm/kn unset
+        tm = ""
+        kn = ""
+
+        # --- Phase 4: Epoch-freeze injection ---
+        # The injected block (knowledge + task memory + digest) is computed ONCE per epoch
+        # and reused byte-for-byte until the epoch key changes. This prevents prefix cache
+        # busting from per-request DB reads (F7 fix).
+        _t0 = time.monotonic()
+        _epoch_freeze = CTXGATE_INJECT_EPOCH_FREEZE_ON
+        
+        if _epoch_freeze:
+            # Compute epoch key
+            _raw_last_user_e = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+            _newest_user_anchor = _msg_anchor(_raw_last_user_e) if _raw_last_user_e else ""
+            _recap = _detect_recap_intent(_raw_last_user_e.get("content", "") if _raw_last_user_e and isinstance(_raw_last_user_e.get("content"), str) else "")
+            _ws_for_epoch = session_compactions.get(session_key)
+            _epoch_key = _compute_epoch_key(session_key, _ws_for_epoch, _newest_user_anchor, _recap)
+            
+            # Check if we have a cached block for this epoch
+            _cached_block = _ws_for_epoch.get("injected_block") if _ws_for_epoch else None
+            _cached_epoch = _ws_for_epoch.get("injected_epoch") if _ws_for_epoch else None
+            
+            if _cached_epoch == _epoch_key and _cached_block is not None:
+                # Reuse the exact same block (byte-for-byte)
+                kn = ""
+                tm = ""
+                _block = _cached_block
+                log.debug("Epoch freeze: reusing cached injection block (%d chars) for %s", len(_block), _epoch_key[:40])
+            else:
+                # New epoch: compute the block
+                _t0 = time.monotonic()
+                kn, tm, _digest = await asyncio.gather(
+                    fetch_relevant_knowledge(messages, max_items=5, max_tokens=400, tenant_id=tenant_id),
+                    fetch_task_memory(x_sid, built, task_uuid=task_uuid, recap=_recap, tenant_id=tenant_id),
+                    _build_session_digest(task_uuid, session_key, tenant_id=tenant_id),
+                    return_exceptions=True
+                )
+                _dt = (time.monotonic() - _t0) * 1000
+                if _dt > 50:
+                    log.warning("SLOW: knowledge+memory fetch %.0fms", _dt)
+                if isinstance(kn, Exception):
+                    log.warning("Knowledge injection failed: %s", kn)
+                    kn = ""
+                if isinstance(tm, Exception):
+                    log.warning("Task memory injection failed: %s", tm)
+                    tm = ""
+                if isinstance(_digest, Exception):
+                    log.debug("Digest fetch failed: %s", _digest)
+                    _digest = ""
+                
+                # Assemble the block
+                _ctx_parts = []
+                if kn:
+                    _ctx_parts.append("Relevant knowledge:" + chr(10) + kn)
+                if tm:
+                    _ctx_parts.append("Task memory:" + chr(10) + tm)
+                if _digest:
+                    _ctx_parts.append("Session digest:" + chr(10) + _digest)
+                
+                # Phase 4: budget the injection block
+                _inject_budget = CTXGATE_INJECT_MAX_TOKENS_CFG
+                if _recap:
+                    _inject_budget = CTXGATE_INJECT_MAX_TOKENS_RECAP_CFG
+                # Hard-clamp: never exceed ceiling - 500 (ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT))
+                _ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
+                _inject_budget = min(_inject_budget, _ceiling - 500)
+                
+                _block = ""
+                if _ctx_parts:
+                    # Priority: 0=digest (newest, keep), 1=task memory, 2=knowledge (oldest, drop first)
+                    _prio_map = {"Relevant knowledge:": 2, "Task memory:": 1, "Session digest:": 0}
+                    _sections = []
+                    for part in _ctx_parts:
+                        _prio = 1
+                        for prefix, p in _prio_map.items():
+                            if part.startswith(prefix):
+                                _prio = p
+                                break
+                        _sections.append((_prio, part))
+                    _block = _fit_to_budget(_sections, _inject_budget)
+                
+                # Cache the block in window state
+                if _ws_for_epoch is not None:
+                    _ws_for_epoch["injected_block"] = _block
+                    _ws_for_epoch["injected_epoch"] = _epoch_key
+                
+                log.debug("Epoch freeze: new injection block (%d chars) for %s (kn=%dch tm=%dch dig=%dch)",
+                         len(_block), _epoch_key[:40], len(kn), len(tm), len(_digest))
+            
+            # Apply the block to the last user message
+            if _block:
+                last_user_idx = len(built) - 1
+                for i in range(len(built) - 1, -1, -1):
+                    if built[i].get("role") == "user":
+                        last_user_idx = i
+                        break
+                _raw_last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+                if _raw_last_user is not None and _msg_anchor(built[last_user_idx]) != _msg_anchor(_raw_last_user):
+                    log.error("Newest user message missing from built context (session=%s) - skipping memory injection", session_key)
+                    metrics["inject_skipped_stale_user"] += 1
+                else:
+                    existing = built[last_user_idx].get("content", "")
+                    if isinstance(existing, str):
+                        built[last_user_idx]["content"] = existing + _block
+                    else:
+                        built[last_user_idx]["content"] = list(existing) + [{"type": "text", "text": _block}]
+                    log.debug("Memory blocks appended to last user msg at pos %d (%dch)", last_user_idx, len(_block))
+            
+            # Instrumentation
+            _record_injection(x_sid, tm if not isinstance(tm, Exception) else "", kn if not isinstance(kn, Exception) else "")
+        else:
+            # Old path (fallback)
+            _t0 = time.monotonic()
+            kn, tm = await asyncio.gather(
+                fetch_relevant_knowledge(messages, max_items=5, max_tokens=400, tenant_id=tenant_id),
+                fetch_task_memory(x_sid, built, task_uuid=task_uuid, tenant_id=tenant_id),
+                return_exceptions=True
+            )
+            _dt = (time.monotonic() - _t0) * 1000
+            if _dt > 50:
+                log.warning("SLOW: knowledge+memory fetch %.0fms", _dt)
+            if isinstance(kn, Exception):
+                log.warning("Knowledge injection failed: %s", kn)
+                kn = ""
+            if isinstance(tm, Exception):
+                log.warning("Task memory injection failed: %s", tm)
+                tm = ""
+            if kn or tm:
+                last_user_idx = len(built) - 1
+                for i in range(len(built) - 1, -1, -1):
+                    if built[i].get("role") == "user":
+                        last_user_idx = i
+                        break
+                _raw_last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+                if _raw_last_user is not None and _msg_anchor(built[last_user_idx]) != _msg_anchor(_raw_last_user):
+                    log.error("Newest user message missing from built context (session=%s) - skipping memory injection", session_key)
+                    metrics["inject_skipped_stale_user"] += 1
+                    kn = tm = ""
+            if kn or tm:
+                _ctx_parts = []
+                if kn:
+                    _ctx_parts.append("Relevant knowledge:" + chr(10) + kn)
+                if tm:
+                    _ctx_parts.append("Task memory:" + chr(10) + tm)
+                if _ctx_parts:
+                    _block = chr(10) + chr(10) + chr(10).join(_ctx_parts)
+                    existing = built[last_user_idx].get("content", "")
+                    if isinstance(existing, str):
+                        built[last_user_idx]["content"] = existing + _block
+                    else:
+                        built[last_user_idx]["content"] = list(existing) + [{"type": "text", "text": _block}]
+                    log.debug("Memory blocks appended to last user msg at pos %d (kn=%dch tm=%dch)", last_user_idx, len(kn), len(tm))
+            _record_injection(x_sid, tm if not isinstance(tm, Exception) else "", kn if not isinstance(kn, Exception) else "")
+
+
+        # Phase 2: repair dangling tool calls before fingerprint + vLLM body
+        built = _repair_dangling_tool_calls(built)
+        built = _with_compaction_note(built)
+
+
+        # Token tracking
+        _t0 = time.monotonic()
+        input_tokens = count_messages_tokens(built)
+        _dt = (time.monotonic() - _t0) * 1000
+        if _dt > 50:
+            log.warning("SLOW: count_messages_tokens %.0fms (tokens=%d)", _dt, input_tokens)
+        metrics["max_context_seen"] = max(metrics.get("max_context_seen", 0), input_tokens)
+        metrics["tokens_in_total"] += input_tokens
+        _track_session_tokens(session_key, input_tokens)
+
+        # --- Cross-session knowledge extraction (fire-and-forget, non-blocking) ---
+        if _EXTRACT_IN_FLIGHT < 2:
+            _spawn(_fire_and_forget_extract(x_sid, session_key, messages, tenant_id=tenant_id))
+        else:
+            metrics["extract_shed"] = metrics.get("extract_shed", 0) + 1
+
+        # Proxy calculates output budget from post-trim input (authoritative)
+        # Goose's max_tokens is based on pre-trim input - ignore it
+        _budget = _output_budget(input_tokens)
+        if _client_cap is not None:
+            # Client explicitly requested a cap. Honor it. MIN_OUTPUT
+            # does not apply on this path (the floor protects
+            # production Goose sessions, not clients that asked for
+            # a small response). Still reject if the input context
+            # leaves no room for at least 1 output token.
+            if _budget < 1:
+                log.error(
+                    "Context leaves no room for output: session=%s "
+                    "input=%d budget=%d", session_key,
+                    input_tokens, _budget)
+                return JSONResponse(
+                    {"error": {"message":
+                     "context leaves no room for output",
+                     "input_tokens": input_tokens,
+                     "budget": _budget}},
+                    status_code=413)
+            max_tokens = min(_budget, _client_cap)
+        else:
+            max_tokens = _budget
+            if max_tokens < MIN_OUTPUT:
+                ceiling = min(MAX_INPUT,
+                              MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
+                if input_tokens > ceiling:
+                    built = _emergency_shrink(built, ceiling)
+                    input_tokens = count_messages_tokens(built)
+                    max_tokens = _output_budget(input_tokens)
+            if max_tokens < MIN_OUTPUT:
+                log.error(
+                    "Context too large for required output budget: "
+                    "session=%s input=%d max_tokens=%d < MIN_OUTPUT=%d",
+                    session_key, input_tokens, max_tokens, MIN_OUTPUT)
+                return JSONResponse(
+                    {"error": {"message":
+                     "context too large for required output budget",
+                     "input_tokens": input_tokens,
+                     "max_tokens": max_tokens,
+                     "min_output": MIN_OUTPUT}},
+                    status_code=413)
+        if input_tokens > 0.9 * MAX_INPUT:
+            log.info("Budget: session=%s input=%d ceiling=%d max_tokens=%d", session_key, input_tokens, min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT), max_tokens)
+        stream = body.get("stream", False)
+        vllm_body = {
+            "model": VLLM_MODEL,
+            "messages": built,
+            "max_tokens": max_tokens,
+            "stream": stream,
+            # Internal: disables auto-continuation for clients that
+            # provided their own max_tokens cap.
+            "_ctxgate_no_continue": _client_cap is not None,
+        }
+        # Sampling: send temperature ONLY when the client sent one and it is at/above
+        # the floor. Otherwise omit it so the server's tuned default (1.0) applies.
+        # A near-greedy temperature in thinking mode causes endless repetition.
+        _ct = body.get("temperature")
+        if _ct is not None:
+            if _ct < 0:
+                # Negative temperature is invalid - forward it so vLLM rejects it (400).
+                vllm_body["temperature"] = _ct
+            elif _ct >= MIN_TEMPERATURE:
+                vllm_body["temperature"] = _ct
+            else:
+                # 0 <= _ct < MIN_TEMPERATURE: near-greedy causes repetition in thinking
+                # mode. Omit it so the server's tuned default (1.0) applies.
+                log.info("Dropping client temperature %s (< MIN_TEMPERATURE %s); server default 1.0 applies", _ct, MIN_TEMPERATURE)
+        if PRESENCE_PENALTY:
+            vllm_body["presence_penalty"] = float(PRESENCE_PENALTY)
+        if REPETITION_DETECTION:
+            vllm_body["repetition_detection"] = {"max_pattern_size": 50, "min_pattern_size": 5, "min_count": 6}
+        if THINKING_TOKEN_BUDGET:
+            vllm_body["thinking_token_budget"] = int(THINKING_TOKEN_BUDGET)
+        # Forward optional vLLM passthrough parameters when the client
+        # explicitly sent them AND we are on the capped fallback path.
+        # These make --exact-tg actually meaningful for benchmarks.
+        if _client_cap is not None:
+            _min_tok = body.get("min_tokens")
+            if isinstance(_min_tok, int) and _min_tok > 0:
+                vllm_body["min_tokens"] = min(_min_tok, max_tokens)
+            if body.get("ignore_eos") is True:
+                vllm_body["ignore_eos"] = True
+        if stream:
+            vllm_body["stream_options"] = {"include_usage": True}
+        if body.get("tools"):
+            vllm_body["tools"] = body["tools"]
+        if body.get("tool_choice"):
+            vllm_body["tool_choice"] = body["tool_choice"]
+        vllm_body["messages"] = _normalize_system_messages(vllm_body.get("messages", []))
+        if CTXGATE_PREFIX_DIAG_ON:
+            _prefix_diag(session_key, vllm_body.get("messages", []))
+
+        _t0 = time.monotonic()
+        if stream:
+            result = await stream_to_vllm(vllm_body, input_tokens, session_key)
+        else:
+            result = await forward_to_vllm(vllm_body, input_tokens, session_key)
+        _dt = (time.monotonic() - _t0) * 1000
+        if _dt > 50:
+            log.warning("SLOW: vllm_call %.0fms (in=%d stream=%s)", _dt, input_tokens, stream)
+        return result
+
+=== STREAM_TO_VLLM (4450-4700) ===
+
+
+async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
+    global metrics
+    try:
+        client = _vllm_client
+        _no_continue = vllm_body.pop("_ctxgate_no_continue", False)
+        _send_body = {k: v for k, v in vllm_body.items() if not k.startswith("_ctxgate_")}
+        # --- Total output budget tracking ---
+        total_output_tokens = 0
+        cont_count = 0
+        exit_reason = "ok"
+        _attempts = 0
+        # --- Initial request with budget guard ---
+        remaining = CTXGATE_MAX_TOTAL_OUTPUT
+        _budget = _output_budget(input_tokens)
+        max_tokens = min(_budget, MAX_OUTPUT, remaining)
+        _caller_cap = vllm_body.get("max_tokens") or 0
+        if _caller_cap > 0:
+            max_tokens = min(max_tokens, _caller_cap)
+        if _no_continue:
+            # Client-capped path: MIN_OUTPUT does not apply.
+            # Only reject if there is literally no room for output.
+            if max_tokens < 1:
+                log.info("Non-stream: client-capped, no room for output (max_tokens=%d)", max_tokens)
+                return JSONResponse({"error": {"message": "Output budget exhausted", "explanation": explain_status("budget")}}, status_code=413)
+        else:
+            if max_tokens < MIN_OUTPUT:
+                log.info("Non-stream: output budget %d < MIN_OUTPUT %d - stopping", max_tokens, MIN_OUTPUT)
+                return JSONResponse({"error": {"message": "Output budget exhausted", "explanation": explain_status("budget")}}, status_code=413)
+        vllm_body["max_tokens"] = max_tokens
+        metrics["output_max_tokens_seen"] = max(metrics["output_max_tokens_seen"], max_tokens)
+        while True:
+            _attempts += 1
+            _t0 = time.monotonic()
+            _send_body = {k: v for k, v in vllm_body.items() if not k.startswith("_ctxgate_")}
+            resp = await client.post(VLLM_URL + "/chat/completions", json=_send_body)
+            _dt = time.monotonic() - _t0
+            if _dt > 2.0:
+                log.warning("vLLM pool-wait: %.1fs (possible pool saturation)", _dt)
+            if resp.status_code in (500, 503) and _attempts < 3:
+                _delay = 1.0 * _attempts
+                log.warning("vLLM transient %d (attempt %d/3) - retrying in %.1fs", resp.status_code, _attempts, _delay)
+                await asyncio.sleep(_delay)
+                continue
+            break
+        if resp.status_code != 200:
+            _et = resp.text.lower()
+            _is_ctx400 = resp.status_code == 400 and any(
+                p in _et for p in ("context", "max_tokens", "max_completion_tokens", "maximum", "greater than"))
+            if _is_ctx400:
+                log.warning("vLLM 400 (context/max_tokens) - re-shrinking and retrying: %s", resp.text[:200])
+                reduced_limit = int(input_tokens * 0.8)
+                vllm_body["messages"] = _emergency_shrink(vllm_body["messages"], reduced_limit)
+                new_input_tokens = count_messages_tokens(vllm_body["messages"])
+                _budget = _output_budget(new_input_tokens)
+                max_tokens = min(_budget, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT)
+                vllm_body["max_tokens"] = max_tokens
+                input_tokens = new_input_tokens
+                _send_body = {k: v for k, v in vllm_body.items() if not k.startswith("_ctxgate_")}
+                resp = await client.post(VLLM_URL + "/chat/completions", json=_send_body)
+                if resp.status_code != 200:
+                    metrics["requests_error"] += 1
+                    log.error("vLLM retry also failed %d: %s", resp.status_code, resp.text[:500])
+                    _record_call(session_key, input_tokens, 0, f"vllm_{resp.status_code}", VLLM_MODEL, False, resp.text[:300])
+                    return JSONResponse({"error": {"message": "vLLM " + str(resp.status_code), "explanation": explain_status(f"vllm_{resp.status_code}", resp.text[:300])}}, status_code=resp.status_code)
+            else:
+                metrics["requests_error"] += 1
+                log.error("vLLM error %d: %s", resp.status_code, resp.text[:500])
+                _record_call(session_key, input_tokens, 0, f"vllm_{resp.status_code}", VLLM_MODEL, False, resp.text[:300])
+                return JSONResponse({"error": {"message": "vLLM " + str(resp.status_code), "explanation": explain_status(f"vllm_{resp.status_code}", resp.text[:300])}}, status_code=resp.status_code)
+        data = resp.json()
+        if not isinstance(data.get("usage"), dict):
+            data["usage"] = {}
+        choices = data.get("choices", [])
+        # --- Tool call sanitization ---
+        for choice in choices:
+            msg = choice.get("message", {})
+            if msg.get("tool_calls"):
+                cleaned, stripped = sanitize_tool_calls(msg)
+                if stripped:
+                    metrics["toolcall_strips"] += 1
+                    metrics["tool_call_suppressed"] += 1
+                    choice["message"]["tool_calls"] = None
+                    choice["finish_reason"] = "stop"
+        # --- Unbounded replace-loop guard ---
+        if BLOCK_UNBOUNDED_LOOPS:
+            for choice in choices:
+                _tcs = choice.get("message", {}).get("tool_calls")
+                if not _tcs:
+                    continue
+                for _tc in _tcs:
+                    _fn = _tc.get("function", {})
+                    if _fn.get("name") != "execute_typescript":
+                        continue
+                    try:
+                        _args = json.loads(_fn.get("arguments", "{}"))
+                    except Exception:
+                        _args = {}
+                    if _unbounded_replace_loop(_args.get("code", "")):
+                        metrics["unsafe_loop_blocked"] += 1
+                        log.warning("Blocked unbounded replace-loop in execute_typescript (session=%s)", session_key)
+                        choice["message"]["tool_calls"] = None
+                        choice["finish_reason"] = "stop"
+                        _retry_msgs = list(vllm_body.get("messages", []))
+                        _retry_msgs.append({"role": "system", "content": (
+                            "RULE: Never write while(s.includes(A)) { s = s.replace(A, B) }. "
+                            "If B contains A, it never terminates and freezes the sandbox. "
+                            "For a global replacement use s.replaceAll(A, B) or s.split(A).join(B) \u2014 ONE pass, no loop. "
+                            "Any loop in execute_typescript must have an explicit iteration cap (e.g. for (let i=0;i<1000;i++)). "
+                            "After a bulk replace, count with s.split(A).length-1 once, do not loop on it."
+                        )})
+                        _retry_body = dict(vllm_body)
+                        _retry_body["messages"] = _retry_msgs
+                        _retry_body["max_tokens"] = max_tokens
+                        try:
+                            _r3 = await client.post(VLLM_URL + "/chat/completions", json=_retry_body)
+                            if _r3.status_code == 200:
+                                data = _r3.json()
+                                if not isinstance(data.get("usage"), dict):
+                                    data["usage"] = {}
+                                choices = data.get("choices", [])
+                                # Check if retry ALSO returned an unbounded loop
+                                _retry_unsafe = False
+                                for _rc in choices:
+                                    _rtcs = _rc.get("message", {}).get("tool_calls")
+                                    if not _rtcs:
+                                        continue
+                                    for _rtc in _rtcs:
+                                        _rfn = _rtc.get("function", {})
+                                        if _rfn.get("name") != "execute_typescript":
+                                            continue
+                                        try:
+                                            _rargs = json.loads(_rfn.get("arguments", "{}"))
+                                        except Exception:
+                                            _rargs = {}
+                                        if _unbounded_replace_loop(_rargs.get("code", "")):
+                                            _retry_unsafe = True
+                                            break
+                                    if _retry_unsafe:
+                                        break
+                                if _retry_unsafe:
+                                    metrics["unsafe_loop_blocked"] += 1
+                                    log.warning("Unbounded-loop retry ALSO unsafe - returning text error (session=%s)", session_key)
+                                    for _rc in choices:
+                                        _rc["message"]["tool_calls"] = None
+                                        _rc["message"]["content"] = "BLOCKED: execute_typescript code contains an unbounded while(var.includes(X)) { var = var.replace(X, Y) } loop. Use s.replaceAll(A, B) or s.split(A).join(B) instead. Any loop must have an explicit iteration cap (e.g. for (let i=0;i<1000;i++))."
+                                        _rc["finish_reason"] = "stop"
+                                else:
+                                    log.info("Unbounded-loop retry succeeded (session=%s)", session_key)
+                        except Exception as _e3:
+                            log.warning("Unbounded-loop retry failed: %s", _e3)
+                            for _rc in choices:
+                                _rc["message"]["tool_calls"] = None
+                                _rc["message"]["content"] = "BLOCKED: execute_typescript code contains an unbounded replace loop. Use s.replaceAll(A, B) or s.split(A).join(B) instead."
+                                _rc["finish_reason"] = "stop"
+                        break
+                break
+        output_tokens = data.get("usage", {}).get("completion_tokens", 0)
+        total_output_tokens += output_tokens
+        # --- Auto-continuation with total output budget ---
+        ns_wall_start = time.time()
+        while choices and choices[0].get("finish_reason") == "length" and cont_count < MAX_CONTINUATIONS:
+            if _no_continue:
+                log.info("No-continue flag: stopping after first segment (client capped)")
+                exit_reason = "client_capped"
+                break
+            if time.time() - ns_wall_start > WALL_CLOCK_MAX:
+                log.warning("Wall clock %ds exceeded - stopping non-stream", WALL_CLOCK_MAX)
+                exit_reason = "wall_clock"
+                break
+            # Check total output budget
+            remaining = CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens
+            if remaining < CTXGATE_MIN_CONTINUATION_OUTPUT:
+                log.info("Non-stream: total output budget exhausted (%d/%d) - stopping", total_output_tokens, CTXGATE_MAX_TOTAL_OUTPUT)
+                exit_reason = "total_output_budget"
+                metrics["output_total_budget_exhausted"] += 1
+                break
+            cont_count += 1
+            metrics["output_continuations_total"] += 1
+            log.info("Non-stream: auto-continuing (%d/%d, remaining=%d)", cont_count, MAX_CONTINUATIONS, remaining)
+            msg_c = choices[0].get("message", {})
+            # --- Continuation state machine ---
+            has_tool_calls = bool(msg_c.get("tool_calls"))
+            if has_tool_calls:
+                # Complete tool-call set -> terminate, no continuation
+                exit_reason = "tool_calls_complete"
+                break
+            trunc_type = _classify_truncation("length", msg_c.get("content",""), msg_c.get("reasoning_content",""), msg_c.get("tool_calls"))
+            if trunc_type == "reasoning_overflow":
+                cb = dict(vllm_body)
+                cb["chat_template_kwargs"] = {"enable_thinking": False}
+                _cb_budget = _output_budget(count_messages_tokens(vllm_body.get("messages", [])))
+                cb["max_tokens"] = min(_cb_budget, MAX_OUTPUT, remaining)
+                r2 = await client.post(VLLM_URL + "/chat/completions", json=cb)
+                if r2.status_code == 200:
+                    d2 = r2.json()
+                    nc = d2.get("choices", [])
+                    if nc and nc[0].get("message",{}).get("content"):
+                        choices[0]["message"]["content"] = (msg_c.get("content","") or "") + nc[0]["message"]["content"]
+                        choices[0]["finish_reason"] = nc[0].get("finish_reason", "stop")
+                        _r2_tokens = d2.get("usage",{}).get("completion_tokens",0)
+                        output_tokens += _r2_tokens
+                        total_output_tokens += _r2_tokens
+                exit_reason = "reasoning_overflow"
+                break
+            # Pure text continuation
+            partial = choices[0].get("message", {}).get("content") or ""
+            cont_msgs = list(vllm_body.get("messages", []))
+            cont_msgs.append({"role": "assistant", "content": partial})
+            cont_msgs.append({"role": "user", "content": "Continue from exactly where you left off. Do not repeat any content already provided. Resume the next word/sentence/code line."})
+            cont_tokens = count_messages_tokens(cont_msgs)
+            _cont_budget = _output_budget(cont_tokens)
+            max_tokens = min(_cont_budget, MAX_OUTPUT, remaining)
+            if cont_tokens > MAX_INPUT or max_tokens < CTXGATE_MIN_CONTINUATION_OUTPUT:
+                log.info("Non-stream cont: would exceed input budget or starve output - stopping")
+                exit_reason = "continuation_budget"
+                break
+            cont_body = dict(vllm_body)
+            cont_body["messages"] = cont_msgs
+            cont_body["max_tokens"] = max_tokens
+            resp = await client.post(VLLM_URL + "/chat/completions", json=cont_body)
+            if resp.status_code != 200:
+                exit_reason = "continuation_error"
+                break
+            data = resp.json()
+            choices = data.get("choices", [])
+            if choices:
+                new_c = choices[0].get("message", {}).get("content", "")
+                if new_c:
+                    choices[0]["message"]["content"] = partial + new_c
+                _cont_tokens = data.get("usage", {}).get("completion_tokens", 0)
+                output_tokens += _cont_tokens
+                total_output_tokens += _cont_tokens
+        # --- Finalize: add ctxgate meta ---
+        truncated = exit_reason != "ok"
+        tool_calls_complete = False
+        tool_calls_emitted = 0
+        for choice in choices:
+            if choice.get("finish_reason") == "length" and choice.get("message", {}).get("content"):
+                choice["message"]["content"] = _safe_truncate(choice["message"]["content"])
+                choice["finish_reason"] = "length"
+            if choice.get("message", {}).get("tool_calls"):
+                tool_calls_complete = True
+                tool_calls_emitted = len(choice["message"]["tool_calls"])
+        if tool_calls_complete:
+            metrics["tool_call_complete"] += 1
+        if truncated:
+            metrics["output_truncated_total"] += 1
+            _reason_key = exit_reason if exit_reason in metrics.get("output_truncated_by_reason", {}) else exit_reason
+            if _reason_key not in metrics["output_truncated_by_reason"]:
+
+=== FORWARD_TO_VLLM (4800-5600) ===
+        _no_continue = vllm_body.pop("_ctxgate_no_continue", False)
+        # Content is forwarded immediately. The only text ever held back is
+        # the first SEAM_WINDOW chars of a continuation segment (to trim overlap
+        # with what the client already has), and it is flushed on every exit path.
+        SEAM_WINDOW = 120
+        total_output_tokens = 0
+        total_cached_tokens = 0
+        full_content = ""
+        seam_hold = ""
+        seam_active = False
+        continuation_count = 0
+        current_body = dict(vllm_body)
+        finish_reason = "stop"
+        exit_reason = "ok"
+        stream_id = "gen"
+        reasoning_tail = ""
+        content_tail = ""
+        reasoning_chars = 0
+        reasoning_full = ""
+        loop_check_acc = 0
+        loop_retries = 0
+        loop_period = 0
+        loop_in_reasoning = False
+        loop_in_content = False
+        reasoning_overflow = False
+        reasoning_chars_first = 0  # O2: preserve first-attempt reasoning chars
+        notice = ""
+        # --- ToolCallAccumulator replaces the old seg_tool_calls_seen boolean ---
+        tc_accum = ToolCallAccumulator()
+        tc_emitted_count = 0
+        tc_buffer: list = []  # buffered tool-call chunks (flushed after safety check)
+        loop_intentional = False
+        shrink_retried = False
+
+        def _seam_resolve() -> str:
+            nonlocal seam_hold, seam_active
+            held, seam_hold, seam_active = seam_hold, "", False
+            tail = full_content[-100:]
+            overlap = 0
+            for j in range(min(len(tail), len(held)), 0, -1):
+                if held[:j] == tail[-j:]:
+                    overlap = j
+                    break
+            if overlap > 10:
+                log.info("Seam dedup: trimmed %d overlapping chars", overlap)
+                held = held[overlap:]
+            return held
+
+        def _flush_seam():
+            nonlocal full_content, seam_active
+            if seam_hold:
+                out = _seam_resolve()
+                if out:
+                    full_content += out
+                    yield _sse_content(out, stream_id)
+            seam_active = False
+
+        def _emit_ctxgate_final(fr: str, reason: str, conts: int, out_toks: int,
+                                 tc_complete: bool, tc_emitted_n: int, tc_truncated: bool = False,
+                                 truncated_override: bool = False):
+            """Build and yield the final ctxgate chunk + [DONE]."""
+            meta = ctxgate_meta(
+                truncated=truncated_override if truncated_override else (reason not in ("ok", "tool_calls_complete")),
+                reason=reason,
+                continuations_used=conts,
+                total_output_tokens=out_toks,
+                tool_calls_complete=tc_complete,
+                tool_calls_emitted=tc_emitted_n,
+                tool_call_truncated=tc_truncated,
+            )
+            if reason != "ok":
+                meta["ctxgate"]["reasoning_chars"] = reasoning_chars
+            final_chunk = {
+                "id": stream_id, "object": "chat.completion.chunk", "created": 0,
+                "model": VLLM_MODEL,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": fr}],
+                "ctxgate": meta["ctxgate"],
+            }
+            if out_toks:
+                final_chunk["usage"] = {
+                    "prompt_tokens": input_tokens,
+                    "completion_tokens": out_toks,
+                    "total_tokens": input_tokens + out_toks,
+                    "prompt_tokens_details": {"cached_tokens": total_cached_tokens},
+                }
+            yield "data: " + json.dumps(final_chunk) + "\n\n"
+            yield "data: [DONE]\n\n"
+
+        try:
+            client = _vllm_client
+            wall_start = time.time()
+            # --- Initial request with total output budget guard ---
+            remaining = CTXGATE_MAX_TOTAL_OUTPUT
+            _budget = _output_budget(input_tokens)
+            max_tokens = min(_budget, MAX_OUTPUT, remaining)
+            _caller_cap = vllm_body.get("max_tokens") or 0
+            if _caller_cap > 0:
+                max_tokens = min(max_tokens, _caller_cap)
+            if _no_continue:
+                if max_tokens < 1:
+                    log.info("Stream: client-capped, no room for output (max_tokens=%d)", max_tokens)
+                    exit_reason = "total_output_budget"
+                    metrics["output_total_budget_exhausted"] += 1
+                    for x in _flush_seam():
+                        yield x
+                    for _cg in _emit_ctxgate_final("length", exit_reason, 0, total_output_tokens, False, 0):
+                        yield _cg
+                    metrics["requests_error"] += 1
+                    _record_call(session_key, input_tokens, 0, "budget", VLLM_MODEL, True, "initial budget exhausted")
+                    return
+            else:
+                if max_tokens < MIN_OUTPUT:
+                    log.info("Stream: initial output budget %d < MIN_OUTPUT %d - stopping", max_tokens, MIN_OUTPUT)
+                    exit_reason = "total_output_budget"
+                    metrics["output_total_budget_exhausted"] += 1
+                    for x in _flush_seam():
+                        yield x
+                    for _cg in _emit_ctxgate_final("length", exit_reason, 0, total_output_tokens, False, 0):
+                        yield _cg
+                    metrics["requests_error"] += 1
+                    _record_call(session_key, input_tokens, 0, "budget", VLLM_MODEL, True, "initial budget exhausted")
+                    return
+            current_body["max_tokens"] = max_tokens
+            metrics["output_max_tokens_seen"] = max(metrics["output_max_tokens_seen"], max_tokens)
+
+            while True:
+                if time.time() - wall_start > WALL_CLOCK_MAX:
+                    log.warning("Wall clock %ds exceeded - stopping stream", WALL_CLOCK_MAX)
+                    exit_reason = "wall_clock"
+                    break
+                finish_reason = "stop"
+                got_finish = False
+                got_done = False
+                seg_output_tokens = 0
+                interrupted = None
+                loop_intentional = False
+                tc_buffer = []
+                _check_vllm_breaker()
+                try:
+                    _send = {k: v for k, v in current_body.items() if not k.startswith("_ctxgate_")}
+                    async with client.stream("POST", VLLM_URL + "/chat/completions", json=_send) as resp:
+                        if resp.status_code != 200:
+                            body_bytes = await resp.aread()
+                            _et = body_bytes[:500].decode("utf-8", errors="replace").lower()
+                            if (resp.status_code == 400 and not shrink_retried
+                                    and any(p in _et for p in ("context", "max_tokens", "max_completion_tokens", "maximum", "greater than"))):
+                                shrink_retried = True
+                                log.warning("Stream 400 (context/max_tokens) - re-shrinking and retrying: %s", _et[:200])
+                                try:
+                                    current_body["messages"] = _emergency_shrink(current_body["messages"], int(input_tokens * 0.8))
+                                except ContextCapacityError as cce:
+                                    for x in _flush_seam():
+                                        yield x
+                                    for _cg in _emit_ctxgate_final("length", "context_capacity", continuation_count, total_output_tokens, False, 0):
+                                        yield _cg
+                                    metrics["requests_error"] += 1
+                                    _record_call(session_key, input_tokens, total_output_tokens, "context_capacity", VLLM_MODEL, True, str(cce)[:200])
+                                    return
+                                input_tokens = count_messages_tokens(current_body["messages"])
+                                _b2 = _output_budget(input_tokens)
+                                current_body["max_tokens"] = min(_b2, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens)
+                                continue
+                            metrics["requests_error"] += 1
+                            _record_call(session_key, input_tokens, total_output_tokens, "vllm_" + str(resp.status_code), VLLM_MODEL, True, body_bytes[:300].decode("utf-8", errors="replace"))
+                            for x in _flush_seam():
+                                yield x
+                            yield "data: " + json.dumps({"error": body_bytes[:200].decode("utf-8", errors="replace")}) + "\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+                        async for line in _lines_with_heartbeat(resp, SSE_HEARTBEAT_INTERVAL):
+                            if line is None:
+                                yield ": hb\n\n"
+                                continue
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:]
+                            if data_str == "[DONE]":
+                                got_done = True
+                                break
+                            try:
+                                chunk = json.loads(data_str)
+                                stream_id = chunk.get("id") or stream_id
+                                usage = chunk.get("usage")
+                                if usage:
+                                    if usage.get("completion_tokens"):
+                                        seg_output_tokens = usage["completion_tokens"]
+                                    total_cached_tokens += (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+                                    usage["prompt_tokens"] = input_tokens
+                                    usage["total_tokens"] = input_tokens + (usage.get("completion_tokens") or 0)
+                                choices = chunk.get("choices", [])
+                                if not choices:
+                                    continue
+                                fr = choices[0].get("finish_reason")
+                                if fr:
+                                    finish_reason = fr
+                                    got_finish = True
+                                delta = choices[0].get("delta", {})
+                                reasoning_piece = delta.get("reasoning_content", "") or delta.get("reasoning", "")
+                                tool_calls_piece = delta.get("tool_calls")
+                                if reasoning_piece:
+                                    rc = {"id": stream_id, "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"reasoning_content": reasoning_piece}, "finish_reason": None}]}
+                                    yield "data: " + json.dumps(rc) + "\n\n"
+                                    reasoning_chars += len(reasoning_piece)
+                                    reasoning_full += reasoning_piece
+                                    reasoning_tail = (reasoning_tail + reasoning_piece)[-LOOP_TAIL:]
+                                    loop_check_acc += len(reasoning_piece)
+                                # --- ToolCallAccumulator: track completeness + forward in real-time ---
+                                if tool_calls_piece:
+                                    tc_accum.add_delta(tool_calls_piece)
+                                    tc_chunk = {"id": stream_id, "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"tool_calls": tool_calls_piece}, "finish_reason": None}]}
+                                    tc_buffer.append(tc_chunk)
+                                content_piece = delta.get("content", "")
+                                if content_piece:
+                                    if seam_active:
+                                        seam_hold += content_piece
+                                        if len(seam_hold) < SEAM_WINDOW:
+                                            continue
+                                        out = _seam_resolve()
+                                    else:
+                                        out = content_piece
+                                    if out:
+                                        full_content += out
+                                        content_tail = (content_tail + out)[-LOOP_TAIL:]
+                                        loop_check_acc += len(out)
+                                        yield _sse_content(out, stream_id)
+                                if loop_check_acc >= LOOP_CHECK_EVERY:
+                                    loop_check_acc = 0
+                                    if not loop_period:
+                                        lp = _detect_loop(reasoning_tail)
+                                        if lp:
+                                            loop_period = lp
+                                            loop_in_reasoning = True
+                                            log.warning("Loop in reasoning (period=%d chars=%d) - stopping upstream", lp, reasoning_chars)
+                                            loop_intentional = True
+                                            break
+                                        lp = _detect_loop(content_tail)
+                                        if lp:
+                                            loop_period = lp
+                                            loop_in_content = True
+                                            log.warning("Loop in content (period=%d chars=%d) - stopping stream", lp, len(full_content))
+                                            loop_intentional = True
+                                            break
+                                if not loop_period and reasoning_chars > MAX_REASONING_TOKENS * 3 and not full_content and not tc_accum.count():
+                                    loop_in_reasoning = True
+                                    reasoning_overflow = True
+                                    log.warning("Reasoning budget backstop (chars=%d > %d) with no content - treating as loop", reasoning_chars, MAX_REASONING_TOKENS * 3)
+                                    loop_intentional = True
+                                    break
+                            except (json.JSONDecodeError, ValueError):
+                                yield "data: " + data_str + "\n\n"
+                except httpx.TransportError as e:
+                    interrupted = "%s: %s" % (type(e).__name__, str(e)[:150])
+                    _vllm_breaker.record_failure()
+
+                # Release any text still held for seam trimming
+                for x in _flush_seam():
+                    yield x
+
+                if interrupted is None and not got_finish and not got_done and not loop_intentional:
+                    interrupted = "upstream closed the stream early"
+
+                if interrupted and full_content and finish_reason == "stop":
+                    finish_reason = "length"
+                total_output_tokens += seg_output_tokens
+                if interrupted is None:
+                    _vllm_breaker.record_success()
+                else:
+                    # Failure already recorded in except; early-close is also a failure
+                    pass
+
+                # --- Tool call completeness check ---
+                tc_complete = tc_accum.is_complete() if tc_accum.count() > 0 else False
+                tc_incomplete = tc_accum.count() > 0 and not tc_complete
+                # --- Flush buffered tool calls (after safety check) ---
+                if tc_buffer:
+                    _unsafe_tc = False
+                    if tc_complete and BLOCK_UNBOUNDED_LOOPS:
+                        for _idx, _tc in tc_accum._calls.items():
+                            if _tc.get("name") == "execute_typescript":
+                                try:
+                                    _args = json.loads(_tc.get("arguments", "{}"))
+                                except Exception:
+                                    _args = {}
+                                if _unbounded_replace_loop(_args.get("code", "")):
+                                    _unsafe_tc = True
+                                    break
+                    if _unsafe_tc:
+                        metrics["unsafe_loop_blocked"] += 1
+                        log.warning("Stream: blocked unbounded replace-loop (session=%s)", session_key)
+                        tc_buffer.clear()
+                        tc_accum = ToolCallAccumulator()
+                        _err_text = "BLOCKED: execute_typescript code contains an unbounded while(var.includes(X)) { var = var.replace(X, Y) } loop. Use s.replaceAll(A, B) or s.split(A).join(B) instead. Any loop must have an explicit iteration cap (e.g. for (let i=0;i<1000;i++))."
+                        _err_chunk = {"id": stream_id, "object": "chat.completion.chunk", "created": 0, "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"content": _err_text}, "finish_reason": None}]}
+                        yield "data: " + json.dumps(_err_chunk) + "\n\n"
+                        finish_reason = "stop"
+                        exit_reason = "unsafe_loop_blocked"
+                        break
+                    else:
+                        if tc_incomplete:
+                            tc_buffer.clear()
+                            # Do NOT emit. The outer classification will set
+                            # tool_call_truncated=true and finish_reason="length".
+                        else:
+                            for _tc_chunk in tc_buffer:
+                                yield "data: " + json.dumps(_tc_chunk) + "\n\n"
+                            tc_emitted_count += len(tc_buffer)
+                            tc_buffer.clear()
+                            if tc_complete:
+                                finish_reason = "tool_calls"
+                                exit_reason = "tool_calls_complete"
+                                break
+
+                if interrupted and not loop_intentional and exit_reason not in ("tool_calls_complete", "unsafe_loop_blocked"):
+                    log.warning("Stream interrupted after %d chars: %s", len(full_content), interrupted)
+                    if tc_incomplete or not full_content or continuation_count >= MAX_CONTINUATIONS:
+                        exit_reason = "interrupted"
+                        finish_reason = "length"
+                        break
+                    finish_reason = "length"
+                    await asyncio.sleep(min(2 * (continuation_count + 1), 5))
+
+                # --- Reasoning overflow: length stop with empty content ---
+                if finish_reason == "length" and not full_content and not tc_accum.count():
+                    if loop_retries < LOOP_RETRIES:
+                        loop_retries += 1
+                        exit_reason = "reasoning_overflow"
+                        metrics["summary_retry_count"] += 1
+                        log.info("reasoning_overflow (length, empty content) - non-thinking retry (%d/%d)", loop_retries, LOOP_RETRIES)
+                        current_body = dict(vllm_body)
+                        current_body["messages"] = list(vllm_body.get("messages", []))
+                        _rb = _output_budget(count_messages_tokens(vllm_body.get("messages", [])))
+                        current_body["max_tokens"] = min(_rb, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens)
+                        current_body["chat_template_kwargs"] = {"enable_thinking": False}
+                        current_body["temperature"] = RETRY_TEMPERATURE
+                        current_body["top_p"] = RETRY_TOP_P
+                        current_body["presence_penalty"] = RETRY_PRESENCE_PENALTY
+                        # O2: keep stream_options so vLLM sends usage chunk
+                        if "stream_options" not in current_body:
+                            current_body["stream_options"] = {"include_usage": True}
+                        reasoning_tail = ""
+                        content_tail = ""
+                        reasoning_chars = 0
+                        reasoning_full = ""
+                        loop_period = 0
+                        loop_check_acc = 0
+                        loop_in_reasoning = False
+                        loop_in_content = False
+                        reasoning_overflow = False
+                        tc_accum = ToolCallAccumulator()
+                        seam_active = False
+                        seam_hold = ""
+                        continue
+                    else:
+                        log.warning("reasoning_overflow but no retries left - stopping")
+                        exit_reason = "reasoning_overflow"
+                        finish_reason = "length"
+                        break
+
+                # --- Continuation state machine ---
+                if _no_continue and finish_reason == "length":
+                    log.info("No-continue flag: ending stream after first segment")
+                    exit_reason = "client_capped"
+                    finish_reason = "length"
+                    break
+                if finish_reason == "length" and continuation_count < MAX_CONTINUATIONS:
+                    # Incomplete tool call -> NO continuation
+                    if tc_incomplete:
+                        log.warning("Incomplete tool call set - NO continuation (truncated)")
+                        exit_reason = "tool_call_truncated"
+                        metrics["tool_call_truncated"] += 1
+                        finish_reason = "length"
+                        break
+                    # Complete tool call set -> terminate, no continuation
+                    if tc_complete:
+                        log.info("Complete tool-call set - terminating turn (no continuation)")
+                        finish_reason = "tool_calls"
+                        exit_reason = "tool_calls_complete"
+                        break
+                    # Pure text continuation
+                    remaining = CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens
+                    if remaining < CTXGATE_MIN_CONTINUATION_OUTPUT:
+                        log.info("Stream: total output budget exhausted (%d/%d) - stopping", total_output_tokens, CTXGATE_MAX_TOTAL_OUTPUT)
+                        exit_reason = "total_output_budget"
+                        metrics["output_total_budget_exhausted"] += 1
+                        finish_reason = "length"
+                        break
+                    continuation_count += 1
+                    metrics["output_continuations_total"] += 1
+                    log.info("vLLM hit max_tokens - auto-continuing (%d/%d, remaining=%d)", continuation_count, MAX_CONTINUATIONS, remaining)
+                    cont_messages = list(vllm_body.get("messages", []))
+                    cont_messages.append({"role": "assistant", "content": full_content})
+                    cont_messages.append({"role": "user", "content": "Continue from exactly where you left off. Do not repeat any content already provided. Resume the next word/sentence/code line."})
+                    cont_tokens = count_messages_tokens(cont_messages)
+                    _cont_budget = _output_budget(cont_tokens)
+                    max_tokens = min(_cont_budget, MAX_OUTPUT, remaining)
+                    if cont_tokens > MAX_INPUT or max_tokens < CTXGATE_MIN_CONTINUATION_OUTPUT:
+                        log.info("Stream cont: would exceed input budget (%d > %d) or starve output (%d < %d) - stopping", cont_tokens, MAX_INPUT, max_tokens, CTXGATE_MIN_CONTINUATION_OUTPUT)
+                        exit_reason = "cont_budget"
+                        finish_reason = "length"
+                        break
+                    current_body = dict(vllm_body)
+                    current_body["messages"] = cont_messages
+                    current_body["max_tokens"] = max_tokens
+                    metrics["output_max_tokens_seen"] = max(metrics["output_max_tokens_seen"], max_tokens)
+                    seam_active = bool(full_content)
+                    seam_hold = ""
+                    continue
+                elif finish_reason == "length":
+                    log.warning("Max continuations (%d) reached - stopping", MAX_CONTINUATIONS)
+                    exit_reason = "max_continuations"
+                    finish_reason = "length"
+                break
+
+            # O2: save first-attempt reasoning chars before any retry resets them
+            if loop_retries == 0 and reasoning_chars > 0:
+                reasoning_chars_first = reasoning_chars
+
+            # Empty-response recovery
+            if (not notice and not full_content and not tc_accum.count()
+                    and finish_reason == "stop" and reasoning_chars > 500
+                    and loop_retries < LOOP_RETRIES):
+                log.warning(
+                    "Empty content after %d reasoning chars (finish=stop) - "
+                    "treating as reasoning_overflow for non-thinking retry",
+                    reasoning_chars,
+                )
+                reasoning_overflow = True
+
+            # --- Tool call emitted inside reasoning (no content, no tool_calls) ---
+            _tc_markers = ('<tool_call>', '<function=', '</parameter>', '</function>')
+            if (not full_content and not tc_accum.count()
+                    and finish_reason == "stop"
+                    and any(m in reasoning_full for m in _tc_markers)):
+                log.warning("tool call emitted inside reasoning (no content, no tool_calls) - non-thinking retry")
+                metrics["tool_call_in_reasoning"] += 1
+                reasoning_overflow = True
+
+            # Loop recovery
+            if (loop_in_reasoning or reasoning_overflow) and loop_retries < LOOP_RETRIES:
+                loop_retries += 1
+                metrics["summary_retry_count"] += 1
+                log.info("Loop in reasoning - non-thinking retry (%d/%d)", loop_retries, LOOP_RETRIES)
+                current_body = dict(vllm_body)
+                current_body["messages"] = list(vllm_body.get("messages", []))
+                _rb2 = _output_budget(count_messages_tokens(vllm_body.get("messages", [])))
+                current_body["max_tokens"] = min(_rb2, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens)
+                current_body["chat_template_kwargs"] = {"enable_thinking": False}
+                current_body["temperature"] = RETRY_TEMPERATURE
+                current_body["top_p"] = RETRY_TOP_P
+                current_body["presence_penalty"] = RETRY_PRESENCE_PENALTY
+                # O2: keep stream_options so vLLM sends usage chunk
+                if "stream_options" not in current_body:
+                    current_body["stream_options"] = {"include_usage": True}
+                reasoning_tail = ""
+                content_tail = ""
+                reasoning_chars = 0
+                reasoning_full = ""
+                loop_period = 0
+                loop_check_acc = 0
+                loop_in_reasoning = False
+                loop_in_content = False
+                reasoning_overflow = False
+                tc_accum = ToolCallAccumulator()
+                seam_active = False
+                seam_hold = ""
+                wall_start = time.time()
+                finish_reason = "stop"
+                while True:
+                    if time.time() - wall_start > WALL_CLOCK_MAX:
+                        exit_reason = "wall_clock"
+                        break
+                    finish_reason = "stop"
+                    got_finish = False
+                    got_done = False
+                    seg_output_tokens = 0
+                    interrupted = None
+                    tc_buffer = []
+                    _check_vllm_breaker()
+                    _retry_t0 = time.monotonic()
+                    try:
+                        _send = {k: v for k, v in current_body.items() if not k.startswith("_ctxgate_")}
+                        async with client.stream("POST", VLLM_URL + "/chat/completions", json=_send) as resp:
+                            if loop_retries > 0:
+                                log.info("CACHE retry_ttft=%.3f", time.monotonic() - _retry_t0)
+                            if resp.status_code != 200:
+                                body_bytes = await resp.aread()
+                                _et = body_bytes[:500].decode("utf-8", errors="replace").lower()
+                                if (resp.status_code == 400 and not shrink_retried
+                                        and any(p in _et for p in ("context", "max_tokens", "max_completion_tokens", "maximum", "greater than"))):
+                                    shrink_retried = True
+                                    log.warning("Stream 400 retry (context/max_tokens) - re-shrinking: %s", _et[:200])
+                                    try:
+                                        current_body["messages"] = _emergency_shrink(current_body["messages"], int(input_tokens * 0.8))
+                                    except ContextCapacityError as cce:
+                                        for x in _flush_seam():
+                                            yield x
+                                        for _cg in _emit_ctxgate_final("length", "context_capacity", continuation_count, total_output_tokens, False, 0):
+                                            yield _cg
+                                        metrics["requests_error"] += 1
+                                        _record_call(session_key, input_tokens, total_output_tokens, "context_capacity", VLLM_MODEL, True, str(cce)[:200])
+                                        return
+                                    input_tokens = count_messages_tokens(current_body["messages"])
+                                    _b3 = _output_budget(input_tokens)
+                                    current_body["max_tokens"] = min(_b3, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens)
+                                    continue
+                                metrics["requests_error"] += 1
+                                _record_call(session_key, input_tokens, total_output_tokens, "vllm_" + str(resp.status_code), VLLM_MODEL, True, body_bytes[:300].decode("utf-8", errors="replace"))
+                                for x in _flush_seam():
+                                    yield x
+                                yield "data: " + json.dumps({"error": body_bytes[:200].decode("utf-8", errors="replace")}) + "\n\n"
+                                yield "data: [DONE]\n\n"
+                                return
+                            async for line in _lines_with_heartbeat(resp, SSE_HEARTBEAT_INTERVAL):
+                                if line is None:
+                                    yield ": hb\n\n"
+                                    continue
+                                if not line.startswith("data: "):
+                                    continue
+                                data_str = line[6:]
+                                if data_str == "[DONE]":
+                                    got_done = True
+                                    break
+                                try:
+                                    chunk = json.loads(data_str)
+                                    stream_id = chunk.get("id") or stream_id
+                                    usage = chunk.get("usage")
+                                    if usage:
+                                        if usage.get("completion_tokens"):
+                                            seg_output_tokens = usage["completion_tokens"]
+                                        total_cached_tokens += (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+                                        usage["prompt_tokens"] = input_tokens
+                                        usage["total_tokens"] = input_tokens + (usage.get("completion_tokens") or 0)
+                                        try:
+                                            _ptd = usage.get("prompt_tokens_details") or {}
+                                            _ct = _ptd.get("cached_tokens", 0)
+                                            _pt = usage.get("prompt_tokens", 0)
+                                            if _pt:
+                                                log.info("Retry cache: cached=%d/%d prompt_tokens (%.0f%%)", _ct, _pt, 100.0 * _ct / _pt)
+                                        except Exception:
+                                            pass
+                                    choices = chunk.get("choices", [])
+                                    if not choices:
+                                        continue
+                                    fr = choices[0].get("finish_reason")
+                                    if fr:
+                                        finish_reason = fr
+                                        got_finish = True
+                                    delta = choices[0].get("delta", {})
+                                    reasoning_piece = delta.get("reasoning_content", "") or delta.get("reasoning", "")
+                                    tool_calls_piece = delta.get("tool_calls")
+                                    if reasoning_piece:
+                                        rc = {"id": stream_id, "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"reasoning_content": reasoning_piece}, "finish_reason": None}]}
+                                        yield "data: " + json.dumps(rc) + "\n\n"
+                                        reasoning_chars += len(reasoning_piece)
+                                        reasoning_full += reasoning_piece
+                                        reasoning_tail = (reasoning_tail + reasoning_piece)[-LOOP_TAIL:]
+                                    loop_check_acc += len(reasoning_piece)
+                                    if tool_calls_piece:
+                                        tc_accum.add_delta(tool_calls_piece)
+                                        tc_chunk = {"id": stream_id, "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"tool_calls": tool_calls_piece}, "finish_reason": None}]}
+                                        tc_buffer.append(tc_chunk)
+                                    content_piece = delta.get("content", "")
+                                    if content_piece:
+                                        full_content += content_piece
+                                        content_tail = (content_tail + content_piece)[-LOOP_TAIL:]
+                                        loop_check_acc += len(content_piece)
+                                        yield _sse_content(content_piece, stream_id)
+                                except (json.JSONDecodeError, ValueError):
+                                    yield "data: " + data_str + "\n\n"
+                    except httpx.TransportError as e:
+                        interrupted = "%s: %s" % (type(e).__name__, str(e)[:150])
+                        _vllm_breaker.record_failure()
+                    for x in _flush_seam():
+                        yield x
+                    if interrupted is None and not got_finish and not got_done:
+                        interrupted = "upstream closed the stream early"
+                    total_output_tokens += seg_output_tokens
+                    if interrupted and full_content and finish_reason == "stop":
+                        finish_reason = "length"
+                    if interrupted is None:
+                        _vllm_breaker.record_success()
+                    else:
+                        # Failure already recorded in except
+                        pass
+                    if loop_check_acc >= LOOP_CHECK_EVERY:
+                        loop_check_acc = 0
+                        if not loop_period:
+                            lp = _detect_loop(content_tail)
+                            if lp:
+                                loop_period = lp
+                                loop_in_content = True
+                                log.warning("Retry looped in content (period=%d) - stopping", lp)
+                                break
+                        if not loop_period:
+                            lp = _detect_loop(reasoning_tail)
+                            if lp:
+                                loop_period = lp
+                                loop_in_reasoning = True
+                                log.warning("Retry looped in reasoning (period=%d) - stopping", lp)
+                                break
+                    if not loop_period and reasoning_chars > MAX_REASONING_TOKENS * 3 and not full_content and not tc_accum.count():
+                        loop_in_reasoning = True
+                        reasoning_overflow = True
+                        log.warning("Retry reasoning budget backstop (chars=%d > %d) - stopping", reasoning_chars, MAX_REASONING_TOKENS * 3)
+                        break
+                    # --- Flush buffered tool calls from retry (after safety check) ---
+                    tc_complete_r = tc_accum.is_complete() if tc_accum.count() > 0 else False
+                    tc_incomplete_r = tc_accum.count() > 0 and not tc_complete_r
+                    if tc_buffer:
+                        _unsafe_tc = False
+                        if tc_complete_r and BLOCK_UNBOUNDED_LOOPS:
+                            for _idx, _tc in tc_accum._calls.items():
+                                if _tc.get('name') == 'execute_typescript':
+                                    try:
+                                        _args = json.loads(_tc.get('arguments', '{}'))
+                                    except Exception:
+                                        _args = {}
+                                    if _unbounded_replace_loop(_args.get('code', '')):
+                                        _unsafe_tc = True
+                        if _unsafe_tc:
+                            metrics['unsafe_loop_blocked'] += 1
+                            log.warning('Stream retry: blocked unbounded replace-loop (session=%s)', session_key)
+                            tc_buffer.clear()
+                            tc_accum = ToolCallAccumulator()
+                            _err_text = 'BLOCKED: execute_typescript code contains an unbounded while(var.includes(X)) { var = var.replace(X, Y) } loop. Use s.replaceAll(A, B) or s.split(A).join(B) instead. Any loop must have an explicit iteration cap.'
+                            _err_chunk = {'id': stream_id, 'object': 'chat.completion.chunk', 'created': 0, 'model': VLLM_MODEL, 'choices': [{'index': 0, 'delta': {'content': _err_text}, 'finish_reason': None}]}
+                            yield 'data: ' + json.dumps(_err_chunk) + '\n\n'
+                            finish_reason = 'stop'
+                            exit_reason = 'unsafe_loop_blocked'
+                        else:
+                            if tc_incomplete_r:
+                                tc_buffer.clear()
+                                # Do NOT emit.
+                            else:
+                                for _tc_chunk in tc_buffer:
+                                    yield 'data: ' + json.dumps(_tc_chunk) + '\n\n'
+                                tc_emitted_count += len(tc_buffer)
+                                tc_buffer.clear()
+                                if tc_complete_r:
+                                    finish_reason = 'tool_calls'
+                                    exit_reason = 'tool_calls_complete'
+                    if _no_continue and finish_reason == "length":
+                        log.info("No-continue flag: ending stream after retry segment")
+                        exit_reason = "client_capped"
+                        finish_reason = "length"
+                        break
+                    if interrupted and exit_reason not in ("tool_calls_complete", "unsafe_loop_blocked"):
+                        log.warning("Retry stream interrupted after %d chars: %s", len(full_content), interrupted)
+                        exit_reason = "interrupted"
+                        finish_reason = "length"
+                    break
+                if exit_reason not in ("interrupted", "tool_calls_complete", "unsafe_loop_blocked"):
+                    if loop_in_content:
+                        exit_reason = "loop"
+                        finish_reason = "length"
+                    elif tc_accum.is_complete() and tc_accum.count() > 0:
+                        exit_reason = "tool_calls_complete"
+                        finish_reason = "tool_calls"
+                    elif loop_in_reasoning or reasoning_overflow:
+                        exit_reason = "reasoning_overflow"
+                        finish_reason = "length"
+                    elif finish_reason == "length":
+                        # O3: retry segment hit max_tokens without completing
+                        exit_reason = "retry_length"
+                    else:
+                        exit_reason = "loop_recovered"
+
+            # Classify empty responses
+            if exit_reason in ("ok", "loop_recovered") and not full_content and not tc_accum.count():
+                exit_reason = "empty"
+
+            # WI-10: Unicode escape diagnostics
+            if tc_accum.count() > 0:
+                _ue_count = _check_unicode_escapes(tc_accum)
+                if _ue_count > 0:
+                    metrics["tool_args_unicode_escape"] += _ue_count
+                    log.warning("Unicode escapes in tool args (%d occurrences, session=%s)", _ue_count, session_key[:16])
+
+            # --- Empty after retry: no synthetic content, truthful exit reason ---
+            if (loop_retries > 0
+                    and exit_reason not in ("unsafe_loop_blocked", "interrupted", "tool_calls_complete")
+                    and not full_content and not tc_accum.count()):
+                finish_reason = "stop"
+                exit_reason = "empty_after_retry"
+                metrics["empty_after_retry"] += 1
+                log.warning("Empty response after retry (session=%s) - no content, no tool calls", session_key[:16])
+
+            # --- Phase 1b: fix exit_reason for loop/overflow recovery ---
+            if loop_in_content:
+                exit_reason = "content_loop"
+            elif loop_in_reasoning:
+                exit_reason = "reasoning_loop"
+            elif exit_reason == "reasoning_overflow" and not loop_in_reasoning and not loop_in_content:
+                if full_content or tc_accum.count():
+                    exit_reason = "ok"
+                else:
+                    exit_reason = "reasoning_loop"
+
+            # --- Final ctxgate chunk + [DONE] ---
+            tc_complete = tc_accum.is_complete() if tc_accum.count() > 0 else False
+            tc_truncated = tc_accum.count() > 0 and not tc_complete
+            tc_emitted_n = tc_emitted_count
+            if tc_emitted_count == 0:
+                tc_complete = False
+            if tc_truncated:
+                metrics["tool_call_truncated"] += 1
+                # O4: per-session tool call truncation visibility
+                _tc_names = []
+                for _idx, _tc in tc_accum._calls.items():
+                    _tc_names.append(_tc.get("name", "?"))
+                log.warning("O4 tool_call_truncated session=%s names=%s max_tokens=%d",
+                           session_key, _tc_names, current_body.get("max_tokens", "?"))
+            if tc_complete:
+                metrics["tool_call_complete"] += 1
+            # Determine final finish_reason
+            if tc_complete and finish_reason != "tool_calls":
+                finish_reason = "tool_calls"
+            if exit_reason not in ("ok", "unsafe_loop_blocked") and finish_reason == "stop":
+                finish_reason = "length"
+
+            # Metrics
+            _success_exit = {"ok", "loop_recovered", "tool_calls_complete"}
+            if exit_reason in _success_exit:
+                metrics["requests_ok"] += 1
+            else:
+                metrics["requests_error"] += 1
+                # Diagnostic breakdown of real errors (additive, stats-only)
+                metrics.setdefault("requests_error_by_reason", {})
+                metrics["requests_error_by_reason"][exit_reason] = (
+                    metrics["requests_error_by_reason"].get(exit_reason, 0) + 1
+                )
+            metrics["cached_tokens_total"] += total_cached_tokens
+            metrics["prompt_tokens_total"] += input_tokens
+            if total_output_tokens:
+                metrics["tokens_out_total"] += total_output_tokens
+                _track_session_tokens(session_key, 0, total_output_tokens, count_req=False)
+            if exit_reason not in ("ok", "tool_calls_complete"):
+                metrics["output_truncated_total"] += 1
+                _rk = exit_reason
+                if _rk not in metrics["output_truncated_by_reason"]:
+                    metrics["output_truncated_by_reason"][_rk] = 0
+                metrics["output_truncated_by_reason"][_rk] += 1
+
+            _record_call(session_key, input_tokens, total_output_tokens,
+                         "ok" if exit_reason == "ok" else "error", VLLM_MODEL, True,
+                         "" if exit_reason == "ok" else "stream ended: " + exit_reason,
+                         cached_tokens=total_cached_tokens)
+
+
+            _stream_truncated = (exit_reason != "ok" and exit_reason != "tool_calls_complete") or loop_in_content or loop_in_reasoning
+            # One concise diagnostic line
+            log.info("NS-DIAG session=%s exit=%s finish=%s truncated=%s conts=%d total_out=%d tc_seen=%d tc_complete=%d tc_emitted=%d reasoning_chars=%d reasoning_chars_first=%d",
+                     session_key, exit_reason, finish_reason,
+                     _stream_truncated, continuation_count, total_output_tokens,
+                     tc_accum.count(), tc_complete, tc_emitted_n, reasoning_chars, reasoning_chars_first)
+
+            # Flush any remaining seam text BEFORE the final marker
+            for x in _flush_seam():
+                yield x
+
+            _stream_truncated = (exit_reason != "ok" and exit_reason != "tool_calls_complete") or loop_in_content or loop_in_reasoning
+            for _cg in _emit_ctxgate_final(finish_reason, exit_reason, continuation_count, total_output_tokens, tc_complete, tc_emitted_n, tc_truncated, truncated_override=_stream_truncated):
+                yield _cg
+        except ContextCapacityError as e:
+            metrics["requests_error"] += 1
+            log.error("Context capacity error in stream: %s", e)
+            _record_call(session_key, input_tokens, total_output_tokens, "context_capacity", VLLM_MODEL, True, str(e)[:200])
+            for x in _flush_seam():
+                yield x
+            for _cg in _emit_ctxgate_final("length", "context_capacity", continuation_count, total_output_tokens, False, 0):
+                yield _cg
+        except Exception as e:
+            metrics["requests_error"] += 1
+            log.exception("Stream error: %s", e)
+            _record_call(session_key, input_tokens, total_output_tokens, "error", VLLM_MODEL, True, str(e)[:300])
+            for x in _flush_seam():
+                yield x
+            for _cg in _emit_ctxgate_final("length", "error", continuation_count, total_output_tokens, False, 0):
+                yield _cg
+    return StreamingResponse(generate(), media_type="text/event-stream")
+async def _get_goose_session_id() -> str:
+    """Read the most recent active session ID from Goose sessions SQLite DB.
+    Only active when CTXGATE_GOOSE_INTEGRATION=1. Returns empty string when disabled."""
+    if not CTXGATE_GOOSE_INTEGRATION:
+        return ""
+    global sqlite_conn
+    async with sqlite_lock:
+        try:
+            if sqlite_conn is None:
+                sqlite_conn = await aiosqlite.connect(GOOSE_SESSIONS_DB)
+            cursor = await sqlite_conn.execute(
+                "SELECT id FROM sessions WHERE archived_at IS NULL ORDER BY updated_at DESC LIMIT 1"
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            if row:
+                return row[0]
+        except Exception as e:
+            log.debug("Goose session lookup failed: %s", e)
+            try:
+                if sqlite_conn:

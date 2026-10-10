@@ -1154,7 +1154,6 @@ sqlite_lock = asyncio.Lock()  # serializes access to the shared aiosqlite conn (
 _last_extract_anchor: dict[str, str] = {}
 session_seeds: dict[str, list] = {}
 _task_uuid_cache: dict[str, str] = {}
-_ensure_task_done: set[str] = set()
 _goose_session_cache: dict[str, tuple] = {}
 session_compactions: dict[str, dict] = {}  # session_key -> frozen [msg0, msg1, msg2] (immutable seed)
 session_tokens: dict[str, dict] = {}  # {in, out, reqs, max_ctx}
@@ -1858,36 +1857,6 @@ def _prefix_raw(messages: list) -> str:
             parts.append(c or "")
             break
     return "\x00".join(parts)
-
-def _fallback_fingerprint(messages: list) -> str:
-    """sha256(system + \x00 + first_user)[:16]. First system
-    message and first user message only; None if there is no
-    user message at all."""
-    sys_text = ""
-    user_text = ""
-    for m in messages:
-        role = m.get("role", "")
-        if role == "system" and not sys_text:
-            c = m.get("content", "")
-            if isinstance(c, list):
-                c = " ".join(
-                    p.get("text", "") for p in c
-                    if isinstance(p, dict))
-            sys_text = c or ""
-        elif role == "user" and not user_text:
-            c = m.get("content", "")
-            if isinstance(c, list):
-                c = " ".join(
-                    p.get("text", "") for p in c
-                    if isinstance(p, dict))
-            user_text = c or ""
-            if sys_text:
-                break
-    if not user_text:
-        return ""
-    return hashlib.sha256(
-        (sys_text + "\x00" + user_text).encode()
-    ).hexdigest()[:16]
 
 def make_session_key(x_session_id: str, messages: list) -> str:
     fp = hashlib.sha256(_prefix_raw(messages).encode()).hexdigest()[:8]
@@ -2935,6 +2904,8 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
         total = count_messages_tokens(messages)
         log.info("Context: %d messages, %d tokens (limit %d)", len(messages), total, MAX_INPUT)
         if total <= MAX_INPUT - _note_n:
+            if sk:
+                session_compactions.pop(sk, None)
             return messages
         target = _trim_target()
         # Pre-recut elision: shrink tool bodies up to the newest-4 boundary so
@@ -3852,29 +3823,16 @@ async def chat_completions(request: Request):
         #   - otherwise -> ONE fixed "dummy" task for all non-Goose traffic
         # No fingerprinting. No SQLite resolver on the hot path. No
         # per-request row creation.
-        # --- Session identity: two deterministic paths ---
-        # Goose  : uuid5(ns, goose_id)          — from agent-session-id
-        # Fallback: uuid5(ns, "fallback:<fp>") — from content fingerprint
-        # Both paths compute uuid5 synchronously. The task row is
-        # created by a spawned background coroutine (see below).
         _goose_id_header = (
             request.headers.get('agent-session-id', '')
             or request.headers.get('X-Session-ID', '')
             or ''
         ).strip()
 
-        # Client cap only applies to the fallback path.
-        _client_cap = None
-        if not _goose_id_header:
-            _cm = body.get("max_tokens")
-            if isinstance(_cm, int) and _cm > 0:
-                _client_cap = _cm
-
         if _goose_id_header:
             _goose_meta = {
                 "id": _goose_id_header,
-                "uuid": str(uuid.uuid5(
-                    GOOSE_SESSION_UUID_NAMESPACE, _goose_id_header)),
+                "uuid": str(uuid.uuid5(GOOSE_SESSION_UUID_NAMESPACE, _goose_id_header)),
                 "name": _goose_id_header,
                 "session_type": "",
                 "working_dir": "",
@@ -3890,50 +3848,38 @@ async def chat_completions(request: Request):
                         "provider_name": _info.get("provider_name") or "",
                     })
             except Exception as e:
-                log.debug(
-                    "goose session metadata enrichment failed (non-fatal): %s",
-                    e)
+                log.debug("goose session metadata enrichment failed (non-fatal): %s", e)
             _log_label = "GOOSE-HEADER"
         else:
-            _fb_fp = _fallback_fingerprint(messages)
-            if not _fb_fp:
-                # No user message — should not happen (upstream rejects
-                # empty message lists), but be defensive.
-                _fb_fp = "empty"
-            _fallback_id = f"fallback:{_fb_fp}"
             _goose_meta = {
-                "id": _fallback_id,
-                "uuid": str(uuid.uuid5(
-                    GOOSE_SESSION_UUID_NAMESPACE, _fallback_id)),
-                "name": "fallback",
-                "session_type": "fallback",
+                "id": "dummy",
+                "uuid": str(uuid.uuid5(GOOSE_SESSION_UUID_NAMESPACE, "dummy")),
+                "name": "dummy",
+                "session_type": "unknown",
                 "working_dir": "",
                 "provider_name": "",
             }
-            _log_label = "FALLBACK"
+            _log_label = "DUMMY"
 
         session_key = f"goose:{_goose_meta['id']}"
         task_uuid = _goose_meta["uuid"]
         x_sid = _goose_meta["id"]
-        log.info("%s sid=%s session_key=%s task=%s cap=%s",
-                 _log_label, _goose_meta["id"], session_key, task_uuid,
-                 _client_cap)
+        await _ensure_task_row(_goose_meta, tenant_id)
+        log.info("%s sid=%s session_key=%s task=%s",
+                 _log_label, _goose_meta["id"], session_key, task_uuid)
 
-        # Memory job — chained background init (INSERT then enqueue).
+        # Memory job (uses provider-level session id, not content-scoped)
         last_user_content = ''
         for m in reversed(messages):
             if m.get('role') == 'user':
                 uc = m.get('content', '')
                 if isinstance(uc, list):
-                    last_user_content = ' '.join(
-                        p.get('text', '') for p in uc
-                        if isinstance(p, dict))
+                    last_user_content = ' '.join(p.get('text', '') for p in uc if isinstance(p, dict))
                 else:
                     last_user_content = uc or ''
                 break
         if last_user_content:
-            _spawn(_bg_ensure_task_and_enqueue(
-                _goose_meta, tenant_id, x_sid, last_user_content))
+            _spawn(_enqueue_memory_job(x_sid, last_user_content, tenant_id=tenant_id, task_uuid=task_uuid))
 
         _t0 = time.monotonic()
         try:
@@ -3954,7 +3900,7 @@ async def chat_completions(request: Request):
             if len(built) >= 3:
                 session_seeds[session_key] = [dict(m) for m in built[:3]]
                 log.info("Seed frozen session=%s (3 msgs)", session_key)
-        elif len(built) >= 3:
+        else:
             frozen = session_seeds[session_key]
             for i, fm in enumerate(frozen):
                 if i < len(built):
@@ -4148,46 +4094,19 @@ async def chat_completions(request: Request):
 
         # Proxy calculates output budget from post-trim input (authoritative)
         # Goose's max_tokens is based on pre-trim input - ignore it
-        _budget = _output_budget(input_tokens)
-        if _client_cap is not None:
-            # Client explicitly requested a cap. Honor it. MIN_OUTPUT
-            # does not apply on this path (the floor protects
-            # production Goose sessions, not clients that asked for
-            # a small response). Still reject if the input context
-            # leaves no room for at least 1 output token.
-            if _budget < 1:
-                log.error(
-                    "Context leaves no room for output: session=%s "
-                    "input=%d budget=%d", session_key,
-                    input_tokens, _budget)
-                return JSONResponse(
-                    {"error": {"message":
-                     "context leaves no room for output",
-                     "input_tokens": input_tokens,
-                     "budget": _budget}},
-                    status_code=413)
-            max_tokens = min(_budget, _client_cap)
-        else:
-            max_tokens = _budget
-            if max_tokens < MIN_OUTPUT:
-                ceiling = min(MAX_INPUT,
-                              MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
-                if input_tokens > ceiling:
-                    built = _emergency_shrink(built, ceiling)
-                    input_tokens = count_messages_tokens(built)
-                    max_tokens = _output_budget(input_tokens)
-            if max_tokens < MIN_OUTPUT:
-                log.error(
-                    "Context too large for required output budget: "
-                    "session=%s input=%d max_tokens=%d < MIN_OUTPUT=%d",
-                    session_key, input_tokens, max_tokens, MIN_OUTPUT)
-                return JSONResponse(
-                    {"error": {"message":
-                     "context too large for required output budget",
-                     "input_tokens": input_tokens,
-                     "max_tokens": max_tokens,
-                     "min_output": MIN_OUTPUT}},
-                    status_code=413)
+        max_tokens = _output_budget(input_tokens)
+        # Hard output floor: if the input ate the budget, shrink the window once more;
+        # if it STILL can't reach MIN_OUTPUT, refuse with a clear 413-style error
+        # instead of sending a starved request (the original output-starvation bug).
+        if max_tokens < MIN_OUTPUT:
+            ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
+            if input_tokens > ceiling:
+                built = _emergency_shrink(built, ceiling)
+                input_tokens = count_messages_tokens(built)
+                max_tokens = _output_budget(input_tokens)
+        if max_tokens < MIN_OUTPUT:
+            log.error("Context too large for required output budget: session=%s input=%d max_tokens=%d < MIN_OUTPUT=%d", session_key, input_tokens, max_tokens, MIN_OUTPUT)
+            return JSONResponse({"error": {"message": "context too large for required output budget", "input_tokens": input_tokens, "max_tokens": max_tokens, "min_output": MIN_OUTPUT}}, status_code=413)
         if input_tokens > 0.9 * MAX_INPUT:
             log.info("Budget: session=%s input=%d ceiling=%d max_tokens=%d", session_key, input_tokens, min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT), max_tokens)
         stream = body.get("stream", False)
@@ -4196,9 +4115,6 @@ async def chat_completions(request: Request):
             "messages": built,
             "max_tokens": max_tokens,
             "stream": stream,
-            # Internal: disables auto-continuation for clients that
-            # provided their own max_tokens cap.
-            "_ctxgate_no_continue": _client_cap is not None,
         }
         # Sampling: send temperature ONLY when the client sent one and it is at/above
         # the floor. Otherwise omit it so the server's tuned default (1.0) applies.
@@ -4220,15 +4136,6 @@ async def chat_completions(request: Request):
             vllm_body["repetition_detection"] = {"max_pattern_size": 50, "min_pattern_size": 5, "min_count": 6}
         if THINKING_TOKEN_BUDGET:
             vllm_body["thinking_token_budget"] = int(THINKING_TOKEN_BUDGET)
-        # Forward optional vLLM passthrough parameters when the client
-        # explicitly sent them AND we are on the capped fallback path.
-        # These make --exact-tg actually meaningful for benchmarks.
-        if _client_cap is not None:
-            _min_tok = body.get("min_tokens")
-            if isinstance(_min_tok, int) and _min_tok > 0:
-                vllm_body["min_tokens"] = min(_min_tok, max_tokens)
-            if body.get("ignore_eos") is True:
-                vllm_body["ignore_eos"] = True
         if stream:
             vllm_body["stream_options"] = {"include_usage": True}
         if body.get("tools"):
@@ -4297,7 +4204,6 @@ async def _evict_stale_sessions():
     stale = [k for k, ts in SESSION_LAST_ACTIVE.items() if now - ts > ttl_sec]
     for k in stale:
         _last_extract_anchor.pop(k, None)
-        _ensure_task_done.discard(k)
         session_seeds.pop(k, None)
         session_compactions.pop(k, None)
         session_tokens.pop(k, None)
@@ -4453,8 +4359,6 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
     global metrics
     try:
         client = _vllm_client
-        _no_continue = vllm_body.pop("_ctxgate_no_continue", False)
-        _send_body = {k: v for k, v in vllm_body.items() if not k.startswith("_ctxgate_")}
         # --- Total output budget tracking ---
         total_output_tokens = 0
         cont_count = 0
@@ -4464,26 +4368,15 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
         remaining = CTXGATE_MAX_TOTAL_OUTPUT
         _budget = _output_budget(input_tokens)
         max_tokens = min(_budget, MAX_OUTPUT, remaining)
-        _caller_cap = vllm_body.get("max_tokens") or 0
-        if _caller_cap > 0:
-            max_tokens = min(max_tokens, _caller_cap)
-        if _no_continue:
-            # Client-capped path: MIN_OUTPUT does not apply.
-            # Only reject if there is literally no room for output.
-            if max_tokens < 1:
-                log.info("Non-stream: client-capped, no room for output (max_tokens=%d)", max_tokens)
-                return JSONResponse({"error": {"message": "Output budget exhausted", "explanation": explain_status("budget")}}, status_code=413)
-        else:
-            if max_tokens < MIN_OUTPUT:
-                log.info("Non-stream: output budget %d < MIN_OUTPUT %d - stopping", max_tokens, MIN_OUTPUT)
-                return JSONResponse({"error": {"message": "Output budget exhausted", "explanation": explain_status("budget")}}, status_code=413)
+        if max_tokens < MIN_OUTPUT:
+            log.info("Non-stream: output budget %d < MIN_OUTPUT %d - stopping", max_tokens, MIN_OUTPUT)
+            return JSONResponse({"error": {"message": "Output budget exhausted", "explanation": explain_status("budget")}}, status_code=413)
         vllm_body["max_tokens"] = max_tokens
         metrics["output_max_tokens_seen"] = max(metrics["output_max_tokens_seen"], max_tokens)
         while True:
             _attempts += 1
             _t0 = time.monotonic()
-            _send_body = {k: v for k, v in vllm_body.items() if not k.startswith("_ctxgate_")}
-            resp = await client.post(VLLM_URL + "/chat/completions", json=_send_body)
+            resp = await client.post(VLLM_URL + "/chat/completions", json=vllm_body)
             _dt = time.monotonic() - _t0
             if _dt > 2.0:
                 log.warning("vLLM pool-wait: %.1fs (possible pool saturation)", _dt)
@@ -4506,8 +4399,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                 max_tokens = min(_budget, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT)
                 vllm_body["max_tokens"] = max_tokens
                 input_tokens = new_input_tokens
-                _send_body = {k: v for k, v in vllm_body.items() if not k.startswith("_ctxgate_")}
-                resp = await client.post(VLLM_URL + "/chat/completions", json=_send_body)
+                resp = await client.post(VLLM_URL + "/chat/completions", json=vllm_body)
                 if resp.status_code != 200:
                     metrics["requests_error"] += 1
                     log.error("vLLM retry also failed %d: %s", resp.status_code, resp.text[:500])
@@ -4610,10 +4502,6 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
         # --- Auto-continuation with total output budget ---
         ns_wall_start = time.time()
         while choices and choices[0].get("finish_reason") == "length" and cont_count < MAX_CONTINUATIONS:
-            if _no_continue:
-                log.info("No-continue flag: stopping after first segment (client capped)")
-                exit_reason = "client_capped"
-                break
             if time.time() - ns_wall_start > WALL_CLOCK_MAX:
                 log.warning("Wall clock %ds exceeded - stopping non-stream", WALL_CLOCK_MAX)
                 exit_reason = "wall_clock"
@@ -4797,7 +4685,6 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
     async def generate():
         global metrics
         nonlocal input_tokens
-        _no_continue = vllm_body.pop("_ctxgate_no_continue", False)
         # Content is forwarded immediately. The only text ever held back is
         # the first SEAM_WINDOW chars of a continuation segment (to trim overlap
         # with what the client already has), and it is flushed on every exit path.
@@ -4892,33 +4779,17 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             remaining = CTXGATE_MAX_TOTAL_OUTPUT
             _budget = _output_budget(input_tokens)
             max_tokens = min(_budget, MAX_OUTPUT, remaining)
-            _caller_cap = vllm_body.get("max_tokens") or 0
-            if _caller_cap > 0:
-                max_tokens = min(max_tokens, _caller_cap)
-            if _no_continue:
-                if max_tokens < 1:
-                    log.info("Stream: client-capped, no room for output (max_tokens=%d)", max_tokens)
-                    exit_reason = "total_output_budget"
-                    metrics["output_total_budget_exhausted"] += 1
-                    for x in _flush_seam():
-                        yield x
-                    for _cg in _emit_ctxgate_final("length", exit_reason, 0, total_output_tokens, False, 0):
-                        yield _cg
-                    metrics["requests_error"] += 1
-                    _record_call(session_key, input_tokens, 0, "budget", VLLM_MODEL, True, "initial budget exhausted")
-                    return
-            else:
-                if max_tokens < MIN_OUTPUT:
-                    log.info("Stream: initial output budget %d < MIN_OUTPUT %d - stopping", max_tokens, MIN_OUTPUT)
-                    exit_reason = "total_output_budget"
-                    metrics["output_total_budget_exhausted"] += 1
-                    for x in _flush_seam():
-                        yield x
-                    for _cg in _emit_ctxgate_final("length", exit_reason, 0, total_output_tokens, False, 0):
-                        yield _cg
-                    metrics["requests_error"] += 1
-                    _record_call(session_key, input_tokens, 0, "budget", VLLM_MODEL, True, "initial budget exhausted")
-                    return
+            if max_tokens < MIN_OUTPUT:
+                log.info("Stream: initial output budget %d < MIN_OUTPUT %d - stopping", max_tokens, MIN_OUTPUT)
+                exit_reason = "total_output_budget"
+                metrics["output_total_budget_exhausted"] += 1
+                for x in _flush_seam():
+                    yield x
+                for _cg in _emit_ctxgate_final("length", exit_reason, 0, total_output_tokens, False, 0):
+                    yield _cg
+                metrics["requests_error"] += 1
+                _record_call(session_key, input_tokens, 0, "budget", VLLM_MODEL, True, "initial budget exhausted")
+                return
             current_body["max_tokens"] = max_tokens
             metrics["output_max_tokens_seen"] = max(metrics["output_max_tokens_seen"], max_tokens)
 
@@ -4936,8 +4807,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                 tc_buffer = []
                 _check_vllm_breaker()
                 try:
-                    _send = {k: v for k, v in current_body.items() if not k.startswith("_ctxgate_")}
-                    async with client.stream("POST", VLLM_URL + "/chat/completions", json=_send) as resp:
+                    async with client.stream("POST", VLLM_URL + "/chat/completions", json=current_body) as resp:
                         if resp.status_code != 200:
                             body_bytes = await resp.aread()
                             _et = body_bytes[:500].decode("utf-8", errors="replace").lower()
@@ -5156,11 +5026,6 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                         break
 
                 # --- Continuation state machine ---
-                if _no_continue and finish_reason == "length":
-                    log.info("No-continue flag: ending stream after first segment")
-                    exit_reason = "client_capped"
-                    finish_reason = "length"
-                    break
                 if finish_reason == "length" and continuation_count < MAX_CONTINUATIONS:
                     # Incomplete tool call -> NO continuation
                     if tc_incomplete:
@@ -5277,8 +5142,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                     _check_vllm_breaker()
                     _retry_t0 = time.monotonic()
                     try:
-                        _send = {k: v for k, v in current_body.items() if not k.startswith("_ctxgate_")}
-                        async with client.stream("POST", VLLM_URL + "/chat/completions", json=_send) as resp:
+                        async with client.stream("POST", VLLM_URL + "/chat/completions", json=current_body) as resp:
                             if loop_retries > 0:
                                 log.info("CACHE retry_ttft=%.3f", time.monotonic() - _retry_t0)
                             if resp.status_code != 200:
@@ -5438,11 +5302,6 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                 if tc_complete_r:
                                     finish_reason = 'tool_calls'
                                     exit_reason = 'tool_calls_complete'
-                    if _no_continue and finish_reason == "length":
-                        log.info("No-continue flag: ending stream after retry segment")
-                        exit_reason = "client_capped"
-                        finish_reason = "length"
-                        break
                     if interrupted and exit_reason not in ("tool_calls_complete", "unsafe_loop_blocked"):
                         log.warning("Retry stream interrupted after %d chars: %s", len(full_content), interrupted)
                         exit_reason = "interrupted"
@@ -5644,31 +5503,6 @@ async def _get_goose_session_info(session_id: str) -> Optional[dict]:
     return None
 
 
-async def _bg_ensure_task_and_enqueue(meta, tenant_id,
-                                      session_id, user_content):
-    """Chained background init: INSERT task row (once per
-    session_key), then enqueue memory job. Never raises to
-    the caller. Skips enqueue if INSERT fails."""
-    session_key = f"goose:{meta['id']}"
-    if session_key not in _ensure_task_done:
-        try:
-            await _ensure_task_row(meta, tenant_id)
-            _ensure_task_done.add(session_key)
-        except Exception as e:
-            log.warning(
-                "task row init failed for %s (will retry): %s",
-                session_key, e)
-            return
-    try:
-        await _enqueue_memory_job(
-            session_id, user_content,
-            tenant_id=tenant_id, task_uuid=meta["uuid"])
-    except Exception as e:
-        log.warning(
-            "_enqueue_memory_job failed for %s: %s",
-            session_key, e)
-
-
 async def _enqueue_memory_job(session_id, user_content, tenant_id: str = "", task_uuid=None):
     if os.environ.get("CTXGATE_MEMORY_WORKER", "1") == "0":
         return
@@ -5740,7 +5574,7 @@ async def _ensure_task_row(meta: dict, tenant_id: str = ""):
             meta.get("provider_name", ""), tenant_id,
         )
     except Exception as e:
-        log.warning("task row init failed for %s: %s", meta.get("id"), e)
+        log.warning("_ensure_task_row failed for %s: %s", meta.get("id"), e)
 async def _resolve_goose_session(messages: list) -> Optional[dict]:
     """Try to resolve a Goose session from message content fingerprints.
     Returns a meta dict or None."""

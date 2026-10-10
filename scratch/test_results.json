@@ -1,0 +1,98 @@
+{
+  "scenario_a": {
+    "pass": false,
+    "state_a1": {
+      "session_windows": "",
+      "phase_summaries_count": "0",
+      "phase_summaries_max": ""
+    },
+    "state_a2": {
+      "session_windows": "",
+      "phase_summaries_count": "0",
+      "phase_summaries_max": ""
+    },
+    "state_a3": {
+      "session_windows": "",
+      "phase_summaries_count": "0",
+      "phase_summaries_max": ""
+    },
+    "seed_changed_total": 0,
+    "h3pop_total": 0,
+    "dropped_slice_found": false
+  },
+  "scenario_b": {
+    "pass": true,
+    "state_b1": {
+      "session_windows": "",
+      "phase_summaries_count": "0",
+      "phase_summaries_max": ""
+    },
+    "notes": [
+      "WARNING: no window load evidence"
+    ],
+    "window_loads_evidence": false
+  },
+  "scenario_c": {
+    "defect_reproduced": false,
+    "watermark_regression": false,
+    "state_c1": {
+      "session_windows": "",
+      "phase_summaries_count": "0",
+      "phase_summaries_max": ""
+    },
+    "state_c2": {
+      "session_windows": "",
+      "phase_summaries_count": "0",
+      "phase_summaries_max": ""
+    },
+    "state_c3": {
+      "session_windows": "",
+      "phase_summaries_count": "0",
+      "phase_summaries_max": ""
+    },
+    "h3pop_count": 0,
+    "seed_changed_count": 0
+  },
+  "r1": {
+    "pass": true,
+    "h3pop": 0,
+    "seed_changed": 0,
+    "state_before": {
+      "session_windows": "",
+      "phase_summaries_count": "0",
+      "phase_summaries_max": ""
+    },
+    "state_after_short": {
+      "session_windows": "",
+      "phase_summaries_count": "0",
+      "phase_summaries_max": ""
+    },
+    "state_final": {
+      "session_windows": "",
+      "phase_summaries_count": "0",
+      "phase_summaries_max": ""
+    }
+  },
+  "r2": {
+    "corruption": false,
+    "seed_flap": true,
+    "seed_changed_count": 2,
+    "h3pop_count": 0,
+    "state_final": {
+      "session_windows": "",
+      "phase_summaries_count": "0",
+      "phase_summaries_max": ""
+    },
+    "note": "Seed flap on 3+ msg diff-system is EXPECTED (seed updates). Corruption = H3-POP."
+  },
+  "r3": {
+    "total_rows": 32,
+    "title_like": 0,
+    "title_like_examples": []
+  },
+  "phase4_verify": {
+    "pass": true,
+    "returncode": 0,
+    "output_tail": "isolation ---\nPASS: No H3-POP on aux request\nPASS: No SEED CHANGED on aux request\nPASS: session_windows unchanged after aux\n\n--- TEST 3: Task uniqueness ---\nPASS: No duplicate task rows\nPASS: No noauth session_ids\n\n--- TEST 5: Parallel session isolation ---\nPASS: Session 2 has 1 task\nPASS: Session 3 has 1 task\n\n--- TEST 6: Pre-seeded DB state ---\nPASS: Pre-seeded session_windows exists\n\n========================================\nRESULTS: 9 passed, 0 failed\n========================================\n"
+  }
+}
