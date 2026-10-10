@@ -28,14 +28,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 class _AccessLogFilter(logging.Filter):
     """Drop uvicorn access-log records for the dashboard's
     high-frequency poll endpoints. Everything else passes."""
-    _SILENT_PATHS = ("/health",)
+    _SILENT_PATHS = ("/health", "/v1/chat/completions")
     def filter(self, record):
         try:
             args = record.args
             # uvicorn logs: (client_addr, method, path, http_version, status)
             if args and len(args) >= 3:
                 method, path = args[1], args[2]
-                if method == "GET":
+                if method in ("GET", "POST"):
                     for p in self._SILENT_PATHS:
                         if path == p or path.startswith(p + "?"):
                             return False
@@ -1154,6 +1154,7 @@ sqlite_lock = asyncio.Lock()  # serializes access to the shared aiosqlite conn (
 _last_extract_anchor: dict[str, str] = {}
 session_seeds: dict[str, list] = {}
 _task_uuid_cache: dict[str, str] = {}
+_ensure_task_done: set[str] = set()
 _goose_session_cache: dict[str, tuple] = {}
 session_compactions: dict[str, dict] = {}  # session_key -> frozen [msg0, msg1, msg2] (immutable seed)
 session_tokens: dict[str, dict] = {}  # {in, out, reqs, max_ctx}
@@ -1857,6 +1858,36 @@ def _prefix_raw(messages: list) -> str:
             parts.append(c or "")
             break
     return "\x00".join(parts)
+
+def _fallback_fingerprint(messages: list) -> str:
+    """sha256(system + \x00 + first_user)[:16]. First system
+    message and first user message only; None if there is no
+    user message at all."""
+    sys_text = ""
+    user_text = ""
+    for m in messages:
+        role = m.get("role", "")
+        if role == "system" and not sys_text:
+            c = m.get("content", "")
+            if isinstance(c, list):
+                c = " ".join(
+                    p.get("text", "") for p in c
+                    if isinstance(p, dict))
+            sys_text = c or ""
+        elif role == "user" and not user_text:
+            c = m.get("content", "")
+            if isinstance(c, list):
+                c = " ".join(
+                    p.get("text", "") for p in c
+                    if isinstance(p, dict))
+            user_text = c or ""
+            if sys_text:
+                break
+    if not user_text:
+        return ""
+    return hashlib.sha256(
+        (sys_text + "\x00" + user_text).encode()
+    ).hexdigest()[:16]
 
 def make_session_key(x_session_id: str, messages: list) -> str:
     fp = hashlib.sha256(_prefix_raw(messages).encode()).hexdigest()[:8]
@@ -3821,16 +3852,29 @@ async def chat_completions(request: Request):
         #   - otherwise -> ONE fixed "dummy" task for all non-Goose traffic
         # No fingerprinting. No SQLite resolver on the hot path. No
         # per-request row creation.
+        # --- Session identity: two deterministic paths ---
+        # Goose  : uuid5(ns, goose_id)          — from agent-session-id
+        # Fallback: uuid5(ns, "fallback:<fp>") — from content fingerprint
+        # Both paths compute uuid5 synchronously. The task row is
+        # created by a spawned background coroutine (see below).
         _goose_id_header = (
             request.headers.get('agent-session-id', '')
             or request.headers.get('X-Session-ID', '')
             or ''
         ).strip()
 
+        # Client cap only applies to the fallback path.
+        _client_cap = None
+        if not _goose_id_header:
+            _cm = body.get("max_tokens")
+            if isinstance(_cm, int) and _cm > 0:
+                _client_cap = _cm
+
         if _goose_id_header:
             _goose_meta = {
                 "id": _goose_id_header,
-                "uuid": str(uuid.uuid5(GOOSE_SESSION_UUID_NAMESPACE, _goose_id_header)),
+                "uuid": str(uuid.uuid5(
+                    GOOSE_SESSION_UUID_NAMESPACE, _goose_id_header)),
                 "name": _goose_id_header,
                 "session_type": "",
                 "working_dir": "",
@@ -3846,38 +3890,50 @@ async def chat_completions(request: Request):
                         "provider_name": _info.get("provider_name") or "",
                     })
             except Exception as e:
-                log.debug("goose session metadata enrichment failed (non-fatal): %s", e)
+                log.debug(
+                    "goose session metadata enrichment failed (non-fatal): %s",
+                    e)
             _log_label = "GOOSE-HEADER"
         else:
+            _fb_fp = _fallback_fingerprint(messages)
+            if not _fb_fp:
+                # No user message — should not happen (upstream rejects
+                # empty message lists), but be defensive.
+                _fb_fp = "empty"
+            _fallback_id = f"fallback:{_fb_fp}"
             _goose_meta = {
-                "id": "dummy",
-                "uuid": str(uuid.uuid5(GOOSE_SESSION_UUID_NAMESPACE, "dummy")),
-                "name": "dummy",
-                "session_type": "unknown",
+                "id": _fallback_id,
+                "uuid": str(uuid.uuid5(
+                    GOOSE_SESSION_UUID_NAMESPACE, _fallback_id)),
+                "name": "fallback",
+                "session_type": "fallback",
                 "working_dir": "",
                 "provider_name": "",
             }
-            _log_label = "DUMMY"
+            _log_label = "FALLBACK"
 
         session_key = f"goose:{_goose_meta['id']}"
         task_uuid = _goose_meta["uuid"]
         x_sid = _goose_meta["id"]
-        await _ensure_task_row(_goose_meta, tenant_id)
-        log.info("%s sid=%s session_key=%s task=%s",
-                 _log_label, _goose_meta["id"], session_key, task_uuid)
+        log.info("%s sid=%s session_key=%s task=%s cap=%s",
+                 _log_label, _goose_meta["id"], session_key, task_uuid,
+                 _client_cap)
 
-        # Memory job (uses provider-level session id, not content-scoped)
+        # Memory job — chained background init (INSERT then enqueue).
         last_user_content = ''
         for m in reversed(messages):
             if m.get('role') == 'user':
                 uc = m.get('content', '')
                 if isinstance(uc, list):
-                    last_user_content = ' '.join(p.get('text', '') for p in uc if isinstance(p, dict))
+                    last_user_content = ' '.join(
+                        p.get('text', '') for p in uc
+                        if isinstance(p, dict))
                 else:
                     last_user_content = uc or ''
                 break
         if last_user_content:
-            _spawn(_enqueue_memory_job(x_sid, last_user_content, tenant_id=tenant_id, task_uuid=task_uuid))
+            _spawn(_bg_ensure_task_and_enqueue(
+                _goose_meta, tenant_id, x_sid, last_user_content))
 
         _t0 = time.monotonic()
         try:
@@ -4092,19 +4148,46 @@ async def chat_completions(request: Request):
 
         # Proxy calculates output budget from post-trim input (authoritative)
         # Goose's max_tokens is based on pre-trim input - ignore it
-        max_tokens = _output_budget(input_tokens)
-        # Hard output floor: if the input ate the budget, shrink the window once more;
-        # if it STILL can't reach MIN_OUTPUT, refuse with a clear 413-style error
-        # instead of sending a starved request (the original output-starvation bug).
-        if max_tokens < MIN_OUTPUT:
-            ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
-            if input_tokens > ceiling:
-                built = _emergency_shrink(built, ceiling)
-                input_tokens = count_messages_tokens(built)
-                max_tokens = _output_budget(input_tokens)
-        if max_tokens < MIN_OUTPUT:
-            log.error("Context too large for required output budget: session=%s input=%d max_tokens=%d < MIN_OUTPUT=%d", session_key, input_tokens, max_tokens, MIN_OUTPUT)
-            return JSONResponse({"error": {"message": "context too large for required output budget", "input_tokens": input_tokens, "max_tokens": max_tokens, "min_output": MIN_OUTPUT}}, status_code=413)
+        _budget = _output_budget(input_tokens)
+        if _client_cap is not None:
+            # Client explicitly requested a cap. Honor it. MIN_OUTPUT
+            # does not apply on this path (the floor protects
+            # production Goose sessions, not clients that asked for
+            # a small response). Still reject if the input context
+            # leaves no room for at least 1 output token.
+            if _budget < 1:
+                log.error(
+                    "Context leaves no room for output: session=%s "
+                    "input=%d budget=%d", session_key,
+                    input_tokens, _budget)
+                return JSONResponse(
+                    {"error": {"message":
+                     "context leaves no room for output",
+                     "input_tokens": input_tokens,
+                     "budget": _budget}},
+                    status_code=413)
+            max_tokens = min(_budget, _client_cap)
+        else:
+            max_tokens = _budget
+            if max_tokens < MIN_OUTPUT:
+                ceiling = min(MAX_INPUT,
+                              MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
+                if input_tokens > ceiling:
+                    built = _emergency_shrink(built, ceiling)
+                    input_tokens = count_messages_tokens(built)
+                    max_tokens = _output_budget(input_tokens)
+            if max_tokens < MIN_OUTPUT:
+                log.error(
+                    "Context too large for required output budget: "
+                    "session=%s input=%d max_tokens=%d < MIN_OUTPUT=%d",
+                    session_key, input_tokens, max_tokens, MIN_OUTPUT)
+                return JSONResponse(
+                    {"error": {"message":
+                     "context too large for required output budget",
+                     "input_tokens": input_tokens,
+                     "max_tokens": max_tokens,
+                     "min_output": MIN_OUTPUT}},
+                    status_code=413)
         if input_tokens > 0.9 * MAX_INPUT:
             log.info("Budget: session=%s input=%d ceiling=%d max_tokens=%d", session_key, input_tokens, min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT), max_tokens)
         stream = body.get("stream", False)
@@ -4134,6 +4217,15 @@ async def chat_completions(request: Request):
             vllm_body["repetition_detection"] = {"max_pattern_size": 50, "min_pattern_size": 5, "min_count": 6}
         if THINKING_TOKEN_BUDGET:
             vllm_body["thinking_token_budget"] = int(THINKING_TOKEN_BUDGET)
+        # Forward optional vLLM passthrough parameters when the client
+        # explicitly sent them AND we are on the capped fallback path.
+        # These make --exact-tg actually meaningful for benchmarks.
+        if _client_cap is not None:
+            _min_tok = body.get("min_tokens")
+            if isinstance(_min_tok, int) and _min_tok > 0:
+                vllm_body["min_tokens"] = min(_min_tok, max_tokens)
+            if body.get("ignore_eos") is True:
+                vllm_body["ignore_eos"] = True
         if stream:
             vllm_body["stream_options"] = {"include_usage": True}
         if body.get("tools"):
@@ -4145,10 +4237,23 @@ async def chat_completions(request: Request):
             _prefix_diag(session_key, vllm_body.get("messages", []))
 
         _t0 = time.monotonic()
-        if stream:
-            result = await stream_to_vllm(vllm_body, input_tokens, session_key)
+        if _client_cap is not None:
+            # Fallback path: raw passthrough, no Goose protections.
+            if stream:
+                result = await stream_to_vllm_passthrough(
+                    vllm_body, input_tokens, session_key)
+            else:
+                result = await forward_to_vllm_passthrough(
+                    vllm_body, input_tokens, session_key)
         else:
-            result = await forward_to_vllm(vllm_body, input_tokens, session_key)
+            # Goose path: full protections (loop detection, retries,
+            # continuation, seam dedup, ctxgate_meta).
+            if stream:
+                result = await stream_to_vllm(
+                    vllm_body, input_tokens, session_key)
+            else:
+                result = await forward_to_vllm(
+                    vllm_body, input_tokens, session_key)
         _dt = (time.monotonic() - _t0) * 1000
         if _dt > 50:
             log.warning("SLOW: vllm_call %.0fms (in=%d stream=%s)", _dt, input_tokens, stream)
@@ -4202,6 +4307,7 @@ async def _evict_stale_sessions():
     stale = [k for k, ts in SESSION_LAST_ACTIVE.items() if now - ts > ttl_sec]
     for k in stale:
         _last_extract_anchor.pop(k, None)
+        _ensure_task_done.discard(k)
         session_seeds.pop(k, None)
         session_compactions.pop(k, None)
         session_tokens.pop(k, None)
@@ -4353,6 +4459,78 @@ def _normalize_system_messages(messages):
 _vllm_client = None
 
 
+async def forward_to_vllm_passthrough(vllm_body: dict,
+                                      input_tokens: int,
+                                      session_key: str):
+    """Raw JSON passthrough for client-capped (fallback) requests.
+
+    One POST to vLLM. No loop detection, no retries, no
+    continuation, no ctxgate metadata. Forwards vLLM's JSON
+    response verbatim (only injects prompt_tokens for
+    consistency). Tracks usage for metrics.
+    """
+    try:
+        client = _vllm_client
+        _check_vllm_breaker()
+        body = {k: v for k, v in vllm_body.items()
+                if not k.startswith("_ctxgate_")}
+        resp = await client.post(
+            VLLM_URL + "/chat/completions", json=body)
+        if resp.status_code != 200:
+            _vllm_breaker.record_failure()
+            metrics["requests_error"] += 1
+            _record_call(session_key, input_tokens, 0,
+                         f"vllm_{resp.status_code}",
+                         VLLM_MODEL, False, resp.text[:300])
+            return JSONResponse(
+                {"error": {"message":
+                 "vLLM " + str(resp.status_code),
+                 "explanation": explain_status(
+                     f"vllm_{resp.status_code}",
+                     resp.text[:300])}},
+                status_code=resp.status_code)
+        _vllm_breaker.record_success()
+        data = resp.json()
+        if not isinstance(data.get("usage"), dict):
+            data["usage"] = {}
+        out_tok = data["usage"].get("completion_tokens", 0)
+        cached = (data["usage"].get(
+            "prompt_tokens_details") or {}).get("cached_tokens", 0)
+        data["usage"]["prompt_tokens"] = input_tokens
+        data["usage"]["total_tokens"] = input_tokens + out_tok
+        metrics["requests_ok"] += 1
+        metrics["tokens_out_total"] += out_tok
+        metrics["cached_tokens_total"] += cached
+        metrics["prompt_tokens_total"] += input_tokens
+        _track_session_tokens(session_key, 0, out_tok,
+                              count_req=False)
+        _record_call(session_key, input_tokens, out_tok, "ok",
+                     VLLM_MODEL, False, cached_tokens=cached)
+        log.info("PASSTHROUGH-JSON session=%s in=%d out=%d",
+                 session_key, input_tokens, out_tok)
+        return JSONResponse(data)
+    except httpx.TimeoutException:
+        metrics["requests_error"] += 1
+        _vllm_breaker.record_failure()
+        _record_call(session_key, input_tokens, 0, "timeout",
+                     VLLM_MODEL, False, "vLLM timeout")
+        return JSONResponse(
+            {"error": {"message": "vLLM timeout",
+             "explanation": explain_status("timeout")}},
+            status_code=504)
+    except Exception as e:
+        metrics["requests_error"] += 1
+        _vllm_breaker.record_failure()
+        log.exception("PASSTHROUGH-JSON session=%s error: %s",
+                      session_key, e)
+        _record_call(session_key, input_tokens, 0, "error",
+                     VLLM_MODEL, False, str(e)[:300])
+        return JSONResponse(
+            {"error": {"message": str(e)[:200],
+             "explanation": explain_status("error", str(e)[:300])}},
+            status_code=500)
+
+
 async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
     global metrics
     try:
@@ -4366,6 +4544,9 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
         remaining = CTXGATE_MAX_TOTAL_OUTPUT
         _budget = _output_budget(input_tokens)
         max_tokens = min(_budget, MAX_OUTPUT, remaining)
+        _caller_cap = vllm_body.get("max_tokens") or 0
+        if _caller_cap > 0:
+            max_tokens = min(max_tokens, _caller_cap)
         if max_tokens < MIN_OUTPUT:
             log.info("Non-stream: output budget %d < MIN_OUTPUT %d - stopping", max_tokens, MIN_OUTPUT)
             return JSONResponse({"error": {"message": "Output budget exhausted", "explanation": explain_status("budget")}}, status_code=413)
@@ -4608,9 +4789,10 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             msg = ch.get("message", {})
             if "reasoning" in msg and "reasoning_content" not in msg:
                 msg["reasoning_content"] = msg.pop("reasoning")
-        log.info("NS-DIAG session=%s exit=%s finish=%s truncated=%s conts=%d total_out=%d tc_seen=%d tc_complete=%d tc_emitted=%d",
-                 session_key, exit_reason, choices[0].get("finish_reason","?") if choices else "?",
-                 truncated, cont_count, total_output_tokens, tool_calls_emitted, tool_calls_complete, tool_calls_emitted)
+        if exit_reason not in ("ok", "tool_calls_complete"):
+            log.warning("NS-DIAG session=%s exit=%s finish=%s truncated=%s conts=%d total_out=%d tc_seen=%d tc_complete=%d tc_emitted=%d",
+                        session_key, exit_reason, choices[0].get("finish_reason","?") if choices else "?",
+                        truncated, cont_count, total_output_tokens, tool_calls_emitted, tool_calls_complete, tool_calls_emitted)
         return JSONResponse(data)
     except httpx.TimeoutException:
         metrics["requests_error"] += 1
@@ -4676,6 +4858,101 @@ async def _lines_with_heartbeat(resp, interval: float):
                 await nxt
             except (asyncio.CancelledError, Exception):
                 pass
+
+
+async def stream_to_vllm_passthrough(vllm_body: dict,
+                                     input_tokens: int,
+                                     session_key: str):
+    """Raw SSE passthrough for client-capped (fallback) requests.
+
+    One POST to vLLM. No loop detection, no retries, no
+    continuation, no seam dedup, no ctxgate metadata. Forwards
+    vLLM's SSE stream line-for-line so token_ids and any
+    vendor-specific fields survive. Tracks usage for metrics.
+    """
+    async def generate():
+        import time as _t
+        t0 = _t.monotonic()
+        total_out = 0
+        total_cached = 0
+        try:
+            client = _vllm_client
+            _check_vllm_breaker()
+            body = {k: v for k, v in vllm_body.items()
+                    if not k.startswith("_ctxgate_")}
+            async with client.stream(
+                    "POST", VLLM_URL + "/chat/completions",
+                    json=body) as resp:
+                if resp.status_code != 200:
+                    body_bytes = await resp.aread()
+                    _vllm_breaker.record_failure()
+                    metrics["requests_error"] += 1
+                    _record_call(session_key, input_tokens, 0,
+                                 f"vllm_{resp.status_code}",
+                                 VLLM_MODEL, True,
+                                 body_bytes[:300].decode(
+                                     "utf-8", errors="replace"))
+                    yield "data: " + json.dumps({
+                        "error": body_bytes[:200].decode(
+                            "utf-8", errors="replace")
+                    }) + "\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                _vllm_breaker.record_success()
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        if line.strip():
+                            yield line + "\n\n"
+                        continue
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        yield "data: [DONE]\n\n"
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                    except (json.JSONDecodeError, ValueError):
+                        yield line + "\n\n"
+                        continue
+                    usage = chunk.get("usage")
+                    if usage:
+                        total_out = usage.get(
+                            "completion_tokens", total_out)
+                        total_cached += (usage.get(
+                            "prompt_tokens_details") or {}).get(
+                            "cached_tokens", 0)
+                    yield line + "\n\n"
+            wall = _t.monotonic() - t0
+            metrics["requests_ok"] += 1
+            metrics["tokens_out_total"] += total_out
+            metrics["cached_tokens_total"] += total_cached
+            metrics["prompt_tokens_total"] += input_tokens
+            _track_session_tokens(session_key, 0, total_out,
+                                  count_req=False)
+            _record_call(session_key, input_tokens, total_out,
+                         "ok", VLLM_MODEL, True,
+                         cached_tokens=total_cached)
+            log.info(
+                "PASSTHROUGH-STREAM session=%s in=%d out=%d "
+                "wall=%.2fs", session_key, input_tokens,
+                total_out, wall)
+        except asyncio.CancelledError:
+            log.info("PASSTHROUGH-STREAM session=%s client "
+                     "disconnected", session_key)
+            raise
+        except Exception as e:
+            metrics["requests_error"] += 1
+            _vllm_breaker.record_failure()
+            log.warning(
+                "PASSTHROUGH-STREAM session=%s error: %s",
+                session_key, e)
+            _record_call(session_key, input_tokens, 0,
+                         "error", VLLM_MODEL, True, str(e)[:300])
+            yield "data: " + json.dumps(
+                {"error": str(e)[:200]}) + "\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(generate(),
+                             media_type="text/event-stream")
 
 
 async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
@@ -4777,6 +5054,9 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             remaining = CTXGATE_MAX_TOTAL_OUTPUT
             _budget = _output_budget(input_tokens)
             max_tokens = min(_budget, MAX_OUTPUT, remaining)
+            _caller_cap = vllm_body.get("max_tokens") or 0
+            if _caller_cap > 0:
+                max_tokens = min(max_tokens, _caller_cap)
             if max_tokens < MIN_OUTPUT:
                 log.info("Stream: initial output budget %d < MIN_OUTPUT %d - stopping", max_tokens, MIN_OUTPUT)
                 exit_reason = "total_output_budget"
@@ -5405,10 +5685,11 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
 
             _stream_truncated = (exit_reason != "ok" and exit_reason != "tool_calls_complete") or loop_in_content or loop_in_reasoning
             # One concise diagnostic line
-            log.info("NS-DIAG session=%s exit=%s finish=%s truncated=%s conts=%d total_out=%d tc_seen=%d tc_complete=%d tc_emitted=%d reasoning_chars=%d reasoning_chars_first=%d",
-                     session_key, exit_reason, finish_reason,
-                     _stream_truncated, continuation_count, total_output_tokens,
-                     tc_accum.count(), tc_complete, tc_emitted_n, reasoning_chars, reasoning_chars_first)
+            if exit_reason not in ("ok", "tool_calls_complete"):
+                log.warning("NS-DIAG session=%s exit=%s finish=%s truncated=%s conts=%d total_out=%d tc_seen=%d tc_complete=%d tc_emitted=%d reasoning_chars=%d reasoning_chars_first=%d",
+                           session_key, exit_reason, finish_reason,
+                           _stream_truncated, continuation_count, total_output_tokens,
+                           tc_accum.count(), tc_complete, tc_emitted_n, reasoning_chars, reasoning_chars_first)
 
             # Flush any remaining seam text BEFORE the final marker
             for x in _flush_seam():
@@ -5501,6 +5782,31 @@ async def _get_goose_session_info(session_id: str) -> Optional[dict]:
     return None
 
 
+async def _bg_ensure_task_and_enqueue(meta, tenant_id,
+                                      session_id, user_content):
+    """Chained background init: INSERT task row (once per
+    session_key), then enqueue memory job. Never raises to
+    the caller. Skips enqueue if INSERT fails."""
+    session_key = f"goose:{meta['id']}"
+    if session_key not in _ensure_task_done:
+        try:
+            await _ensure_task_row(meta, tenant_id)
+            _ensure_task_done.add(session_key)
+        except Exception as e:
+            log.warning(
+                "task row init failed for %s (will retry): %s",
+                session_key, e)
+            return
+    try:
+        await _enqueue_memory_job(
+            session_id, user_content,
+            tenant_id=tenant_id, task_uuid=meta["uuid"])
+    except Exception as e:
+        log.warning(
+            "_enqueue_memory_job failed for %s: %s",
+            session_key, e)
+
+
 async def _enqueue_memory_job(session_id, user_content, tenant_id: str = "", task_uuid=None):
     if os.environ.get("CTXGATE_MEMORY_WORKER", "1") == "0":
         return
@@ -5572,7 +5878,7 @@ async def _ensure_task_row(meta: dict, tenant_id: str = ""):
             meta.get("provider_name", ""), tenant_id,
         )
     except Exception as e:
-        log.warning("_ensure_task_row failed for %s: %s", meta.get("id"), e)
+        log.warning("task row init failed for %s: %s", meta.get("id"), e)
 async def _resolve_goose_session(messages: list) -> Optional[dict]:
     """Try to resolve a Goose session from message content fingerprints.
     Returns a meta dict or None."""
