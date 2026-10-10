@@ -2904,8 +2904,6 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
         total = count_messages_tokens(messages)
         log.info("Context: %d messages, %d tokens (limit %d)", len(messages), total, MAX_INPUT)
         if total <= MAX_INPUT - _note_n:
-            if sk:
-                session_compactions.pop(sk, None)
             return messages
         target = _trim_target()
         # Pre-recut elision: shrink tool bodies up to the newest-4 boundary so
@@ -3900,7 +3898,7 @@ async def chat_completions(request: Request):
             if len(built) >= 3:
                 session_seeds[session_key] = [dict(m) for m in built[:3]]
                 log.info("Seed frozen session=%s (3 msgs)", session_key)
-        else:
+        elif len(built) >= 3:
             frozen = session_seeds[session_key]
             for i, fm in enumerate(frozen):
                 if i < len(built):
