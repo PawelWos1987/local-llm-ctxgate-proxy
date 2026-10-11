@@ -77,3 +77,4 @@ schema/012_session_windows.sql
 
 # Goose
 .goosehints
+scratch/
