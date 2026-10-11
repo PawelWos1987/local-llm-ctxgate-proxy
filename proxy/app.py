@@ -1535,12 +1535,13 @@ async def lifespan(app: FastAPI):
         log.info("LM data-flow: conversation text WILL be sent to external LM at %s (model=%s)", MISTRAL_URL, MISTRAL_MODEL)
     else:
         log.info("LM data-flow: conversation text will NOT be sent to external LM (CTXGATE_LM_ENABLED=0)")
-    if not QWEN_TOKENIZER_PATH:
-        log.error("CTXGATE_QWEN_TOKENIZER is required. Set it to the path of tokenizer.json")
-        raise SystemExit(78)
-    if not os.path.isfile(QWEN_TOKENIZER_PATH):
-        log.error("Tokenizer file not found: %s", QWEN_TOKENIZER_PATH)
-        raise SystemExit(78)
+    if ESTIMATOR_MODE == 'exact':
+        if not QWEN_TOKENIZER_PATH:
+            log.error("CTXGATE_QWEN_TOKENIZER is required. Set it to the path of tokenizer.json")
+            raise SystemExit(78)
+        if not os.path.isfile(QWEN_TOKENIZER_PATH):
+            log.error("Tokenizer file not found: %s", QWEN_TOKENIZER_PATH)
+            raise SystemExit(78)
     if ESTIMATOR_MODE == "exact":
         try:
             enc = tokenizers.Tokenizer.from_file(QWEN_TOKENIZER_PATH)
@@ -4262,7 +4263,7 @@ async def chat_completions(request: Request):
         _t0 = time.monotonic()
         _sensitive_input_lo = MAX_CONTEXT - SAFETY_MARGIN - MAX_OUTPUT - int(0.1 * MAX_OUTPUT)
         _sensitive_input_hi = MAX_CONTEXT - SAFETY_MARGIN - MAX_OUTPUT + int(0.1 * MAX_OUTPUT)
-        input_tokens = count_messages_tokens(built)
+        input_tokens = count_messages_tokens(built) + count_tools_tokens(body.get("tools", []))
         _dt = (time.monotonic() - _t0) * 1000
         if _dt > 50:
             log.warning("SLOW: count_messages_tokens %.0fms (tokens=%d)", _dt, input_tokens)
@@ -4304,7 +4305,7 @@ async def chat_completions(request: Request):
                               MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
                 if input_tokens > ceiling:
                     built = _emergency_shrink(built, ceiling)
-                    input_tokens = count_messages_tokens(built)
+                    input_tokens = count_messages_tokens(built) + count_tools_tokens(body.get("tools", []))
                     max_tokens = _output_budget(input_tokens)
             if max_tokens < MIN_OUTPUT:
                 log.error(
@@ -4704,7 +4705,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                 calibrator.bump_margin(session_key)
                 reduced_limit = int(input_tokens * 0.8)
                 vllm_body["messages"] = _emergency_shrink(vllm_body["messages"], reduced_limit)
-                new_input_tokens = count_messages_tokens(vllm_body["messages"])
+                new_input_tokens = count_messages_tokens(vllm_body["messages"]) + count_tools_tokens(vllm_body.get("tools", []))
                 _budget = _output_budget(new_input_tokens)
                 max_tokens = min(_budget, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT)
                 vllm_body["max_tokens"] = max_tokens
@@ -5241,7 +5242,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                     metrics["requests_error"] += 1
                                     _record_call(session_key, input_tokens, total_output_tokens, "context_capacity", VLLM_MODEL, True, str(cce)[:200])
                                     return
-                                input_tokens = count_messages_tokens(current_body["messages"])
+                                input_tokens = count_messages_tokens(current_body["messages"]) + count_tools_tokens(current_body.get("tools", []))
                                 _b2 = _output_budget(input_tokens)
                                 current_body["max_tokens"] = min(_b2, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens)
                                 continue
@@ -5585,7 +5586,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                         metrics["requests_error"] += 1
                                         _record_call(session_key, input_tokens, total_output_tokens, "context_capacity", VLLM_MODEL, True, str(cce)[:200])
                                         return
-                                    input_tokens = count_messages_tokens(current_body["messages"])
+                                    input_tokens = count_messages_tokens(current_body["messages"]) + count_tools_tokens(current_body.get("tools", []))
                                     _b3 = _output_budget(input_tokens)
                                     current_body["max_tokens"] = min(_b3, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens)
                                     continue
