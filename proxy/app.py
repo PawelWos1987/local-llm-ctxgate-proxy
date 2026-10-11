@@ -1793,7 +1793,7 @@ K_TOOLS_COLD = 1.537   # chars per token for tool definitions (conservative)
 EWMA_ALPHA = 0.5       # per-session EWMA rate
 GLOBAL_ALPHA = 0.1     # global EWMA rate
 M_FLOOR = 0.08         # steady-state margin floor
-M_FLOOR_COLD = 0.20    # cold-start margin floor (first 2 obs)
+M_FLOOR_COLD = 0.50    # cold-start margin floor (first 2 obs)
 M_CAP = 0.25           # max margin
 ESTIMATOR_MODE = os.environ.get("CTXGATE_TOKEN_ESTIMATOR", "calibrated")  # "calibrated" | "exact"
 
@@ -1836,7 +1836,7 @@ class _TokenCalibrator:
             self._sessions[session_key] = s
 
         ratio = predicted / real
-        new_rho = s["rho"] / ratio if ratio > 0 else s["rho"]
+        new_rho = s["rho"] * ratio if ratio > 0 else s["rho"]
         new_rho = max(RHO_LO, min(RHO_HI, new_rho))
 
         if s["n"] == 0:
@@ -1875,6 +1875,7 @@ class _TokenCalibrator:
         s["m_bump"] = min(s.get("m_bump", 0.0) + amount, M_CAP)
 
 calibrator = _TokenCalibrator()
+_active_rho: float = RHO_COLD  # per-request rho, set by build_context/chat_completions
 
 def count_tokens(text: str, estimate: bool = False) -> int:
     """Count tokens in text.
@@ -1888,7 +1889,7 @@ def count_tokens(text: str, estimate: bool = False) -> int:
             return len(enc.encode(text).ids)
         except AttributeError:
             return len(enc.encode(text))
-    return max(1, int(len(text) / RHO_COLD))
+    return max(1, int(len(text) / _active_rho))
 
 def count_message_tokens(msg: dict, estimate: bool = False) -> int:
     """Predict tokens for a single message using pure length arithmetic.
@@ -1913,7 +1914,7 @@ def count_message_tokens(msg: dict, estimate: bool = False) -> int:
         total_chars += 10
     if msg.get("tool_call_id"):
         total_chars += len(msg["tool_call_id"])
-    return max(1, int(total_chars / RHO_COLD))
+    return max(1, int(total_chars / _active_rho))
 
 def count_messages_tokens(messages: list, estimate: bool = False) -> int:
     """Predict total tokens for a message list using pure length arithmetic.
@@ -2979,6 +2980,8 @@ async def _window_cleanup_ttl() -> None:
 
 async def build_context(request_messages: list, task_uuid: str = None, session_key: str = None) -> list:
     sk = session_key or ""
+    global _active_rho
+    _active_rho, _ = calibrator.get_rho(sk)
     _note_n = _note_tok()  # tokens reserved for COMPACTION_NOTE (added after build_context)
     async with _window_lock(sk):
         ws = session_compactions.get(sk)
@@ -4042,6 +4045,8 @@ async def chat_completions(request: Request):
             _log_label = "FALLBACK"
 
         session_key = f"goose:{_goose_meta['id']}"
+        global _active_rho
+        _active_rho, _ = calibrator.get_rho(session_key)
         task_uuid = _goose_meta["uuid"]
         x_sid = _goose_meta["id"]
         log.info("%s sid=%s session_key=%s task=%s cap=%s",
