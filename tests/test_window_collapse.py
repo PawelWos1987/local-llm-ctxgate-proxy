@@ -37,7 +37,7 @@ def _load():
     names = ["_recut_to", "_recut", "_msg_anchor", "_seed_sig", "_norm_content",
              "_new_window_state", "_window_valid", "_kept_messages", "_prep_messages",
              "strip_reasoning", "protected_tool_groups",
-             "_newest_user_idx", "_make_pinned_copy", "_pinned_user_copy", "_note_tok", "_with_compaction_note"]
+             "_newest_user_idx", "_note_tok", "_with_compaction_note"]
     mod_src = _extract(names)
     ns = {}
     COMPACTION_NOTE = "[COMPACTED HISTORY] earlier turns archived; see TASK STATE"
@@ -46,8 +46,8 @@ def _load():
               count_messages_tokens=_count_messages_tokens,
               _trim_target=lambda: 44800,
               metrics={}, hashlib=hashlib, re=re, json=json,
-              PINNED_USER_MAX_CHARS=16000, PINNED_USER_FAR_CHARS=2000,
-              PINNED_USER_FAR_THRESHOLD=8)
+              
+              )
     import asyncio
     ns["asyncio"] = asyncio
     ns["log"] = type("L", (), {"warning": staticmethod(lambda *a: None),

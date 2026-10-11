@@ -17,7 +17,6 @@ from proxy.app import (
     ToolCallAccumulator,
     verify_context_invariants,
     ContextCapacityError,
-    _make_pinned_copy,
     _emergency_shrink,
     _norm_content,
     _protected_indices,
@@ -28,9 +27,9 @@ from proxy.app import (
     MIN_OUTPUT,
     MAX_CONTEXT,
     SAFETY_MARGIN,
-    PINNED_USER_MAX_CHARS,
-    PINNED_USER_FAR_CHARS,
     count_messages_tokens,
+    _kept_messages,
+    _live_prompt_identity,
 )
 
 PASS = 0
@@ -301,7 +300,7 @@ def test_e_newest_4_tool_bodies():
 #/ TEST F: Pinned current instruction
 #/ ============================================================
 def test_f_pinned_instruction():
-    section("TEST F: Pinned newest-user copy (head + tail)")
+    section("TEST F: Live prompt preserved in full (no truncation)")
     
     # Large user message with critical info at BOTH ends
     head_text = "TASK: Implement the authentication module with JWT tokens."
@@ -309,48 +308,37 @@ def test_f_pinned_instruction():
     tail_text = "CONSTRAINT: Do NOT use session cookies. File: /src/auth/jwt.py. Acceptance: all tests pass."
     full_msg = head_text + middle_text + tail_text
     
-    msg = {"role": "user", "content": full_msg}
+    # _kept_messages preserves the live prompt at its natural position
+    msgs = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": full_msg},
+    ]
+    seed = [msgs[0]]
+    rest = msgs[1:]
+    # Cut that would normally exclude the live prompt
+    kept = _kept_messages(seed, rest, 2)
     
-    # Normal pinned copy (distance <= threshold)
-    pinned = _make_pinned_copy(msg, distance=2)
-    ok("F1: ctxgate_pinned marker set", pinned.get("ctxgate_pinned") == True)
-    ok("F2: ctxgate_anchor present", "ctxgate_anchor" in pinned)
+    last_user = [m for m in kept if m.get("role") == "user"][-1]
+    ok("F1: live prompt present in kept window", last_user is not None)
+    ok("F2: full content preserved (no truncation)",
+       last_user["content"] == full_msg,
+       f"len={len(last_user['content'])} expected={len(full_msg)}")
+    ok("F3: head preserved", head_text[:100] in last_user["content"])
+    ok("F4: tail preserved", "Do NOT use session cookies" in last_user["content"])
+    ok("F5: no ctxgate_pinned marker", "ctxgate_pinned" not in last_user)
     
-    # First 300 chars must be anchor-compatible (same as original head)
-    ok("F3: first 300 chars match original head",
-       pinned["content"][:300] == full_msg[:300])
+    # _live_prompt_identity produces a stable hash
+    h1 = _live_prompt_identity(msgs)
+    h2 = _live_prompt_identity(msgs)
+    ok("F6: live prompt identity is stable", h1 == h2 and len(h1) == 64)
     
-    # Head must survive
-    ok("F4: head (task declaration) preserved",
-       head_text[:100] in pinned["content"])
-    
-    # Tail must survive (constraints at end)
-    ok("F5: tail (constraints) preserved",
-       "Do NOT use session cookies" in pinned["content"])
-    
-    # Middle marker present
-    ok("F6: middle omission marker present",
-       "[...middle omitted by ctxgate...]" in pinned["content"])
-    
-    # Total length within cap
-    ok("F7: within PINNED_USER_MAX_CHARS",
-       len(pinned["content"]) <= PINNED_USER_MAX_CHARS + 100,
-       f"len={len(pinned['content'])} cap={PINNED_USER_MAX_CHARS}")
-    
-    # Far pinned copy (distance > threshold)
-    pinned_far = _make_pinned_copy(msg, distance=15)
-    ok("F8: far copy has ctxgate_pinned", pinned_far.get("ctxgate_pinned") == True)
-    ok("F9: far copy within FAR cap",
-       len(pinned_far["content"]) <= PINNED_USER_FAR_CHARS + 100,
-       f"len={len(pinned_far['content'])} cap={PINNED_USER_FAR_CHARS}")
-    ok("F10: far copy preserves head", head_text[:50] in pinned_far["content"])
-    ok("F11: far copy preserves tail", "Do NOT use session cookies" in pinned_far["content"])
-    
-    # Short message: no truncation needed
-    short_msg = {"role": "user", "content": "Hello, simple message."}
-    pinned_short = _make_pinned_copy(short_msg, distance=1)
-    ok("F12: short message unmodified", pinned_short["content"] == "Hello, simple message.")
-    ok("F13: short message still has marker", pinned_short.get("ctxgate_pinned") == True)
+    # Different prompt → different hash
+    msgs_mod = [dict(m) for m in msgs]
+    msgs_mod[-1]["content"] = "MODIFIED"
+    h3 = _live_prompt_identity(msgs_mod)
+    ok("F7: modified prompt produces different hash", h1 != h3)
 
 #/ ============================================================
 #/ TEST G: Root-summary continuity

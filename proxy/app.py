@@ -1,4 +1,16 @@
 """local-llm-ctxgate-proxy: Context gate proxy for Goose -> vLLM with PG memory."""
+# ─── Token Estimator Mode ───────────────────────────────────────────────────────
+# CTXGATE_TOKEN_ESTIMATOR controls how tokens are counted:
+#   "calibrated" (DEFAULT): O(1) len/rho arithmetic. No tokenizer call.
+#                           Per-session EWMA calibrator adapts rho to real usage.
+#   "exact":               Qwen tokenizer (enc.encode). Requires CTXGATE_QWEN_TOKENIZER
+#                           env var pointing to a valid tokenizer file.
+#   "shadow":              Computes both calibrated and exact; logs delta for
+#                           telemetry. Admission uses exact count (safe).
+#
+# Rollback: set CTXGATE_TOKEN_ESTIMATOR=exact to restore tokenizer-based counting.
+# In exact mode, CTXGATE_QWEN_TOKENIZER must be set or startup will fail.
+# ─────────────────────────────────────────────────────────────────────────────────
 import asyncio
 import datetime
 import hashlib
@@ -8,10 +20,11 @@ import logging
 import math
 import os
 import re
+import contextvars
 import uuid
 import sys
 import time
-from collections import deque
+from collections import deque, OrderedDict
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
@@ -695,6 +708,301 @@ async def _persist_ledger_entries(entries: list, task_uuid):
             log.debug("Ledger insert failed: %s", ex)
     return inserted
 
+# ─── Phase 06: Structured Ledger + Supersession + Retrieval ───────────────────
+
+_LEDGER_TYPES = {
+    "requirement", "constraint", "decision", "rejected_approach",
+    "completed_work", "test_result", "failure", "artifact", "todo",
+}
+_LEDGER_STATUSES = {"active", "completed", "superseded", "rejected", "uncertain"}
+
+# Topic keywords for conflict detection in supersession
+_CONFLICT_TOPICS = {
+    "database": ["postgres", "mysql", "sqlite", "redis", "mongo", "db", "database"],
+    "language": ["python", "java", "rust", "go", "typescript", "javascript"],
+    "framework": ["fastapi", "flask", "django", "express", "react", "vue"],
+    "deployment": ["aws", "gcp", "azure", "docker", "kubernetes", "deploy"],
+    "caching": ["redis", "memcached", "cache", "caching"],
+    "testing": ["pytest", "unittest", "test", "testing"],
+    "architecture": ["microservice", "monolith", "event-driven", "architecture"],
+}
+
+def _entries_conflict(entry_a: dict, entry_b: dict) -> bool:
+    """Determine if two ledger entries conflict (address the same topic with opposing content)."""
+    text_a = (entry_a.get("text", "") + " " + entry_a.get("entry_type", "")).lower()
+    text_b = (entry_b.get("text", "") + " " + entry_b.get("entry_type", "")).lower()
+    
+    for topic, keywords in _CONFLICT_TOPICS.items():
+        a_has = any(kw in text_a for kw in keywords)
+        b_has = any(kw in text_b for kw in keywords)
+        if a_has and b_has:
+            a_specifics = [kw for kw in keywords if kw in text_a]
+            b_specifics = [kw for kw in keywords if kw in text_b]
+            if a_specifics != b_specifics:
+                return True
+            if "never" in text_a or "don't" in text_a or "no " in text_a:
+                if "use" in text_b or "must" in text_b:
+                    return True
+            if "never" in text_b or "don't" in text_b or "no " in text_b:
+                if "use" in text_a or "must" in text_a:
+                    return True
+    return False
+
+def _apply_supersession(entries: list, new_entry: dict) -> list:
+    """A new explicit instruction supersedes only conflicting older ones.
+    
+    Rules:
+    - A new EXPLICIT instruction supersedes conflicting older entries
+    - A new NON-explicit (summary-derived) entry CANNOT supersede an explicit entry
+    - Unrelated entries remain active
+    - Superseded entries get status='superseded' and superseded_by=new_entry.id
+    """
+    if not new_entry.get("explicit", False):
+        for e in entries:
+            if e.get("status") != "active":
+                continue
+            if e.get("explicit", False):
+                continue
+            if _entries_conflict(e, new_entry):
+                e["status"] = "superseded"
+                e["superseded_by"] = new_entry.get("id")
+                e["updated_at"] = None
+        return entries
+    
+    for e in entries:
+        if e.get("status") != "active":
+            continue
+        if e.get("id") == new_entry.get("id"):
+            continue
+        if _entries_conflict(e, new_entry):
+            e["status"] = "superseded"
+            e["superseded_by"] = new_entry.get("id")
+            e["updated_at"] = None
+    return entries
+
+def _format_ledger_snapshot(entries: list) -> str:
+    """Format active ledger entries as a compact, structured snapshot string."""
+    active = [e for e in entries if e.get("status") == "active"]
+    if not active:
+        return ""
+    
+    type_markers = {
+        "requirement": "R", "constraint": "C", "decision": "D",
+        "rejected_approach": "X", "completed_work": "W",
+        "test_result": "T", "failure": "F", "artifact": "A", "todo": "!",
+    }
+    
+    lines = ["[LEDGER] (%d active entries)" % len(active)]
+    for e in active:
+        marker = type_markers.get(e.get("entry_type", ""), "?")
+        text = e.get("text", "")
+        if len(text) > 200:
+            text = text[:197] + "..."
+        explicit_tag = "" if e.get("explicit", False) else " (inferred)"
+        lines.append("[%s] %s: %s%s" % (marker, e.get("entry_type", "?"), text, explicit_tag))
+    
+    return chr(10).join(lines)
+
+def _build_ledger_message(entries: list) -> dict:
+    """Build a separate system message containing the ledger snapshot."""
+    snapshot = _format_ledger_snapshot(entries)
+    if not snapshot:
+        return None
+    return {
+        "role": "system",
+        "content": snapshot,
+    }
+
+async def _fetch_active_ledger(task_uuid: str, session_key: str = "", tenant_id: str = "") -> list:
+    """Fetch active ledger entries for a session/task. Tenant-scoped."""
+    if not pool:
+        return []
+    try:
+        rows = await pool.fetch(
+            "SELECT id, entry_type, status, source_event_id, source_hash, "
+            "source_span, text, explicit, superseded_by "
+            "FROM proxy.ledger_entries "
+            "WHERE tenant_id=$1 AND session_key=$2 AND status='active' "
+            "ORDER BY id",
+            tenant_id, session_key,
+        )
+        return [dict(r) for r in rows]
+    except Exception as e:
+        log.debug("_fetch_active_ledger failed: %s", e)
+        return []
+
+def _inject_ledger_into_context(kept: list, task_uuid: str = None, session_key: str = "", tenant_id: str = "") -> list:
+    """Inject the ledger snapshot as a separate system message into the context."""
+    if not task_uuid and not session_key:
+        return kept
+    
+    cached_entries = _ledger_cache.get((tenant_id, session_key) if session_key else (tenant_id, task_uuid))
+    if not cached_entries:
+        return kept
+    
+    ledger_msg = _build_ledger_message(cached_entries)
+    if not ledger_msg:
+        return kept
+    
+    insert_at = 0
+    for i, m in enumerate(kept):
+        if m.get("role") == "system":
+            insert_at = i + 1
+        else:
+            break
+    
+    for m in kept:
+        if m.get("role") == "system" and m.get("content", "").startswith("[LEDGER]"):
+            return kept
+    
+    kept.insert(insert_at, ledger_msg)
+    return kept
+
+# In-memory cache for ledger entries
+_ledger_cache = {}
+_session_tenant: dict = {}  # session_key -> tenant_id mapping
+
+async def _prefetch_ledger(task_uuid: str, session_key: str = "", tenant_id: str = "") -> None:
+    """Prefetch ledger entries into the in-memory cache."""
+    if not session_key and not task_uuid:
+        return
+    entries = await _fetch_active_ledger(task_uuid, session_key, tenant_id)
+    if entries:
+        cache_key = (tenant_id, session_key) if session_key else (tenant_id, task_uuid)
+        _ledger_cache[cache_key] = entries
+
+# ─── Phase 07: Tool Body Archive + Gap-Aware Watermark ─────────────────────────
+
+TOOL_BODY_CHUNK_CHARS = int(os.environ.get("CTXGATE_TOOL_BODY_CHUNK_CHARS", "50000"))
+
+def _chunk_tool_body(content: str, chunk_size: int = None) -> list:
+    """Split large tool output into bounded chunks for durable storage."""
+    if chunk_size is None:
+        chunk_size = TOOL_BODY_CHUNK_CHARS
+    if len(content) <= chunk_size:
+        return [content] if content else []
+    chunks = []
+    for i in range(0, len(content), chunk_size):
+        chunks.append(content[i:i + chunk_size])
+    return chunks
+
+def _retrieve_chunk_range(chunks: list, start: int = 0, end: int = None) -> list:
+    """Get a range of chunks (0-indexed, inclusive start, exclusive end)."""
+    if end is None:
+        end = len(chunks)
+    start = max(0, start)
+    end = min(len(chunks), end)
+    if start >= end:
+        return []
+    return chunks[start:end]
+
+async def _retrieve_archived_content(
+    tenant_id: str,
+    session_key: str,
+    event_hash: str,
+    start: int = 0,
+    end: int = None,
+) -> str:
+    """Fetch archived tool body content by tenant + session + event_hash + range."""
+    if not pool:
+        return ""
+    try:
+        if end is None:
+            rows = await pool.fetch(
+                "SELECT content FROM proxy.tool_body_chunks "
+                "WHERE tenant_id=$1 AND session_key=$2 AND event_hash=$3 AND chunk_idx >= $4 "
+                "ORDER BY chunk_idx",
+                tenant_id, session_key, event_hash, start,
+            )
+        else:
+            rows = await pool.fetch(
+                "SELECT content FROM proxy.tool_body_chunks "
+                "WHERE tenant_id=$1 AND session_key=$2 AND event_hash=$3 "
+                "AND chunk_idx >= $4 AND chunk_idx < $5 "
+                "ORDER BY chunk_idx",
+                tenant_id, session_key, event_hash, start, end,
+            )
+        return "".join(r["content"] for r in rows)
+    except Exception as e:
+        log.warning("_retrieve_archived_content failed: %s", e)
+        return ""
+
+async def _store_tool_body(
+    tenant_id: str,
+    session_key: str,
+    event_hash: str,
+    content: str,
+    chunk_size: int = None,
+) -> int:
+    """Store a large tool body in chunks. Idempotent (ON CONFLICT DO NOTHING)."""
+    if not pool:
+        return 0
+    if chunk_size is None:
+        chunk_size = TOOL_BODY_CHUNK_CHARS
+    chunks = _chunk_tool_body(content, chunk_size)
+    if not chunks:
+        return 0
+    total = len(chunks)
+    stored = 0
+    for i, chunk in enumerate(chunks):
+        chunk_hash = hashlib.sha256(chunk.encode()).hexdigest()
+        try:
+            await pool.execute(
+                "INSERT INTO proxy.tool_body_chunks "
+                "(tenant_id, session_key, event_hash, chunk_idx, content, content_hash, total_chunks) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7) "
+                "ON CONFLICT (session_key, event_hash, chunk_idx) DO NOTHING",
+                tenant_id, session_key, event_hash, i, chunk, chunk_hash, total,
+            )
+            stored += 1
+        except Exception as e:
+            log.debug("Tool body chunk store failed: %s", e)
+    return stored
+
+def _compute_gap_aware_watermark(chunks: list) -> int:
+    """Compute the contiguous watermark: the end_idx of the last consecutively stored chunk."""
+    if not chunks:
+        return 0
+    
+    sorted_chunks = sorted(chunks, key=lambda c: c.get("chunk_seq", 0))
+    
+    watermark = 0
+    for i, chunk in enumerate(sorted_chunks):
+        if chunk.get("chunk_seq") != i:
+            break
+        if chunk.get("state") != "stored":
+            break
+        watermark = chunk.get("end_idx", 0)
+    
+    return watermark
+
+def _deterministic_chunk_id(task_id: str, start_idx: int, end_idx: int, chunk_seq: int) -> str:
+    """Generate a deterministic chunk ID from its components. Idempotent."""
+    raw = "%s|%d|%d|%d" % (task_id, start_idx, end_idx, chunk_seq)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+# Restart recovery SQL: find orphaned chunks with expired leases
+_RESTART_RECOVERY_SQL = (
+    "UPDATE proxy.summary_chunks "
+    "SET state='queued', owner=NULL, lease_expires=NULL, updated_at=now() "
+    "WHERE state IN ('claimed','processing') AND lease_expires < now()"
+)
+
+async def _restart_recovery() -> int:
+    """On startup: reset orphaned chunks (expired leases) back to 'queued'."""
+    if not pool:
+        return 0
+    try:
+        result = await pool.execute(_RESTART_RECOVERY_SQL)
+        parts = result.split()
+        count = int(parts[-1]) if parts else 0
+        if count > 0:
+            log.info("Restart recovery: reset %d orphaned chunks to queued", count)
+        return count
+    except Exception as e:
+        log.warning("Restart recovery failed: %s", e)
+        return 0
+
 async def _build_session_digest(task_uuid, session_key: str = "", tenant_id: str = "") -> str:
     """Phase 3: Deterministic session digest from ledger + phase summaries."""
     if not pool:
@@ -817,6 +1125,7 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
     on a later request. A brand-new / pre-change session (no watermark) backfills
     only the NEWEST SUMMARY_BACKFILL_CHARS of the dropped region, in order.
     """
+    _rho_var.set(RHO_COLD)  # background task: don't inherit request context
     global _summary_last_attempt
     if not pool or not rest:
         return
@@ -875,21 +1184,10 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
                             t = t + " " + " ".join(parts)
                 return t
 
-            total_chars = sum(len(_mtext(m)) for m in slice_msgs)
-            if total_chars > SUMMARY_BACKFILL_CHARS:
-                acc = 0
-                keep_from = len(slice_msgs)
-                for i in range(len(slice_msgs) - 1, -1, -1):
-                    acc += len(_mtext(slice_msgs[i]))
-                    keep_from = i
-                    if acc >= SUMMARY_BACKFILL_CHARS:
-                        break
-                skipped = keep_from
-                slice_msgs = slice_msgs[keep_from:]
-                start_idx = start_idx + skipped
-                log.info("backfill capped: skipped %d older messages (newest %d kept)", skipped, len(slice_msgs))
-                if not slice_msgs:
-                    return
+            # All text is processed - no skipping. If a slice exceeds max size,
+            # it is split into more chunks (handled by _build_chunks below).
+            # SUMMARY_BACKFILL_CHARS env var retained for backward compat but its
+            # skip behavior is removed.
 
             per_cap = 500
             def _build_chunks(cap):
@@ -995,13 +1293,38 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
             for ci, r in enumerate(chunk_results):
                 if isinstance(r, Exception):
                     log.warning("Phase chunk %d/%d failed: %s", ci + 1, len(chunks), r)
-            # BUG 1: stored_any was never set True (root cause of the stuck
-            # watermark / infinite re-summarization). Derive it from the gather
-            # results: any chunk that returned a non-empty string stored a phase.
-            stored_any = any(isinstance(r, str) and r for r in chunk_results)
-            if not stored_any:
+            # Per-chunk state tracking: only advance watermark when ALL chunks succeed
+            all_succeeded = True
+            for ci, r in enumerate(chunk_results):
+                if isinstance(r, Exception):
+                    log.warning("Phase chunk %d/%d failed: %s", ci + 1, len(chunks), r)
+                    all_succeeded = False
+                    try:
+                        _cid = hashlib.sha256(f"{task_uuid}:{start_idx}:{end_idx}:{ci}".encode()).hexdigest()
+                        await pool.execute(
+                            "INSERT INTO proxy.summary_chunks (task_id, session_key, chunk_id, start_idx, end_idx, chunk_seq, status) "
+                            "VALUES ($1,$2,$3,$4,$5,$6,'failed') "
+                            "ON CONFLICT (task_id, chunk_id) DO UPDATE SET status='failed', updated_at=now()",
+                            task_uuid, session_key, _cid, start_idx, end_idx, ci
+                        )
+                    except Exception:
+                        pass
+                elif isinstance(r, str) and r:
+                    try:
+                        _cid = hashlib.sha256(f"{task_uuid}:{start_idx}:{end_idx}:{ci}".encode()).hexdigest()
+                        await pool.execute(
+                            "INSERT INTO proxy.summary_chunks (task_id, session_key, chunk_id, start_idx, end_idx, chunk_seq, status, summary) "
+                            "VALUES ($1,$2,$3,$4,$5,$6,'succeeded',$7) "
+                            "ON CONFLICT (task_id, chunk_id) DO UPDATE SET status='succeeded', summary=$7, updated_at=now()",
+                            task_uuid, session_key, _cid, start_idx, end_idx, ci, r
+                        )
+                    except Exception:
+                        pass
+                else:
+                    all_succeeded = False
+            if not all_succeeded:
                 metrics["summary_slices_failed"] += 1
-                log.warning("Slice summarization produced no phases (start=%d end=%d) - watermark NOT advanced", start_idx, end_idx)
+                log.warning("Slice summarization: not all chunks succeeded (start=%d end=%d) - watermark NOT advanced past failed chunks", start_idx, end_idx)
                 return
 
             # Phase 3: Replace LLM root step with deterministic digest
@@ -1060,8 +1383,42 @@ async def _fetch_session_summary(task_uuid, budget=1500, session_key: str = ""):
 # --- Constants ---
 VLLM_URL = os.environ.get("CTXGATE_VLLM_URL", "http://127.0.0.1:29000/v1")
 VLLM_MODEL = os.environ.get("CTXGATE_VLLM_MODEL", "Qwen3.8-27B")
-MAX_CONTEXT = _env_int("CTXGATE_MAX_CONTEXT", 84000)
-MAX_INPUT = _env_int("CTXGATE_MAX_INPUT", 64000)
+# ─── Budget Configuration ───────────────────────────────────────────────────
+# Primary source: Goose custom provider config (single source of truth).
+# Fallback: env vars (CTXGATE_MAX_CONTEXT, CTXGATE_MAX_OUTPUT) → hardcoded defaults.
+# All other budget values are derived to maintain the invariant:
+#   MAX_INPUT + SAFETY_MARGIN + MIN_OUTPUT <= MAX_CONTEXT
+#
+# Derived:
+#   MIN_OUTPUT    = MAX_OUTPUT // 3
+#   SAFETY_MARGIN = 5% of MAX_CONTEXT
+#   MAX_INPUT     = MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT
+
+_GOOSE_CONFIG_PATH = os.path.expanduser("~/.config/goose/custom_providers/custom_qwen.json")
+
+def _load_goose_budget() -> tuple:
+    """Read context_limit and max_tokens from the Goose custom provider config.
+    Falls back to (None, None) if the file is missing or malformed."""
+    try:
+        with open(_GOOSE_CONFIG_PATH, "r") as f:
+            cfg = json.load(f)
+        for m in cfg.get("models", []):
+            ctx = m.get("context_limit")
+            out = m.get("max_tokens")
+            if ctx and out:
+                return int(ctx), int(out)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return None, None
+
+_goose_ctx, _goose_out = _load_goose_budget()
+MAX_CONTEXT = _env_int("CTXGATE_MAX_CONTEXT", _goose_ctx or 84000)
+MAX_OUTPUT = _env_int("CTXGATE_MAX_OUTPUT", _goose_out or 22500)
+
+# Derived budget values (overridable via env for power users, but defaults are computed)
+MIN_OUTPUT = _env_int("CTXGATE_MIN_OUTPUT", MAX_OUTPUT // 3)
+SAFETY_MARGIN = _env_int("CTXGATE_SAFETY_MARGIN", int(MAX_CONTEXT * 0.05))
+MAX_INPUT = _env_int("CTXGATE_MAX_INPUT", MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
 # --- Rolling window (sticky cut) config ---
 TRIM_TARGET_TOKENS = _env_int("CTXGATE_TRIM_TARGET_TOKENS", 0)          # absolute; wins if > 0
 TRIM_TARGET_FRACTION = _env_float("CTXGATE_TRIM_TARGET_FRACTION", 0.70)
@@ -1074,16 +1431,15 @@ SUMMARY_TOOL_CAP_CHARS = _env_int("CTXGATE_SUMMARY_TOOL_CAP_CHARS", 1000)
 WINDOW_TTL_DAYS = _env_int("CTXGATE_WINDOW_TTL_DAYS", 7)
 SSE_HEARTBEAT_INTERVAL = _env_int("CTXGATE_SSE_HEARTBEAT_INTERVAL", 10)
 STABLE_ELIDE = os.environ.get("CTXGATE_STABLE_ELIDE", "1") != "0"  # stable tool-body elision (prefix-cache friendly)
-MAX_OUTPUT = _env_int("CTXGATE_MAX_OUTPUT", 16000)
-SAFETY_MARGIN = _env_int("CTXGATE_SAFETY_MARGIN", 4000)
-MIN_OUTPUT = _env_int("CTXGATE_MIN_OUTPUT", 8000)  # hard floor for the output budget
+
 CTXGATE_PREFIX_DIAG_ON = os.environ.get("CTXGATE_PREFIX_DIAG", "0") == "1"
 CTXGATE_INJECT_EPOCH_FREEZE_ON = os.environ.get("CTXGATE_INJECT_EPOCH_FREEZE", "1") == "1"
 CTXGATE_INJECT_MAX_TOKENS_CFG = _env_int("CTXGATE_INJECT_MAX_TOKENS", 3000)
 CTXGATE_INJECT_MAX_TOKENS_RECAP_CFG = _env_int("CTXGATE_INJECT_MAX_TOKENS_RECAP", 5000)
-PINNED_USER_MAX_CHARS = _env_int("CTXGATE_PINNED_USER_MAX_CHARS", 16000)  # cap for pinned user copy
-PINNED_USER_FAR_CHARS = _env_int("CTXGATE_PINNED_USER_FAR_CHARS", 2000)   # tighter cap when user msg is far before cut
-PINNED_USER_FAR_THRESHOLD = _env_int("CTXGATE_PINNED_USER_FAR_THRESHOLD", 8)  # distance in messages to trigger far cap
+# High/low watermark for rolling window re-cut
+CTXGATE_WINDOW_TRIGGER_FRAC = _env_float("CTXGATE_WINDOW_TRIGGER_FRAC", 0.92)
+CTXGATE_WINDOW_TARGET_FRAC = _env_float("CTXGATE_WINDOW_TARGET_FRAC", 0.82)
+CUT_QUANTUM = _env_int("CTXGATE_CUT_QUANTUM", 512)
 
 WALL_CLOCK_MAX = _env_int("CTXGATE_WALL_CLOCK_MAX", 1800)  # 30 min - large contexts need more time
 MAX_CONTINUATIONS = int(os.environ.get("CTXGATE_MAX_CONTINUATIONS", 5))
@@ -1166,6 +1522,7 @@ recent_calls = deque(maxlen=200)
 RECENT_CALLS_MAX = 200
 
 metrics = {
+    "shadow_comparison": {"total": 0, "last_calibrated": 0, "last_exact": 0, "last_delta_pct": 0},
     "requests_total": 0,
     "requests_ok": 0,
     "requests_error": 0,
@@ -1392,9 +1749,9 @@ def validate_config() -> list:
     except Exception as e:
         problems.append(f"VLLM_URL unparseable: {e}")
 
-    # 3. MAX_INPUT + SAFETY_MARGIN <= MAX_CONTEXT
-    if MAX_INPUT + SAFETY_MARGIN > MAX_CONTEXT:
-        problems.append(f"MAX_INPUT({MAX_INPUT}) + SAFETY_MARGIN({SAFETY_MARGIN}) > MAX_CONTEXT({MAX_CONTEXT})")
+    # 3. MAX_INPUT + SAFETY_MARGIN + MIN_OUTPUT <= MAX_CONTEXT
+    if MAX_INPUT + SAFETY_MARGIN + MIN_OUTPUT > MAX_CONTEXT:
+        problems.append(f"MAX_INPUT({MAX_INPUT}) + SAFETY_MARGIN({SAFETY_MARGIN}) + MIN_OUTPUT({MIN_OUTPUT}) > MAX_CONTEXT({MAX_CONTEXT})")
 
     # 4. MAX_OUTPUT >= 1
     if MAX_OUTPUT < 1:
@@ -1786,16 +2143,16 @@ def _check_tenant_rate_limit(tenant_id: str):
 # --- Token counting ---
 # --- Calibrated Token Estimator (replaces exact tokenizer on hot path) ---
 # Constants from Phase 1 calibration (1310 prefix requests, 250 sessions, Qwen3.8-27B):
-RHO_COLD = 3.391       # median chars/token from calibration
-RHO_LO = 2.695         # p3 of observed rho (dense content floor)
-RHO_HI = 4.026         # p97 of observed rho (sparse content ceiling)
+RHO_COLD = 6.5         # chars/token from D6 measurement (Qwen3.8-27B)
+RHO_LO = 3.0           # p3 of observed rho (dense content floor)
+RHO_HI = 10.0          # p97 of observed rho (sparse content ceiling)
 K_TOOLS_COLD = 1.537   # chars per token for tool definitions (conservative)
 EWMA_ALPHA = 0.5       # per-session EWMA rate
 GLOBAL_ALPHA = 0.1     # global EWMA rate
 M_FLOOR = 0.08         # steady-state margin floor
 M_FLOOR_COLD = 0.50    # cold-start margin floor (first 2 obs)
 M_CAP = 0.25           # max margin
-ESTIMATOR_MODE = os.environ.get("CTXGATE_TOKEN_ESTIMATOR", "calibrated")  # "calibrated" | "exact"
+ESTIMATOR_MODE = os.environ.get("CTXGATE_TOKEN_ESTIMATOR", "calibrated")  # "calibrated" (default) | "exact" (rollback) | "shadow" (telemetry)
 
 class _TokenCalibrator:
     """Per-session EWMA calibrator for the token predictor.
@@ -1875,21 +2232,112 @@ class _TokenCalibrator:
         s["m_bump"] = min(s.get("m_bump", 0.0) + amount, M_CAP)
 
 calibrator = _TokenCalibrator()
-_active_rho: float = RHO_COLD  # per-request rho, set by build_context/chat_completions
+_rho_var: contextvars.ContextVar = contextvars.ContextVar("ctxgate_rho", default=RHO_COLD)
+
+# --- Token Count Cache (versioned, bounded LRU) ---
+# Cache key: SHA-256(canonical_content) + model + tokenizer_version + template_version + schema_version
+# Bounded to 10000 entries (LRU eviction).
+# In calibrated mode, immutable components are cached by content hash.
+# No synchronous full-history tokenizer call on the hot path.
+
+_TOKENIZER_VERSION = os.environ.get("CTXGATE_TOKENIZER_VERSION", "1")
+_TEMPLATE_VERSION = os.environ.get("CTXGATE_TEMPLATE_VERSION", "1")
+_SCHEMA_VERSION = os.environ.get("CTXGATE_SCHEMA_VERSION", "1")
+_TOKEN_CACHE_MAX = int(os.environ.get("CTXGATE_TOKEN_CACHE_MAX", "10000"))
+
+class _TokenCountCache:
+    """Bounded LRU cache for token counts of immutable components.
+
+    Key: SHA-256(canonical_bytes) + model + tokenizer_ver + template_ver + schema_ver
+    Value: token count (int)
+
+    Used in calibrated mode to avoid re-estimating unchanged components.
+    In exact mode, the tokenizer is authoritative and the cache is a
+    pure performance optimization.
+    """
+    def __init__(self, maxsize: int = _TOKEN_CACHE_MAX):
+        self._cache: OrderedDict = OrderedDict()
+        self._maxsize = maxsize
+        self.hits = 0
+        self.misses = 0
+
+    def _make_key(self, content: str, model: str) -> str:
+        h = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        return f"{h}:{model}:{_TOKENIZER_VERSION}:{_TEMPLATE_VERSION}:{_SCHEMA_VERSION}"
+
+    def get(self, content: str, model: str) -> int | None:
+        key = self._make_key(content, model)
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            self.hits += 1
+            return self._cache[key]
+        self.misses += 1
+        return None
+
+    def put(self, content: str, model: str, tokens: int) -> None:
+        key = self._make_key(content, model)
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        self._cache[key] = tokens
+        if len(self._cache) > self._maxsize:
+            self._cache.popitem(last=False)
+
+    def invalidate_model(self, model: str) -> None:
+        """Invalidate all entries for a given model."""
+        suffix = f":{model}:{_TOKENIZER_VERSION}:{_TEMPLATE_VERSION}:{_SCHEMA_VERSION}"
+        to_remove = [k for k in self._cache if k.endswith(suffix)]
+        for k in to_remove:
+            del self._cache[k]
+
+    def clear(self) -> None:
+        self._cache.clear()
+        self.hits = 0
+        self.misses = 0
+
+_token_cache = _TokenCountCache()
+
 
 def count_tokens(text: str, estimate: bool = False) -> int:
     """Count tokens in text.
 
-    Default uses the calibrated predictor: tokens = len(text) / rho.
-    Pure length arithmetic with zero tokenizer calls.
-    When CTXGATE_TOKEN_ESTIMATOR=exact, falls back to the tokenizer.
+    Mode behavior:
+    - exact: uses the real tokenizer (authoritative, no uncertainty).
+    - calibrated: uses len/rho prediction with cache for immutable content.
+    - shadow: computes calibrated prediction for telemetry, but returns
+      the exact count (so admission is always safe).
+
+    No synchronous full-history tokenizer call on the calibrated hot path.
     """
+    if ESTIMATOR_MODE == "shadow":
+        # Shadow: compute calibrated for logging, return exact for admission
+        _shadow_pred = max(1, int(len(text) / _rho_var.get()))
+        if enc is not None:
+            try:
+                _exact = len(enc.encode(text).ids)
+            except AttributeError:
+                _exact = len(enc.encode(text))
+            metrics["shadow_comparison"]["total"] += 1
+            metrics["shadow_comparison"]["last_calibrated"] = _shadow_pred
+            metrics["shadow_comparison"]["last_exact"] = _exact
+            metrics["shadow_comparison"]["last_delta_pct"] = (
+                (_shadow_pred - _exact) / _exact * 100 if _exact else 0.0)
+            return _exact
+        return _shadow_pred
+
     if ESTIMATOR_MODE == "exact" and enc is not None:
+        cached = _token_cache.get(text, VLLM_MODEL)
+        if cached is not None:
+            return cached
         try:
-            return len(enc.encode(text).ids)
+            result = len(enc.encode(text).ids)
         except AttributeError:
-            return len(enc.encode(text))
-    return max(1, int(len(text) / _active_rho))
+            result = len(enc.encode(text))
+        _token_cache.put(text, VLLM_MODEL, result)
+        return result
+
+    # Calibrated mode: pure len/rho arithmetic (O(1), no tokenizer, no cache).
+    # Cache is NOT used here because the result depends on _rho_var (per-session).
+    return max(1, int(len(text) / _rho_var.get()))
 
 def count_message_tokens(msg: dict, estimate: bool = False) -> int:
     """Predict tokens for a single message using pure length arithmetic.
@@ -1914,7 +2362,7 @@ def count_message_tokens(msg: dict, estimate: bool = False) -> int:
         total_chars += 10
     if msg.get("tool_call_id"):
         total_chars += len(msg["tool_call_id"])
-    return max(1, int(total_chars / _active_rho))
+    return max(1, int(total_chars / _rho_var.get()))
 
 def count_messages_tokens(messages: list, estimate: bool = False) -> int:
     """Predict total tokens for a message list using pure length arithmetic.
@@ -2261,16 +2709,22 @@ def _prep_messages(raw: list) -> list:
 
 
 # --- Rolling window (sticky cut) helpers ---
+def _safe_admitted_budget() -> int:
+    """The safe admitted input budget: the effective ceiling for input tokens."""
+    return min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
+
+def _eviction_trigger() -> int:
+    """High-watermark trigger: eviction triggers when kept tokens exceed this."""
+    return int(_safe_admitted_budget() * CTXGATE_WINDOW_TRIGGER_FRAC)
+
 def _trim_target() -> int:
-    """Low-watermark target for the kept window. Absolute wins if > 0, else
-    fraction of MAX_INPUT, clamped to [floor_eff, MAX_INPUT]."""
+    """Low-watermark target after eviction."""
     floor_eff = min(TRIM_TARGET_FLOOR, MAX_INPUT // 2)
     if TRIM_TARGET_TOKENS > 0:
         t = TRIM_TARGET_TOKENS
     else:
-        t = int(MAX_INPUT * TRIM_TARGET_FRACTION)
+        t = int(_safe_admitted_budget() * CTXGATE_WINDOW_TARGET_FRAC)
     return max(floor_eff, min(t, MAX_INPUT))
-
 def _norm_content(c) -> str:
     """Normalize a message's content for identity comparison (F2).
 
@@ -2284,9 +2738,9 @@ def _norm_content(c) -> str:
     return str(c)
 
 def _msg_anchor(m: dict) -> str:
-    """Stable identity of a message: role + normalized content[:300] + tool_call_id."""
+    """Stable identity of a message: role + full normalized content + tool_call_id."""
     c = _norm_content(m.get("content"))
-    return hashlib.sha1((str(m.get("role", "")) + "|" + c[:300] + "|" + str(m.get("tool_call_id", ""))).encode()).hexdigest()
+    return hashlib.sha256((str(m.get("role", "")) + "|" + c + "|" + str(m.get("tool_call_id", ""))).encode()).hexdigest()
 
 def _seed_sig(messages: list) -> str:
     h = hashlib.sha1()
@@ -2306,20 +2760,30 @@ def _window_lock(session_key: str) -> asyncio.Lock:
 
 def _fit_to_budget(sections: list, budget_tokens: int) -> str:
     """Fit sections into a token budget. Drop OLDEST first, never cut mid-line.
-    
+
     sections: list of (priority, text) tuples, priority 0 = newest (keep), higher = older (drop first).
     Returns the joined string that fits within budget_tokens.
+    If the first (highest-priority) section alone exceeds the budget, it is
+    boundary-safe truncated to fit.
     """
     if not sections:
         return ""
-    # Sort by priority (0 = keep, higher = drop first)
     sorted_secs = sorted(sections, key=lambda x: x[0])
     parts = []
     total = 0
     for prio, text in sorted_secs:
         t = count_tokens(text)
-        if total + t > budget_tokens and parts:
-            break
+        if total + t > budget_tokens:
+            if parts:
+                break  # drop this and all remaining (lower priority)
+            else:
+                # First section alone exceeds budget: boundary-safe truncation
+                max_chars = int(budget_tokens * _rho_var.get())
+                if len(text) > max_chars:
+                    text = text[:max_chars] + "\n[...truncated to fit budget...]"
+                parts.append(text)
+                total = count_tokens(text)
+                break
         parts.append(text)
         total += t
     return "\n\n".join(parts)
@@ -2369,6 +2833,16 @@ def _compute_epoch_key(session_key: str, ws: dict, newest_user_anchor: str, reca
 def _new_window_state(cut: int, rest: list, seed: list, summarized_through: int) -> dict:
     ca = _msg_anchor(rest[cut]) if 0 <= cut < len(rest) else ""
     cp = _msg_anchor(rest[cut - 1]) if 0 <= cut - 1 < len(rest) else ""
+    lu = _newest_user_idx(rest)
+    live_hash = ""
+    if lu is not None:
+        live_hash = hashlib.sha256(_norm_content(rest[lu].get("content")).encode()).hexdigest()
+    suffix_head_hash = ""
+    suffix_tail_hash = ""
+    if cut < len(rest):
+        suffix_head_hash = hashlib.sha256(_norm_content(rest[cut].get("content")).encode()).hexdigest()
+    if cut > 0:
+        suffix_tail_hash = hashlib.sha256(_norm_content(rest[cut - 1].get("content")).encode()).hexdigest()
     return {
         "cut": cut,
         "cut_anchor": ca,
@@ -2381,10 +2855,15 @@ def _new_window_state(cut: int, rest: list, seed: list, summarized_through: int)
         "elide_idx": None,
         "injected_block": None,
         "injected_epoch": None,
+        "live_prompt_hash": live_hash,
+        "suffix_head_hash": suffix_head_hash,
+        "suffix_tail_hash": suffix_tail_hash,
     }
 
 def _window_valid(ws: dict, seed: list, rest: list) -> bool:
-    """O(1) validation: seed signature + two anchors at the stored cut."""
+    """O(1) validation: seed signature + SHA-256 hashes at the stored cut.
+    Uses suffix_head_hash and suffix_tail_hash (SHA-256 of full content)
+    for stronger validation than the old 300-char anchors."""
     if not ws:
         return False
     cut = ws.get("cut", 0)
@@ -2392,13 +2871,33 @@ def _window_valid(ws: dict, seed: list, rest: list) -> bool:
         return False
     if ws.get("seed_sig") != _seed_sig(seed):
         return False
-    ca = _msg_anchor(rest[cut]) if cut < len(rest) else ""
-    if ws.get("cut_anchor", "") != ca:
-        return False
-    cp = _msg_anchor(rest[cut - 1]) if cut - 1 >= 0 else ""
-    if ws.get("cut_prev_anchor", "") != cp:
-        return False
+    if ws.get("suffix_head_hash"):
+        if cut < len(rest):
+            h = hashlib.sha256(_norm_content(rest[cut].get("content")).encode()).hexdigest()
+            if ws["suffix_head_hash"] != h:
+                return False
+    else:
+        ca = _msg_anchor(rest[cut]) if cut < len(rest) else ""
+        if ws.get("cut_anchor", "") != ca:
+            return False
+    if ws.get("suffix_tail_hash"):
+        if cut > 0:
+            h = hashlib.sha256(_norm_content(rest[cut - 1].get("content")).encode()).hexdigest()
+            if ws["suffix_tail_hash"] != h:
+                return False
+    else:
+        cp = _msg_anchor(rest[cut - 1]) if cut - 1 >= 0 else ""
+        if ws.get("cut_prev_anchor", "") != cp:
+            return False
     return True
+
+
+def _window_epoch(ws: dict) -> str:
+    """The epoch is defined by the cut anchor. Within the same epoch,
+    the same messages are retained and injection content is stable.
+    Only advances when the high watermark is crossed."""
+    return ws.get('cut_anchor', '')
+
 
 # Constant note appended to message 0 (system) of the FINAL request on EVERY request.
 # MUST stay constant: no per-request / per-session data (keeps vLLM prefix cache stable
@@ -2415,7 +2914,7 @@ def _note_tok() -> int:
     """Token cost of the note (lazy + cached; never call count_tokens at import time)."""
     global _NOTE_TOK_CACHE
     if _NOTE_TOK_CACHE is None:
-        _NOTE_TOK_CACHE = count_tokens(chr(10) * 2 + COMPACTION_NOTE) if COMPACTION_NOTE else 0
+        _NOTE_TOK_CACHE = max(1, count_tokens(chr(10) * 2 + COMPACTION_NOTE)) if COMPACTION_NOTE else 0
     return _NOTE_TOK_CACHE
 
 def _with_compaction_note(messages: list) -> list:
@@ -2434,51 +2933,15 @@ def _with_compaction_note(messages: list) -> list:
         return [new_first] + list(messages[1:])
     return [{"role": "system", "content": COMPACTION_NOTE}] + list(messages)
 
-def _make_pinned_copy(m: dict, distance: int = 0) -> dict:
-    """Deterministic pinned copy of a user message. Keeps the first 300 chars
-    verbatim (so _msg_anchor, which hashes content[:300], matches the raw message
-    and the 'newest user missing' check passes) and caps the total with a
-    head + middle-marker + tail truncation. Distance-aware: when the message is
-    far before the cut (distance > PINNED_USER_FAR_THRESHOLD), use a tighter cap.
-
-    Adds internal proxy-state markers (ctxgate_pinned, ctxgate_anchor) that are
-    NOT part of the model-visible content text."""
-    c = _norm_content(m.get("content"))
-    CAP = PINNED_USER_FAR_CHARS if distance > PINNED_USER_FAR_THRESHOLD else PINNED_USER_MAX_CHARS
-    if len(c) <= CAP:
-        text = c
-    else:
-        head_len = min(300, CAP)          # never exceed CAP
-        if len(c) <= head_len + 50:
-            text = c                       # nothing to actually omit
-        else:
-            tail_len = min(CAP - head_len - 50, len(c) - head_len)
-            if tail_len < 0:
-                tail_len = 0
-            marker = "\n[...middle omitted by ctxgate...]\n"
-            text = c[:head_len] + marker + c[len(c) - tail_len:] if tail_len > 0 else c[:head_len] + marker
-    # Internal proxy state (NOT in model-visible content)
-    anchor = hashlib.sha1(c[:300].encode()).hexdigest()
-    return {"role": "user", "content": text, "ctxgate_pinned": True, "ctxgate_anchor": anchor}
-
-def _pinned_user_copy(rest: list, cut: int):
-    """Return the pinned copy of the newest user message if it lies before the
-    budget cut (the walk would otherwise drop it), else None. Shared by
-    _kept_messages and the sticky fast path so the prefix stays byte-stable."""
-    lu = _newest_user_idx(rest)
-    if lu is None or lu >= cut:
-        return None
-    return _make_pinned_copy(rest[lu], distance=cut - lu)
-
 def _kept_messages(seed: list, rest: list, cut: int) -> list:
-    """Rebuild the kept window: seed + [pinned newest-user copy] +
-    rest[cut:]. O(kept). The pinned copy is inserted only when the newest user
-    message sits before the cut, so the window stays bounded instead of keeping
-    the entire post-user tail (the old 'pin by keeping everything' bug)."""
+    """Rebuild the kept window: seed + rest[cut:].
+    If the newest user message (live prompt) sits before the cut, the cut is
+    extended to include it so the live prompt is always present at its natural
+    position. No duplicate/pinned copy is created."""
+    lu = _newest_user_idx(rest)
+    if lu is not None and lu < cut:
+        cut = lu
     result = list(seed)
-    pinned = _pinned_user_copy(rest, cut)
-    if pinned is not None:
-        result.append(pinned)
     result.extend(rest[cut:])
     return result
 
@@ -2490,60 +2953,240 @@ def _newest_user_idx(rest: list):
     return None
 
 
-def _recut_to(messages: list, max_tokens: int) -> int:
-    """Existing budget walk to a boundary-aligned cut targeting max_tokens.
+def _strip_proxy_metadata(messages: list) -> list:
+    """Remove internal ctxgate_* keys from messages before sending to vLLM."""
+    cleaned = []
+    for m in messages:
+        if any(k.startswith("ctxgate_") for k in m):
+            c = {k: v for k, v in m.items() if not k.startswith("ctxgate_")}
+            cleaned.append(c)
+        else:
+            cleaned.append(m)
+    return cleaned
 
-    Boundary rule (F1): after the newest-first budget walk, drop ONLY leading
-    'tool' messages (orphans whose assistant lies before the cut). A leading
-    assistant is a valid window start because its tool results follow inside the
-    kept suffix, so we never drain assistant messages. A post-check guards
-    against window collapse and falls back to the plain budget tail.
+
+def _validate_outgoing_payload(vllm_body: dict, expected_live_hash: str) -> tuple:
+    """Validate the final outgoing payload before sending to vLLM.
+
+    Checks:
+      1. Live prompt hash matches the captured identity
+      2. No ctxgate_* metadata leaks
+      3. No orphaned tool results
+
+    Returns (ok: bool, error_message: str).
     """
-    seed = list(messages[:3])
-    rest = list(messages[3:])
-    stub_tok = _note_tok()  # COMPACTION_NOTE is added to message 0 later in the handler
-    seed_tok = count_messages_tokens(seed)
+    messages = vllm_body.get("messages", [])
+
+    # 1. Live prompt hash
+    if expected_live_hash:
+        actual_hash = _live_prompt_identity(messages)
+        if actual_hash != expected_live_hash:
+            return False, "live_prompt_integrity_violation"
+
+    # 2. No ctxgate_* metadata leaks
+    for msg in messages:
+        for key in msg:
+            if key.startswith("ctxgate_"):
+                return False, "proxy_metadata_leak"
+
+    # 3. No orphaned tool results (tool result without matching assistant tool_call)
+    tool_call_ids = set()
+    for msg in messages:
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                tcid = tc.get("id", "")
+                if tcid:
+                    tool_call_ids.add(tcid)
+    tool_result_ids = set()
+    for msg in messages:
+        if msg.get("role") == "tool":
+            tcid = msg.get("tool_call_id", "")
+            if tcid:
+                tool_result_ids.add(tcid)
+    orphans = tool_result_ids - tool_call_ids
+    if orphans:
+        return False, f"orphaned_tool_results:{len(orphans)}"
+
+    return True, ""
+
+
+def _is_context_length_error(status_code: int, error_body: str) -> bool:
+    """Detect if an error is specifically a context-length overflow.
+
+    Only 400 responses with context-length-specific messages qualify.
+    401, 403, 429, 500, 503, etc. do NOT trigger a recut.
+    """
+    if status_code != 400:
+        return False
+    _et = error_body.lower()
+    indicators = (
+        "context length",
+        "maximum context",
+        "too many tokens",
+        "context_length_exceeded",
+        "maximum context length",
+        "exceeds the model",
+        "input is too long",
+        "prompt is too long",
+    )
+    return any(ind in _et for ind in indicators)
+
+
+def _live_prompt_identity(messages: list) -> str:
+    """Compute an immutable SHA-256 identity for the live prompt (last user message).
+    
+    Uses canonical JSON serialization to preserve content block order and
+    multimodal semantics. Returns hex digest, or empty string if no user message.
+    """
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            # Canonical JSON: sort keys for determinism, preserve list order
+            return hashlib.sha256(
+                json.dumps(m, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+    return ""
+
+
+def estimate_full_payload_tokens(messages: list, tools: list, note_tokens: int,
+                                  session_key: str = "") -> int:
+    """Canonical full-payload token estimator. SINGLE authority for admission checks.
+
+    Counts ALL components of the outgoing request:
+    - Static system prefix (within messages)
+    - All retained messages (role + content + tool_calls)
+    - Role/template separators (chat template overhead)
+    - Injected checkpoint/digest (note_tokens)
+    - Retrieved evidence (within messages)
+    - Live prompt (last user message, within messages)
+    - Actual top-level tool schemas
+    - Safety/output reserves (applied by caller via _output_budget)
+
+    Uncertainty guard (mode-aware):
+    - exact: 0 additional (tokenizer is authoritative)
+    - calibrated: proportional to calibrator margin (cold start = larger)
+    - shadow: 0 additional (admission uses exact count)
+
+    Admission invariant: estimate_full_payload_tokens(...) + output_budget <= MAX_CONTEXT
+    """
+    msg_tokens = count_messages_tokens(messages, estimate=True)
+    tools_tokens = count_tools_tokens(tools) if tools else 0
+    template_overhead = len(messages) * 4
+    total = msg_tokens + tools_tokens + template_overhead + note_tokens
+
+    # Mode-aware uncertainty guard
+    if ESTIMATOR_MODE == "exact":
+        return total
+    if ESTIMATOR_MODE == "shadow":
+        return total
+    # Calibrated: apply proportional uncertainty guard
+    _, margin = calibrator.get_rho(session_key)
+    return int(total * (1 + margin))
+
+def _turn_groups(messages: list) -> list:
+    """Parse messages into turn groups. A turn group is a maximal sequence
+    starting with a user message, followed by zero or more (assistant + tool
+    results) pairs. The group boundary is always at a user message.
+    
+    Returns a list of lists, where each inner list is a turn group.
+    Messages before the first user message (e.g., system) form their own group.
+    """
+    groups = []
+    current = []
+    for m in messages:
+        if m.get("role") == "user" and current:
+            groups.append(current)
+            current = []
+        current.append(m)
+    if current:
+        groups.append(current)
+    return groups
+
+def _safe_cut(groups: list, budget_tokens: int) -> int:
+    """Turn-group-aware budget cut with quantized motion.
+    
+    Cut motion is quantized to CUT_QUANTUM-token steps: the effective
+    budget is rounded DOWN to the nearest quantum boundary before
+    comparison. Never cuts in the middle of a turn group."""
+    if not groups:
+        return 0
+    quantized_budget = (budget_tokens // CUT_QUANTUM) * CUT_QUANTUM
+    if quantized_budget < 512:
+        quantized_budget = budget_tokens
+    group_tokens = []
+    for g in groups:
+        gt = sum(count_message_tokens(m, estimate=True) for m in g)
+        group_tokens.append(gt)
+    cum = 0
+    cut_group_idx = len(groups)
+    for i in range(len(groups) - 1, -1, -1):
+        cum += group_tokens[i]
+        if cum <= quantized_budget:
+            cut_group_idx = i
+        else:
+            if cum <= quantized_budget + CUT_QUANTUM:
+                cut_group_idx = i
+            break
+    return cut_group_idx
+def _recut_to(messages: list, max_tokens: int) -> int:
+    """Turn-group-aware budget cut targeting max_tokens.
+
+    The immutable prefix is ONLY the system message (index 0) if it exists.
+    Messages 1 and 2 (first user/assistant) are ordinary history.
+    Cuts are quantized to turn group boundaries - never in the middle of a
+    turn group. If the budget boundary falls inside a group, extend to the
+    end of that group (or start of next group, whichever keeps fewer tokens).
+    """
+    # Immutable prefix: only the system message (index 0) if it exists
+    if messages and messages[0].get("role") == "system":
+        seed = [messages[0]]
+        rest = list(messages[1:])
+    else:
+        seed = []
+        rest = list(messages)
+    
+    stub_tok = _note_tok()
+    seed_tok = count_messages_tokens(seed) if seed else 0
     total_tok = count_messages_tokens(messages, estimate=True)
     lu = _newest_user_idx(rest)
-    pinned_copy_tok = count_message_tokens(_make_pinned_copy(rest[lu])) if lu is not None else 0
-    budget = max(500, max_tokens - seed_tok - stub_tok - pinned_copy_tok - 200)
-    tail = []
-    t = 0
-    for m in reversed(rest):
-        mt = count_message_tokens(m, estimate=True)
-        if t + mt > budget and len(tail) > 5:
-            break
-        tail.append(m)
-        t += mt
-    tail.reverse()
-    # Drop only leading orphan 'tool' messages (their assistant is before the cut).
-    while tail and tail[0].get("role") == "tool":
-        tail.pop(0)
-    cut = max(0, len(rest) - len(tail))
-    # F1 post-check: guard against window collapse (never keep <0.5*target when the
-    # history is large). On failure fall back to the plain budget tail.
-    kept_tok = count_messages_tokens(_kept_messages(seed, rest, cut))
+    budget = max(500, max_tokens - seed_tok - stub_tok - 200)
+    
+    # Turn-group-aware cutting
+    groups = _turn_groups(rest)
+    if not groups:
+        return 0
+    
+    cut_group_idx = _safe_cut(groups, budget)
+    
+    # Convert group index to message index within rest
+    cut = 0
+    for i in range(cut_group_idx):
+        cut += len(groups[i])
+    
+    # Post-check: guard against window collapse
+    kept = _kept_messages(seed, rest, cut)
+    kept_tok = count_messages_tokens(kept)
     if kept_tok < 0.5 * max_tokens and total_tok > max_tokens and len(rest) > 0:
         log.error("WINDOW COLLAPSE guard: kept_tok=%d target=%d total_tok=%d cut=%d rest=%d - falling back to plain budget tail",
                   kept_tok, max_tokens, total_tok, cut, len(rest))
         metrics["window_collapse_guard"] += 1
-        ft = []
-        ft_tok = 0
+        # Fallback: newest-first budget walk (old behavior)
+        tail = []
+        t = 0
         for m in reversed(rest):
             mt = count_message_tokens(m, estimate=True)
-            if ft_tok + mt > budget and len(ft) > 5:
+            if t + mt > budget and len(tail) > 5:
                 break
-            ft.append(m)
-            ft_tok += mt
-        ft.reverse()
-        while ft and ft[0].get("role") == "tool":
-            ft.pop(0)
-        cut = max(0, len(rest) - len(ft))
+            tail.append(m)
+            t += mt
+        tail.reverse()
+        while tail and tail[0].get("role") == "tool":
+            tail.pop(0)
+        cut = max(0, len(rest) - len(tail))
+    
     if lu is not None and cut > lu:
-        log.warning("RECUT pin: newest user msg at rest[%d] was past cut=%d - inserting pinned copy (window stays bounded)", lu, cut)
+        log.warning("RECUT: newest user msg at rest[%d] is before cut=%d - _kept_messages will extend cut to include it (live prompt preserved in full)", lu, cut)
         metrics["recut_user_pinned"] += 1
     return cut
-
 def _recut(messages: list) -> int:
     return _recut_to(messages, _trim_target())
 
@@ -2558,9 +3201,9 @@ log.info(
     CTXGATE_INJECT_MAX_TOKENS_CFG,
     CTXGATE_INJECT_MAX_TOKENS_RECAP_CFG,
 )
-if MAX_INPUT + MAX_OUTPUT + SAFETY_MARGIN > MAX_CONTEXT:
-    log.warning("Budget config invalid: MAX_INPUT(%d) + MAX_OUTPUT(%d) + SAFETY_MARGIN(%d) > MAX_CONTEXT(%d)",
-                MAX_INPUT, MAX_OUTPUT, SAFETY_MARGIN, MAX_CONTEXT)
+if MAX_INPUT + SAFETY_MARGIN + MIN_OUTPUT > MAX_CONTEXT:
+    log.warning("Budget config invalid: MAX_INPUT(%d) + SAFETY_MARGIN(%d) + MIN_OUTPUT(%d) > MAX_CONTEXT(%d)",
+                MAX_INPUT, SAFETY_MARGIN, MIN_OUTPUT, MAX_CONTEXT)
 if MIN_OUTPUT > MAX_OUTPUT:
     log.warning("Budget config invalid: MIN_OUTPUT(%d) > MAX_OUTPUT(%d)", MIN_OUTPUT, MAX_OUTPUT)
 
@@ -2577,13 +3220,36 @@ def _protected_indices(work: list) -> set:
     tool_calls declarations). Uses protected_tool_groups as the single source
     of truth for recent tool body protection."""
     protected = set(range(min(3, len(work))))
-    for i in range(3, len(work)):
-        if work[i].get("ctxgate_pinned"):
-            protected.add(i)
-            break
     # Canonical: newest 4 tool groups (replaces old "newest 6" ad-hoc logic)
     protected |= protected_tool_groups(work)
+    # Live prompt (last user message) must NEVER be elided
+    for k in range(len(work) - 1, -1, -1):
+        if work[k].get("role") == "user":
+            protected.add(k)
+            break
     return protected
+
+
+def _eviction_priority(msg: dict, idx: int, total: int) -> int:
+    """Eviction priority: 0=verbose tool, 1=old turn, 2=summary, 3=optional.
+    Returns -1 for never-evict (system prefix, live prompt)."""
+    role = msg.get('role', '')
+    if role == 'system':
+        return -1
+    if role == 'user' and idx == total - 1:
+        return -1
+    if role == 'tool':
+        c = msg.get('content', '')
+        if isinstance(c, str) and len(c) > 2500:
+            return 0
+        return 1
+    if role == 'user':
+        return 1
+    if role == 'assistant':
+        if msg.get('tool_calls'):
+            return 1
+        return 2
+    return 3
 
 
 # --- Canonical helpers (single source of truth, all paths use these) ---
@@ -2722,12 +3388,10 @@ def verify_context_invariants(context: list, original: list, ceiling: int, total
         pinned_exists = False
         for m in context:
             if m.get("role") == "user":
-                if _norm_content(m.get("content"))[:300] == orig_user_content[:300]:
+                if hashlib.sha256(_norm_content(m.get("content")).encode()).hexdigest() == hashlib.sha256(orig_user_content.encode()).hexdigest():
                     found_in_ctx = True
                     break
-            if m.get("ctxgate_pinned"):
-                pinned_exists = True
-        if not found_in_ctx and not pinned_exists:
+        if not found_in_ctx:
             violations.append("newest_user_missing: newest user message not represented in context")
 
     # (3) newest 4 tool bodies byte-identical
@@ -2792,22 +3456,24 @@ def verify_context_invariants(context: list, original: list, ceiling: int, total
 
     return violations
 
-def _elided_tool_content(c: str) -> str:
-    """The exact step-(a) elision body used by _emergency_shrink (1000 head +
-    marker + 1000 tail). Shared so stable elision and emergency shrink produce
-    byte-identical content for the same input."""
-    if "chars elided by ctxgate" in c:
+def _elided_tool_content(c: str, session_key: str = '', event_hash: str = '') -> str:
+    """Deterministic elision: 1000-char head + marker + 1000-char tail.
+    Includes SHA-256 content hash and retrieval handle. Idempotent."""
+    if 'chars elided by ctxgate' in c:
         return c
+    content_hash = hashlib.sha256(c.encode()).hexdigest()[:16]
     elided = len(c) - 2000
-    return c[:1000] + "\n[...%d chars elided by ctxgate...]\n" % elided + c[-1000:]
-
-def _stable_elide_inplace(msgs: list, start: int, end: int) -> None:
-    """Elide in-place every 'tool' message with string content > 2500 chars
-    in msgs[start:end]. Content > 2500 becomes head+tail (~2550 chars, back
-    below the 2500 threshold) so the operation is IDEMPOTENT and deterministic:
-    the same message elides to the same bytes on every call, keeping the sent
-    prefix byte-stable across re-cuts. Never touches non-tool messages; the
-    caller computes start/end so seed/stub/pinned are never elided."""
+    if session_key and event_hash:
+        handle = '/retrieve?session=%s&event=%s' % (session_key, event_hash)
+    else:
+        handle = '/retrieve?event=%s' % content_hash
+    marker = '\n[...%d chars elided by ctxgate | hash=%s | retrieve: %s...]\n' % (elided, content_hash, handle)
+    return c[:1000] + marker + c[-1000:]
+def _stable_elide_inplace(msgs: list, start: int, end: int, session_key: str = '') -> None:
+    """Elide in-place every tool message with string content > 2500 chars
+    in msgs[start:end]. Produces head+tail with content hash and retrieval
+    handle. IDEMPOTENT: same message elides to same bytes every call.
+    Never touches non-tool messages."""
     if start < 0:
         start = 0
     end = min(end, len(msgs))
@@ -2815,12 +3481,12 @@ def _stable_elide_inplace(msgs: list, start: int, end: int) -> None:
         return
     for i in range(start, end):
         m = msgs[i]
-        if m.get("role") != "tool":
+        if m.get('role') != 'tool':
             continue
-        c = m.get("content")
+        c = m.get('content')
         if isinstance(c, str) and len(c) > 2500:
-            m["content"] = _elided_tool_content(c)
-
+            event_hash = _msg_anchor(m)[:16]
+            m['content'] = _elided_tool_content(c, session_key=session_key, event_hash=event_hash)
 def _stable_elide_idx(cut: int, rest: list) -> int:
     """Absolute index into raw 'rest' marking the elidable boundary:
     the index of the 4th-newest tool-result message (or 'cut', whichever is
@@ -2867,7 +3533,8 @@ def _emergency_shrink(kept: list, ceiling: int) -> list:
         c = m.get("content")
         if not isinstance(c, str) or len(c) <= 2500:
             continue
-        new_content = _elided_tool_content(c)
+        event_hash = _msg_anchor(m)[:16]
+        new_content = _elided_tool_content(c, session_key='', event_hash=event_hash)
         old_tok = msg_toks[i]
         work[i]["content"] = new_content
         new_tok = count_message_tokens(work[i])
@@ -2884,7 +3551,9 @@ def _emergency_shrink(kept: list, ceiling: int) -> list:
                 start = i
                 break
         if start is None:
-            break
+            raise ContextCapacityError(
+                'mandatory costs + live prompt exceed ceiling after all eviction',
+                running_total, ceiling)
         end = start
         if work[start].get("role") == "assistant" and work[start].get("tool_calls"):
             j = start + 1
@@ -2980,8 +3649,8 @@ async def _window_cleanup_ttl() -> None:
 
 async def build_context(request_messages: list, task_uuid: str = None, session_key: str = None) -> list:
     sk = session_key or ""
-    global _active_rho
-    _active_rho, _ = calibrator.get_rho(sk)
+    rho, margin = calibrator.get_rho(sk)
+    _rho_var.set(rho)
     _note_n = _note_tok()  # tokens reserved for COMPACTION_NOTE (added after build_context)
     async with _window_lock(sk):
         ws = session_compactions.get(sk)
@@ -2993,72 +3662,78 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
                 session_compactions[sk] = ws
                 metrics["window_loads_db"] += 1
         raw = request_messages
-        seed_raw = list(raw[:3])
-        rest_raw = raw[3:]
+        if raw and raw[0].get("role") == "system":
+            seed_raw = [raw[0]]
+            rest_raw = raw[1:]
+        else:
+            seed_raw = []
+            rest_raw = list(raw)
         # FAST PATH: valid sticky cut -> O(kept) only; never tokenizes the dropped region.
         if ws and _window_valid(ws, seed_raw, rest_raw) and ws["cut"] < len(rest_raw):
-            combined = _prep_messages(seed_raw + rest_raw[ws["cut"]:])
-            kept = list(combined)
-            # Insert the deterministic pinned newest-user copy when it lies before the
-            # cut (same as _kept_messages) so the prefix stays byte-stable between turns.
+            # If the live prompt (newest user msg) is before the cut, extend
+            # the effective cut to include it at its natural position.
             lu = _newest_user_idx(rest_raw)
-            if lu is not None and lu < ws["cut"]:
-                kept.insert(3, _make_pinned_copy(rest_raw[lu], distance=ws["cut"] - lu))
+            eff_cut = ws["cut"]
+            if lu is not None and lu < eff_cut:
+                eff_cut = lu
+            combined = _prep_messages(seed_raw + rest_raw[eff_cut:])
+            kept = list(combined)
             if STABLE_ELIDE:
                 if ws.get("elide_idx") is None:
-                    ws["elide_idx"] = _stable_elide_idx(ws["cut"], rest_raw)
-                # Deterministically elide the [cut, elide_idx) tool bodies so
+                    ws["elide_idx"] = _stable_elide_idx(eff_cut, rest_raw)
+                # Deterministically elide the [eff_cut, elide_idx) tool bodies so
                 # the kept window is byte-stable between requests.
-                # kept = seed(3) + [pinned(1)] + rest[cut:]
-                # so rest[cut] starts at kept[3+has_pin].
-                has_pin = 1 if (lu is not None and lu < ws["cut"]) else 0
-                base = 3 + has_pin
-                # rest[cut:elide_idx] maps to kept[base : base+(elide_idx-cut)]
-                _stable_elide_inplace(kept, base, base + (ws["elide_idx"] - ws["cut"]))
+                # kept = seed + rest[eff_cut:]
+                # rest[eff_cut] starts at kept[len(seed)]
+                base = len(seed_raw)
+                _stable_elide_inplace(kept, base, base + (ws["elide_idx"] - eff_cut))
             kept_tok = count_messages_tokens(kept)
             ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT) - _note_n
+            trigger = _eviction_trigger()
             if kept_tok > ceiling:
-                # Sticky window exceeded the hard ceiling: bail out of the fast
-                # path and let the slow path re-cut to _trim_target(), update
-                # session_compactions, and kick the summarizer. The old code
-                # called _emergency_shrink here, dropping the oldest groups on
-                # every request while ws["cut"] stayed fixed — the first kept
-                # message changed each turn, killing the vLLM prefix cache.
-                log.info("sticky window over ceiling %d > %d: re-cutting", kept_tok, ceiling)
+                # Hard ceiling exceeded: must re-cut (capacity risk).
+                log.info('sticky window over hard ceiling %d > %d: re-cutting', kept_tok, ceiling)
+            elif kept_tok > trigger:
+                # High watermark crossed: hysteresis re-cut to target.
+                log.info('sticky window over trigger %d > %d: hysteresis re-cut to target %d',
+                         kept_tok, trigger, _trim_target())
             elif kept_tok <= MAX_INPUT - _note_n:
                 metrics["trim_sticky_reuse"] += 1
                 log.info("Context sticky-reuse: session=%s cut=%d kept_tokens=%d skipped=%d", sk, ws["cut"], kept_tok, ws["cut"])
-                # Verify context invariants (diagnostic + metrics)
+                # Verify context invariants - HARD GATE on Goose path
                 _viols = verify_context_invariants(kept, raw, ceiling, kept_tok)
                 if _viols:
-                    _seed_fixable = []
-                    _other_viols = []
+                    _fatal_viols = []
                     for _v in _viols:
-                        if _v.startswith("tool_body"):
-                            metrics["recent_tool_preservation_failures"] += 1
-                        elif _v.startswith("newest_user") or _v.startswith("pinned"):
+                        if _v.startswith("newest_user") or _v.startswith("pinned"):
                             metrics["pinned_user_preservation_failures"] += 1
-                        if _v.startswith("missing_tool_result"):
-                            _mi = re.search(r"ctx\[(\d+)\]", _v)
-                            if _mi and int(_mi.group(1)) < 3:
-                                _seed_fixable.append(_v)
-                                continue
-                        _other_viols.append(_v)
-                    if _other_viols:
-                        log.warning("Context invariant violations (fast path): %s", _other_viols[:3])
-                    if _seed_fixable:
-                        log.debug("Context invariant violations (fast path, seed-repairable): %s", _seed_fixable)
+                            _fatal_viols.append(_v)
+                        elif _v.startswith("orphan_tool") or _v.startswith("missing_tool_result"):
+                            metrics["recent_tool_preservation_failures"] += 1
+                            _fatal_viols.append(_v)
+                        elif _v.startswith("tool_body"):
+                            metrics["recent_tool_preservation_failures"] += 1
+                    if _fatal_viols:
+                        log.error("Context invariant HARD GATE (fast path): %s", _fatal_viols[:3])
+                        raise ContextCapacityError(
+                            f"context invariant violation in fast path: {_fatal_viols[0]}",
+                            kept_tok, ceiling)
                 if task_uuid and ws["summarized_through"] < ws.get("dropped_total", ws["cut"]) and not ws.get("in_flight", False):
                     la = _summary_last_attempt.get(task_uuid)
                     if la is None or (time.time() - la[0]) > 120:
                         ws["pending_cut"] = ws["cut"]
                         ws["in_flight"] = True
                         _spawn(_summarize_trimmed_messages(task_uuid, sk, rest_raw, pending_cut=ws["cut"]))
+                kept = _inject_ledger_into_context(kept, task_uuid, sk, "")
                 return kept
         # SLOW PATH: no valid state (or kept over limit) -> full count + re-cut.
         messages = _prep_messages(raw)
-        seed = list(messages[:3])
-        rest = messages[3:]
+        if messages and messages[0].get("role") == "system":
+            seed = [messages[0]]
+            rest = messages[1:]
+        else:
+            seed = []
+            rest = list(messages)
         total = count_messages_tokens(messages)
         log.info("Context: %d messages, %d tokens (limit %d)", len(messages), total, MAX_INPUT)
         if total <= MAX_INPUT - _note_n:
@@ -3096,11 +3771,8 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
         new_ws["elide_idx"] = elide_idx
         if STABLE_ELIDE:
             # Elide the [cut, elide_idx) tool bodies in the freshly built kept
-            # window. kept = seed(3) + [pinned(1)] + rest[cut:]
-            lu2 = _newest_user_idx(rest)
-            has_pin2 = 1 if (lu2 is not None and cut > lu2) else 0
-            base2 = 3 + has_pin2
-            # rest[cut:elide_idx] maps to kept[base2 : base2+(elide_idx-cut)]
+            # window. kept = seed + rest[cut:]
+            base2 = len(seed)
             _stable_elide_inplace(kept, base2, base2 + (elide_idx - cut))
         kept_tok = count_messages_tokens(kept)
         ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT) - _note_n
@@ -3113,26 +3785,24 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
             kept_tok = count_messages_tokens(kept)
         if kept_tok > ceiling:
             log.error("EMERGENCY SHRINK failed to meet ceiling: kept_tok=%d ceiling=%d (pathological single huge message)", kept_tok, ceiling)
-        # Verify context invariants (diagnostic + metrics)
+        # Verify context invariants - HARD GATE on Goose path
         _viols = verify_context_invariants(kept, raw, ceiling, kept_tok)
         if _viols:
-            _seed_fixable = []
-            _other_viols = []
+            _fatal_viols = []
             for _v in _viols:
-                if _v.startswith("tool_body"):
-                    metrics["recent_tool_preservation_failures"] += 1
-                elif _v.startswith("newest_user") or _v.startswith("pinned"):
+                if _v.startswith("newest_user") or _v.startswith("pinned"):
                     metrics["pinned_user_preservation_failures"] += 1
-                if _v.startswith("missing_tool_result"):
-                    _mi = re.search(r"ctx\[(\d+)\]", _v)
-                    if _mi and int(_mi.group(1)) < 3:
-                        _seed_fixable.append(_v)
-                        continue
-                _other_viols.append(_v)
-            if _other_viols:
-                log.warning("Context invariant violations (slow path): %s", _other_viols[:3])
-            if _seed_fixable:
-                log.debug("Context invariant violations (slow path, seed-repairable): %s", _seed_fixable)
+                    _fatal_viols.append(_v)
+                elif _v.startswith("orphan_tool") or _v.startswith("missing_tool_result"):
+                    metrics["recent_tool_preservation_failures"] += 1
+                    _fatal_viols.append(_v)
+                elif _v.startswith("tool_body"):
+                    metrics["recent_tool_preservation_failures"] += 1
+            if _fatal_viols:
+                log.error("Context invariant HARD GATE (slow path): %s", _fatal_viols[:3])
+                raise ContextCapacityError(
+                    f"context invariant violation in slow path: {_fatal_viols[0]}",
+                    kept_tok, ceiling)
         headroom = ceiling - kept_tok
         log.info("Context over limit: %d > %d, re-cut to low-watermark %d (%.0f%%)", total, MAX_INPUT, target, 100.0 * target / MAX_INPUT)
         log.info("After trim: %d msgs, %d tokens (headroom %d ceiling %d)", len(kept), kept_tok, headroom, ceiling)
@@ -3143,6 +3813,7 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
             new_ws["pending_cut"] = cut
             new_ws["in_flight"] = True
             _spawn(_summarize_trimmed_messages(task_uuid, sk, rest, pending_cut=cut))
+        kept = _inject_ledger_into_context(kept, task_uuid, sk, "")
         return kept
 def _track_session_tokens(session_key: str, input_tokens: int, output_tokens: int = 0, count_req: bool = True):
     """Update per-session token counters. count_req=False for output-only updates."""
@@ -3697,6 +4368,40 @@ def _fd_breakdown() -> dict:
         _limit = -1
     return {"total": total, "limit": _limit, "by_type": by_type, "tcp_states": tcp_states, "close_wait": close_wait}
 
+@app.get("/retrieve")
+async def retrieve_archived(
+    session: str = "",
+    event: str = "",
+    start: int = 0,
+    end: int = None,
+    tenant: str = "",
+):
+    """Retrieve archived tool body content by session + event_hash + range.
+    
+    Tenant-scoped: requires tenant parameter matching the session's tenant.
+    """
+    if not session or not event:
+        return {"error": "session and event parameters required"}
+    
+    # Resolve tenant from session if not provided
+    if not tenant:
+        tenant = _session_tenant.get(session, "")
+    if not tenant:
+        return {"error": "tenant not resolved for session"}
+    
+    content = await _retrieve_archived_content(tenant, session, event, start, end)
+    if not content:
+        return {"error": "no archived content found", "session": session, "event": event}
+    
+    return {
+        "session": session,
+        "event": event,
+        "start": start,
+        "end": end if end else "all",
+        "chars": len(content),
+        "content": content,
+    }
+
 @app.get("/health")
 async def health():
     import os as _os
@@ -3973,6 +4678,8 @@ async def chat_completions(request: Request):
         if not messages:
             metrics["requests_error"] += 1
             return JSONResponse({"error": "No messages provided"}, status_code=400)
+        # Capture live prompt identity BEFORE any modification (out-of-band only)
+        _live_prompt_hash = _live_prompt_identity(messages)
 
         # Phase 2: cap messages and tools array sizes
 
@@ -4045,8 +4752,8 @@ async def chat_completions(request: Request):
             _log_label = "FALLBACK"
 
         session_key = f"goose:{_goose_meta['id']}"
-        global _active_rho
-        _active_rho, _ = calibrator.get_rho(session_key)
+        rho, margin = calibrator.get_rho(session_key)
+        _rho_var.set(rho)
         task_uuid = _goose_meta["uuid"]
         x_sid = _goose_meta["id"]
         log.info("%s sid=%s session_key=%s task=%s cap=%s",
@@ -4265,10 +4972,11 @@ async def chat_completions(request: Request):
 
 
         # Token tracking
+        _note_n = _note_tok()  # compaction note token cost
         _t0 = time.monotonic()
         _sensitive_input_lo = MAX_CONTEXT - SAFETY_MARGIN - MAX_OUTPUT - int(0.1 * MAX_OUTPUT)
         _sensitive_input_hi = MAX_CONTEXT - SAFETY_MARGIN - MAX_OUTPUT + int(0.1 * MAX_OUTPUT)
-        input_tokens = count_messages_tokens(built) + count_tools_tokens(body.get("tools", []))
+        input_tokens = estimate_full_payload_tokens(built, body.get("tools", []), _note_n, session_key)
         _dt = (time.monotonic() - _t0) * 1000
         if _dt > 50:
             log.warning("SLOW: count_messages_tokens %.0fms (tokens=%d)", _dt, input_tokens)
@@ -4310,7 +5018,7 @@ async def chat_completions(request: Request):
                               MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
                 if input_tokens > ceiling:
                     built = _emergency_shrink(built, ceiling)
-                    input_tokens = count_messages_tokens(built) + count_tools_tokens(body.get("tools", []))
+                    input_tokens = estimate_full_payload_tokens(built, body.get("tools", []), _note_n, session_key)
                     max_tokens = _output_budget(input_tokens)
             if max_tokens < MIN_OUTPUT:
                 log.error(
@@ -4324,6 +5032,18 @@ async def chat_completions(request: Request):
                      "max_tokens": max_tokens,
                      "min_output": MIN_OUTPUT}},
                     status_code=413)
+        # Capacity check: if the live prompt + mandatory costs cannot fit,
+        # return a structured capacity error. Never silently trim the live prompt.
+        _cap_ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
+        if input_tokens > _cap_ceiling:
+            metrics["requests_error"] += 1
+            log.error("Capacity exceeded: session=%s input=%d ceiling=%d", session_key, input_tokens, _cap_ceiling)
+            return JSONResponse(
+                {"error": {"type": "capacity_exceeded",
+                 "message": f"Live prompt + mandatory context ({input_tokens} tokens) exceeds input budget ({_cap_ceiling} tokens). Reduce prompt size or increase CTXGATE_MAX_CONTEXT.",
+                 "input_tokens": input_tokens,
+                 "ceiling": _cap_ceiling}},
+                status_code=413)
         if input_tokens > 0.9 * MAX_INPUT:
             log.info("Budget: session=%s input=%d ceiling=%d max_tokens=%d", session_key, input_tokens, min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT), max_tokens)
         stream = body.get("stream", False)
@@ -4386,10 +5106,10 @@ async def chat_completions(request: Request):
             # continuation, seam dedup, ctxgate_meta).
             if stream:
                 result = await stream_to_vllm(
-                    vllm_body, input_tokens, session_key)
+                    vllm_body, input_tokens, session_key, _live_prompt_hash)
             else:
                 result = await forward_to_vllm(
-                    vllm_body, input_tokens, session_key)
+                    vllm_body, input_tokens, session_key, _live_prompt_hash)
         _dt = (time.monotonic() - _t0) * 1000
         if _dt > 50:
             log.warning("SLOW: vllm_call %.0fms (in=%d stream=%s)", _dt, input_tokens, stream)
@@ -4667,7 +5387,7 @@ async def forward_to_vllm_passthrough(vllm_body: dict,
             status_code=500)
 
 
-async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
+async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, live_prompt_hash: str = ""):
     global metrics
     try:
         client = _vllm_client
@@ -4688,6 +5408,16 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             return JSONResponse({"error": {"message": "Output budget exhausted", "explanation": explain_status("budget")}}, status_code=413)
         vllm_body["max_tokens"] = max_tokens
         metrics["output_max_tokens_seen"] = max(metrics["output_max_tokens_seen"], max_tokens)
+        # Phase 08: Unified validation before sending
+        vllm_body["messages"] = _strip_proxy_metadata(vllm_body.get("messages", []))
+        _vok, _verr = _validate_outgoing_payload(vllm_body, live_prompt_hash)
+        if not _vok:
+            metrics["requests_error"] += 1
+            log.error("Outgoing payload validation failed: %s (session=%s)", _verr, session_key)
+            return JSONResponse(
+                {"error": {"type": _verr,
+                 "message": f"Outgoing payload validation failed: {_verr}"}},
+                status_code=400)
         while True:
             _attempts += 1
             _t0 = time.monotonic()
@@ -4703,25 +5433,42 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
             break
         if resp.status_code != 200:
             _et = resp.text.lower()
-            _is_ctx400 = resp.status_code == 400 and any(
-                p in _et for p in ("context", "max_tokens", "max_completion_tokens", "maximum", "greater than"))
-            if _is_ctx400:
-                log.warning("vLLM 400 (context/max_tokens) - re-shrinking and retrying: %s", resp.text[:200])
+            _is_ctx_err = _is_context_length_error(resp.status_code, resp.text)
+            if _is_ctx_err:
+                # Phase 08: ONE forced whole-group recut, then fail
+                log.warning("vLLM context-length error - ONE recut retry: %s", resp.text[:200])
                 calibrator.bump_margin(session_key)
-                reduced_limit = int(input_tokens * 0.8)
-                vllm_body["messages"] = _emergency_shrink(vllm_body["messages"], reduced_limit)
-                new_input_tokens = count_messages_tokens(vllm_body["messages"]) + count_tools_tokens(vllm_body.get("tools", []))
+                target = _trim_target()
+                _recut_to(vllm_body["messages"], target)
+                new_input_tokens = estimate_full_payload_tokens(vllm_body["messages"], vllm_body.get("tools", []), _note_n, session_key)
                 _budget = _output_budget(new_input_tokens)
                 max_tokens = min(_budget, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT)
                 vllm_body["max_tokens"] = max_tokens
                 input_tokens = new_input_tokens
+                # Phase 08: validate the recut payload before retrying
+                _vok, _verr = _validate_outgoing_payload(vllm_body, live_prompt_hash)
+                if not _vok:
+                    metrics["requests_error"] += 1
+                    log.error("Recut payload validation failed: %s (session=%s)", _verr, session_key)
+                    _record_call(session_key, input_tokens, 0, f"recut_validation_failed:{_verr}", VLLM_MODEL, False, _verr)
+                    return JSONResponse(
+                        {"error": {"type": _verr,
+                         "message": f"Payload validation failed after recut: {_verr}"}},
+                        status_code=400)
                 resp = await client.post(VLLM_URL + "/chat/completions", json=vllm_body)
                 if resp.status_code != 200:
                     metrics["requests_error"] += 1
-                    log.error("vLLM retry also failed %d: %s", resp.status_code, resp.text[:500])
+                    log.error("vLLM recut retry also failed %d: %s", resp.status_code, resp.text[:500])
                     _record_call(session_key, input_tokens, 0, f"vllm_{resp.status_code}", VLLM_MODEL, False, resp.text[:300])
+                    if _is_context_length_error(resp.status_code, resp.text):
+                        return JSONResponse(
+                            {"error": {"type": "context_length_exceeded",
+                             "message": "Context length exceeded even after one recut retry. Reduce prompt size.",
+                             "input_tokens": input_tokens}},
+                            status_code=400)
                     return JSONResponse({"error": {"message": "vLLM " + str(resp.status_code), "explanation": explain_status(f"vllm_{resp.status_code}", resp.text[:300])}}, status_code=resp.status_code)
             else:
+                # Phase 08: non-context errors (401, 403, 429, 500, 503, non-context 400) pass through
                 metrics["requests_error"] += 1
                 log.error("vLLM error %d: %s", resp.status_code, resp.text[:500])
                 _record_call(session_key, input_tokens, 0, f"vllm_{resp.status_code}", VLLM_MODEL, False, resp.text[:300])
@@ -5098,8 +5845,18 @@ async def stream_to_vllm_passthrough(vllm_body: dict,
                              media_type="text/event-stream")
 
 
-async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
+async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, live_prompt_hash: str = ""):
     global metrics
+    # Phase 08: Unified validation before sending
+    vllm_body["messages"] = _strip_proxy_metadata(vllm_body.get("messages", []))
+    _vok, _verr = _validate_outgoing_payload(vllm_body, live_prompt_hash)
+    if not _vok:
+        metrics["requests_error"] += 1
+        log.error("Outgoing payload validation failed (stream): %s (session=%s)", _verr, session_key)
+        async def _err_gen():
+            yield "data: " + json.dumps({"error": {"type": _verr, "message": f"Outgoing payload validation failed: {_verr}"}}) + chr(10)*2
+            yield "data: [DONE]" + chr(10)*2
+        return StreamingResponse(_err_gen(), media_type="text/event-stream")
     async def generate():
         global metrics
         nonlocal input_tokens
@@ -5135,6 +5892,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
         tc_buffer: list = []  # buffered tool-call chunks (flushed after safety check)
         loop_intentional = False
         shrink_retried = False
+        _bytes_sent = False  # Phase 08: set True after first SSE data chunk sent to client
 
         def _seam_resolve() -> str:
             nonlocal seam_hold, seam_active
@@ -5231,14 +5989,15 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                     async with client.stream("POST", VLLM_URL + "/chat/completions", json=current_body) as resp:
                         if resp.status_code != 200:
                             body_bytes = await resp.aread()
-                            _et = body_bytes[:500].decode("utf-8", errors="replace").lower()
-                            if (resp.status_code == 400 and not shrink_retried
-                                    and any(p in _et for p in ("context", "max_tokens", "max_completion_tokens", "maximum", "greater than"))):
+                            _et = body_bytes[:500].decode("utf-8", errors="replace")
+                            _is_ctx_err = _is_context_length_error(resp.status_code, _et)
+                            if _is_ctx_err and not shrink_retried and not _bytes_sent:
+                                # Phase 08: ONE recut retry, only if no bytes sent to client
                                 shrink_retried = True
-                                log.warning("Stream 400 (context/max_tokens) - re-shrinking and retrying: %s", _et[:200])
+                                log.warning("Stream context-length error - ONE recut retry (no bytes sent): %s", _et[:200])
                                 calibrator.bump_margin(session_key)
                                 try:
-                                    current_body["messages"] = _emergency_shrink(current_body["messages"], int(input_tokens * 0.8))
+                                    _recut_to(current_body["messages"], _trim_target())
                                 except ContextCapacityError as cce:
                                     for x in _flush_seam():
                                         yield x
@@ -5247,17 +6006,38 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                     metrics["requests_error"] += 1
                                     _record_call(session_key, input_tokens, total_output_tokens, "context_capacity", VLLM_MODEL, True, str(cce)[:200])
                                     return
-                                input_tokens = count_messages_tokens(current_body["messages"]) + count_tools_tokens(current_body.get("tools", []))
+                                input_tokens = estimate_full_payload_tokens(current_body["messages"], current_body.get("tools", []), _note_n, session_key)
                                 _b2 = _output_budget(input_tokens)
                                 current_body["max_tokens"] = min(_b2, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens)
+                                # Phase 08: validate recut payload
+                                _vok, _verr = _validate_outgoing_payload(current_body, live_prompt_hash)
+                                if not _vok:
+                                    metrics["requests_error"] += 1
+                                    log.error("Stream recut validation failed: %s (session=%s)", _verr, session_key)
+                                    _record_call(session_key, input_tokens, total_output_tokens, f"recut_validation_failed:{_verr}", VLLM_MODEL, True, _verr)
+                                    yield "data: " + json.dumps({"error": {"type": _verr, "message": f"Recut validation failed: {_verr}"}})  + chr(10)*2
+                                    yield "data: [DONE]" + chr(10)*2
+                                    return
                                 continue
-                            metrics["requests_error"] += 1
-                            _record_call(session_key, input_tokens, total_output_tokens, "vllm_" + str(resp.status_code), VLLM_MODEL, True, body_bytes[:300].decode("utf-8", errors="replace"))
-                            for x in _flush_seam():
-                                yield x
-                            yield "data: " + json.dumps({"error": body_bytes[:200].decode("utf-8", errors="replace")}) + "\n\n"
-                            yield "data: [DONE]\n\n"
-                            return
+                            elif _is_ctx_err and _bytes_sent:
+                                # Phase 08: bytes already sent - cannot recut, emit error event
+                                log.warning("Stream context-length error AFTER bytes sent - emitting SSE error (no recut): %s", _et[:200])
+                                metrics["requests_error"] += 1
+                                _record_call(session_key, input_tokens, total_output_tokens, "context_length_exceeded_mid_stream", VLLM_MODEL, True, _et[:200])
+                                for x in _flush_seam():
+                                    yield x
+                                yield "data: " + json.dumps({"error": {"type": "context_length_exceeded", "message": "Context length exceeded mid-stream. No retry possible after bytes sent."}})  + chr(10)*2
+                                yield "data: [DONE]" + chr(10)*2
+                                return
+                            else:
+                                # Non-context errors: pass through
+                                metrics["requests_error"] += 1
+                                _record_call(session_key, input_tokens, total_output_tokens, "vllm_" + str(resp.status_code), VLLM_MODEL, True, body_bytes[:300].decode("utf-8", errors="replace"))
+                                for x in _flush_seam():
+                                    yield x
+                                yield "data: " + json.dumps({"error": body_bytes[:200].decode("utf-8", errors="replace")})  + chr(10)*2
+                                yield "data: [DONE]" + chr(10)*2
+                                return
                         async for line in _lines_with_heartbeat(resp, SSE_HEARTBEAT_INTERVAL):
                             if line is None:
                                 yield ": hb\n\n"
@@ -5296,6 +6076,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                 tool_calls_piece = delta.get("tool_calls")
                                 if reasoning_piece:
                                     rc = {"id": stream_id, "object": "chat.completion.chunk", "created": chunk.get("created", 0), "model": VLLM_MODEL, "choices": [{"index": 0, "delta": {"reasoning_content": reasoning_piece}, "finish_reason": None}]}
+                                    _bytes_sent = True
                                     yield "data: " + json.dumps(rc) + "\n\n"
                                     reasoning_chars += len(reasoning_piece)
                                     reasoning_full += reasoning_piece
@@ -5319,6 +6100,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                         full_content += out
                                         content_tail = (content_tail + out)[-LOOP_TAIL:]
                                         loop_check_acc += len(out)
+                                        _bytes_sent = True
                                         yield _sse_content(out, stream_id)
                                 if loop_check_acc >= LOOP_CHECK_EVERY:
                                     loop_check_acc = 0
@@ -5591,7 +6373,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                         metrics["requests_error"] += 1
                                         _record_call(session_key, input_tokens, total_output_tokens, "context_capacity", VLLM_MODEL, True, str(cce)[:200])
                                         return
-                                    input_tokens = count_messages_tokens(current_body["messages"]) + count_tools_tokens(current_body.get("tools", []))
+                                    input_tokens = estimate_full_payload_tokens(current_body["messages"], current_body.get("tools", []), _note_n, session_key)
                                     _b3 = _output_budget(input_tokens)
                                     current_body["max_tokens"] = min(_b3, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens)
                                     continue
@@ -6686,6 +7468,27 @@ def _check_config():
         sys.exit(78)
     print("\n  OK: configuration valid")
     sys.exit(0)
+
+
+@app.get("/tokenize")
+async def tokenize_endpoint(request: Request):
+    """Diagnostic: tokenize text using the active estimator mode.
+    NOT safe for admission. Debugging/calibration only.
+    """
+    text = request.query_params.get("text", "")
+    model = request.query_params.get("model", VLLM_MODEL)
+    if not text:
+        return JSONResponse({"error": "text parameter required"}, status_code=400)
+    if len(text) > 100000:
+        return JSONResponse({"error": "text too long (max 100000 chars)"}, status_code=413)
+    tokens = count_tokens(text)
+    return {
+        "text_length": len(text),
+        "estimated_tokens": tokens,
+        "mode": ESTIMATOR_MODE,
+        "rho": _rho_var.get(),
+        "warning": "Proxy-side estimate only. Not vLLM actual tokenization. Not safe for admission."
+    }
 
 if __name__ == "__main__":
     import socket as _sock

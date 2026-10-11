@@ -193,76 +193,35 @@ def test_recut_normal_history_min_tail_5():
 # FIX 3: Distance-aware pinned copy cap
 # ---------------------------------------------------------------------------
 def test_pinned_copy_far_distance():
-    """When the pinned user message is >50 positions before the cut,
-    the cap should be PINNED_USER_FAR_CHARS (2000) not 16000."""
-    # Create a long user message (10000 chars)
-    long_content = "x" * 10000
-
-    # Far distance (57 > 50 threshold)
-    copy_far = app._make_pinned_copy({"role": "user", "content": long_content}, distance=57)
-    far_len = len(copy_far["content"])
-    check("fix3: far distance (57) uses reduced cap",
-          far_len <= app.PINNED_USER_FAR_CHARS + 20,  # +20 for truncation marker
-          "len=%d far_cap=%d" % (far_len, app.PINNED_USER_FAR_CHARS))
-
-    # Near distance (10 <= 50 threshold)
-    copy_near = app._make_pinned_copy({"role": "user", "content": long_content}, distance=10)
-    near_len = len(copy_near["content"])
-    check("fix3: near distance (10) uses full cap",
-          near_len <= app.PINNED_USER_MAX_CHARS + 20,
-          "len=%d max_cap=%d" % (near_len, app.PINNED_USER_MAX_CHARS))
-
-    # At exactly the threshold (50) should use full cap
-    copy_at = app._make_pinned_copy({"role": "user", "content": long_content}, distance=50)
-    at_len = len(copy_at["content"])
-    check("fix3: at threshold (50) uses full cap (not >50)",
-          at_len <= app.PINNED_USER_MAX_CHARS + 20,
-          "len=%d" % at_len)
-
-    # Just past threshold (51) should use reduced cap
-    copy_just = app._make_pinned_copy({"role": "user", "content": long_content}, distance=51)
-    just_len = len(copy_just["content"])
-    check("fix3: just past threshold (51) uses reduced cap",
-          just_len <= app.PINNED_USER_FAR_CHARS + 20,
-          "len=%d" % just_len)
-
-    # Short message (under both caps) should be unchanged
-    short_content = "hello world"
-    copy_short = app._make_pinned_copy({"role": "user", "content": short_content}, distance=100)
-    check("fix3: short message unchanged regardless of distance",
-          copy_short["content"] == short_content,
-          "content=%s" % copy_short["content"])
-
+    """Live prompt is preserved in full - no truncation, no pinned copy."""
+    long_content = "x" * 20000
+    msgs = [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "old"},
+        {"role": "assistant", "content": "resp"},
+        {"role": "user", "content": long_content},
+    ]
+    seed = [msgs[0]]
+    rest = msgs[1:]
+    kept = app._kept_messages(seed, rest, 2)
+    last_user = [m for m in kept if m.get("role") == "user"][-1]
+    check("live prompt preserved in full", len(last_user["content"]) == len(long_content))
+    check("no ctxgate_pinned marker", "ctxgate_pinned" not in last_user)
 
 def test_pinned_user_copy_passes_distance():
-    """_pinned_user_copy should pass (cut - lu) as distance."""
+    """_kept_messages extends cut to include the live prompt at its natural position."""
     rest = [
-        {"role": "user", "content": "y" * 5000},  # index 0
+        {"role": "user", "content": "q1"},
         {"role": "assistant", "content": "a1"},
-        {"role": "user", "content": "z" * 5000},  # index 2 = newest user
+        {"role": "user", "content": "q2"},
         {"role": "assistant", "content": "a2"},
-        {"role": "tool", "content": "t1", "tool_call_id": "tc1"},
-        {"role": "assistant", "content": "a3"},
+        {"role": "user", "content": "live prompt"},
     ]
-    cut = 5  # newest user at idx 2, distance = 5 - 2 = 3
-    result = app._pinned_user_copy(rest, cut)
-    check("fix3: _pinned_user_copy returns non-None when user before cut",
-          result is not None)
-    if result:
-        # distance=3 <= 50, so full cap applies; 5000 chars < 16000 so no truncation
-        check("fix3: near-distance copy not truncated",
-              len(result["content"]) == 5000,
-              "len=%d" % len(result["content"]))
-
-    # Far: user at idx 0, cut at 60 -> distance=60 > 50
-    rest_far = [
-        {"role": "user", "content": "y" * 5000},  # index 0
-    ] + [{"role": "assistant", "content": "a%d" % i} for i in range(59)]
-    result_far = app._pinned_user_copy(rest_far, 60)
-    check("fix3: far-distance copy is truncated",
-          result_far is not None and len(result_far["content"]) <= app.PINNED_USER_FAR_CHARS + 20,
-          "len=%s" % (len(result_far["content"]) if result_far else "None"))
-
+    seed = [{"role": "system", "content": "SYS"}]
+    # cut=3 would normally exclude the live prompt at index 4
+    kept = app._kept_messages(seed, rest, 3)
+    last_user = [m for m in kept if m.get("role") == "user"][-1]
+    check("live prompt included despite cut", last_user["content"] == "live prompt")
 
 def main():
     print("=" * 60)

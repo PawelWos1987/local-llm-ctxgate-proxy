@@ -35,7 +35,7 @@ def _count_messages_tokens(ms):
 def _load():
     names = ["_emergency_shrink", "_protected_indices", "protected_tool_groups",
              "_elided_tool_content", "_norm_content", "_msg_anchor", "_newest_user_idx",
-             "_make_pinned_copy", "_pinned_user_copy", "_recut_to", "_recut", "_trim_target"]
+             "_recut_to", "_recut", "_trim_target"]
     mod_src = _extract(names)
     ns = {}
     ns.update(
@@ -44,7 +44,7 @@ def _load():
         _trim_target=lambda: 40600,
         MAX_CONTEXT=84000, MAX_INPUT=58000, MAX_OUTPUT=22500,
         SAFETY_MARGIN=3500, MIN_OUTPUT=16000,
-        PINNED_USER_MAX_CHARS=16000,
+        
         TRIM_TARGET_TOKENS=0, TRIM_TARGET_FRACTION=0.70,
         TRIM_TARGET_FLOOR=20000,
         metrics=collections.defaultdict(int),

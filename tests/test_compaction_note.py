@@ -8,15 +8,15 @@ SRC = open(APP, encoding="utf-8").read()
 TREE = ast.parse(SRC)
 
 FUNCS = {"_note_tok", "_with_compaction_note", "_norm_content", "_normalize_system_messages",
-         "_kept_messages", "_pinned_user_copy", "_newest_user_idx", "_make_pinned_copy",
+         "_kept_messages", "_newest_user_idx",
          "_protected_indices"}
 CONSTS = {"COMPACTION_NOTE", "_NOTE_TOK_CACHE"}
 
 
 def load():
     ns = {"os": os, "hashlib": hashlib,
-          "PINNED_USER_MAX_CHARS": 4000, "PINNED_USER_FAR_CHARS": 1000,
-          "PINNED_USER_FAR_THRESHOLD": 10,
+          
+          
           "count_tokens": lambda t: len(t) // 4,
           "protected_tool_groups": lambda w: set()}
     code = ""
@@ -62,15 +62,18 @@ def test_no_system_message_after_seed_in_kept_window():
         assert all(m["role"] != "system" for m in kept[1:]), cut
 
 
-def test_pinned_copy_sits_at_index_3():
+def test_live_prompt_at_natural_position():
+    """The live prompt appears at its natural position, not at index 3.
+    No pinned copy is created."""
     ns = load()
     seed, rest = session()
     newest_user = ns["_newest_user_idx"](rest)
     kept = ns["_kept_messages"](seed, rest, newest_user + 1)
-    assert kept[3].get("ctxgate_pinned") is True
-    kept2 = ns["_kept_messages"](seed, rest, 5)
-    assert not kept2[3].get("ctxgate_pinned")
-    assert kept2[3] == rest[5]
+    # No ctxgate_pinned marker anywhere
+    assert all(not m.get("ctxgate_pinned") for m in kept)
+    # The live prompt (last user msg) is present in full
+    last_user = [m for m in kept if m.get("role") == "user"][-1]
+    assert last_user == rest[newest_user]
 
 
 def test_helper_idempotent_and_non_mutating():
@@ -122,9 +125,8 @@ def test_note_applied_once_in_handler_and_never_in_build_context():
             assert "_with_compaction_note" not in ast.get_source_segment(SRC, n), n.name
     a = SRC.index("built = _repair_dangling_tool_calls(built)")
     b = SRC.index("built = _with_compaction_note(built)")
-    c = SRC.index("fp = hashlib.sha256(_prefix_raw(built)")
     d = SRC.index("_prefix_diag(session_key, vllm_body.get(")
-    assert a < b < c < d
+    assert a < b < d
 
 
 if __name__ == "__main__":

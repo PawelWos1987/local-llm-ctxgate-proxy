@@ -31,13 +31,13 @@ def _cmts(ms): return sum(_cmt(m) for m in ms)
 def _load():
     names=["_recut_to","_recut","_msg_anchor","_seed_sig","_norm_content",
            "_new_window_state","_window_valid","_kept_messages","_prep_messages",
-           "_newest_user_idx","_make_pinned_copy","_pinned_user_copy","_trim_target",
+           "_newest_user_idx","_trim_target",
            "_emergency_shrink","_protected_indices","_output_budget","_note_tok","_with_compaction_note"]
     ns=dict(count_message_tokens=_cmt,count_messages_tokens=_cmts,
             MAX_CONTEXT=MAX_CONTEXT,MAX_INPUT=MAX_INPUT,MAX_OUTPUT=MAX_OUTPUT,
             SAFETY_MARGIN=SAFETY_MARGIN,MIN_OUTPUT=MIN_OUTPUT,
             TRIM_TARGET_TOKENS=0,TRIM_TARGET_FRACTION=TRIM_FRAC,TRIM_TARGET_FLOOR=20000,
-            PINNED_USER_MAX_CHARS=16000, PINNED_USER_FAR_CHARS=2000, PINNED_USER_FAR_THRESHOLD=8,
+            
             COMPACTION_NOTE="Older conversation turns may have been compacted. If a TASK STATE block appears in the newest user message, treat it as background only; the newest user message is the live instruction.",
             count_tokens=lambda s: len(s)//4, _NOTE_TOK_CACHE=None,
             metrics=collections.defaultdict(int))
