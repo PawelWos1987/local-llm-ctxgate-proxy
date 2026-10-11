@@ -19,10 +19,7 @@ import aiosqlite
 import asyncpg
 import httpx
 import tiktoken
-try:
-    import tokenizers
-except ImportError:
-    tokenizers = None
+import tokenizers
 from fastapi import FastAPI, Request, Response, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -1051,7 +1048,7 @@ async def _fetch_session_summary(task_uuid, budget=1500, session_key: str = ""):
             t = count_tokens(s)
             if t <= budget:
                 return s
-            return s[:int(budget * RHO_COLD)]
+            return s[:budget * 8]
     except Exception as e:
         log.warning("Session summary fetch failed: %s", e)
     return ""
@@ -1147,7 +1144,6 @@ THINKING_TOKEN_BUDGET = os.environ.get("CTXGATE_THINKING_TOKEN_BUDGET", "")
 
 # --- Global state (per-session where applicable) ---
 pool: Optional[asyncpg.Pool] = None
-enc = None  # tokenizer (only loaded in exact mode)
 enc: Optional[Any] = None
 sqlite_conn: Optional[aiosqlite.Connection] = None
 sqlite_lock = asyncio.Lock()  # serializes access to the shared aiosqlite conn (not safe for concurrent execute)
@@ -1541,21 +1537,15 @@ async def lifespan(app: FastAPI):
     if not os.path.isfile(QWEN_TOKENIZER_PATH):
         log.error("Tokenizer file not found: %s", QWEN_TOKENIZER_PATH)
         raise SystemExit(78)
-    # Tokenizer is NOT loaded at startup (removed from hot path).
-    # Only loaded when CTXGATE_TOKEN_ESTIMATOR=exact (emergency mode).
-    if ESTIMATOR_MODE == "exact":
-        try:
-            enc = tokenizers.Tokenizer.from_file(QWEN_TOKENIZER_PATH)
-            tok_name = "Qwen tokenizer.json"
-            vocab = enc.get_vocab_size()
-            log.info("ctxgate-proxy started: tokenizer=%s vocab=%d, vllm=%s model=%s",
-                     tok_name, vocab, VLLM_URL, VLLM_MODEL)
-        except Exception as e:
-            log.error("Failed to load tokenizer %s: %s (required for exact mode)", QWEN_TOKENIZER_PATH, e)
-            raise SystemExit(78)
-    else:
-        log.info("ctxgate-proxy started: estimator=calibrated (rho=%.2f), vllm=%s model=%s",
-                 RHO_COLD, VLLM_URL, VLLM_MODEL)
+    try:
+        enc = tokenizers.Tokenizer.from_file(QWEN_TOKENIZER_PATH)
+        tok_name = "Qwen tokenizer.json"
+        vocab = enc.get_vocab_size()
+        log.info("ctxgate-proxy started: tokenizer=%s vocab=%d, vllm=%s model=%s",
+                 tok_name, vocab, VLLM_URL, VLLM_MODEL)
+    except Exception as e:
+        log.error("Failed to load tokenizer %s: %s", QWEN_TOKENIZER_PATH, e)
+        raise SystemExit(78)
 
     # Start memory worker background loop
     worker_task = asyncio.create_task(_memory_worker_loop())
@@ -1785,176 +1775,79 @@ def _check_tenant_rate_limit(tenant_id: str):
     return None
 
 # --- Token counting ---
-# --- Calibrated Token Estimator (replaces exact tokenizer on hot path) ---
-# Constants from Phase 1 calibration (1310 prefix requests, 250 sessions, Qwen3.8-27B):
-#   rho = chars per token (content density)
-#   Formula: tokens = chars / rho + tools_chars / k_tools
-RHO_COLD = 3.391       # median chars/token from calibration
-RHO_LO = 2.695         # p3 of observed rho (dense content floor)
-RHO_HI = 4.026         # p97 of observed rho (sparse content ceiling)
-K_TOOLS_COLD = 1.537   # chars per token for tool definitions (conservative)
-EWMA_ALPHA = 0.5       # per-session EWMA rate
-GLOBAL_ALPHA = 0.1     # global EWMA rate
-M_FLOOR = 0.08         # steady-state margin floor
-M_FLOOR_COLD = 0.20    # cold-start margin floor (first 2 obs)
-M_CAP = 0.25           # max margin
-ESTIMATOR_MODE = os.environ.get("CTXGATE_TOKEN_ESTIMATOR", "calibrated")  # "calibrated" | "exact"
-
-class _TokenCalibrator:
-    """Per-session EWMA calibrator for the token predictor.
-
-    Observes (predicted, real) pairs from the Goose path and adjusts
-    the per-session rho to minimize under-estimation.
-    """
-    def __init__(self):
-        self._sessions: dict = {}
-        self._global_rho: float = RHO_COLD
-        self._global_errs: deque = deque(maxlen=200)
-        # Telemetry
-        self.under_total = 0
-        self.over_total = 0
-        self.max_under_pct = 0.0
-        self.max_over_pct = 0.0
-        self.ratio = 1.0  # effective multiplier gauge
-
-    def observe(self, session_key: str, predicted: int, real: int) -> None:
-        """Call after receiving real prompt_tokens from vLLM."""
-        if real <= 0 or predicted <= 0:
-            return
-        err = (predicted - real) / real
-        under = max(0.0, -err)
-        over = max(0.0, err)
-
-        if under > 0:
-            self.under_total += 1
-            self.max_under_pct = max(self.max_under_pct, under)
-        else:
-            self.over_total += 1
-            self.max_over_pct = max(self.max_over_pct, over)
-
-        # Update per-session EWMA
-        s = self._sessions.get(session_key)
-        if s is None:
-            s = {"rho": self._global_rho, "errs": deque(maxlen=50), "n": 0, "m_bump": 0.0}
-            self._sessions[session_key] = s
-
-        # Derive observed rho adjustment from this request
-        ratio = predicted / real
-        # If we under-estimated (ratio < 1), we need lower rho (more tokens)
-        # If we over-estimated (ratio > 1), we need higher rho (fewer tokens)
-        new_rho = s["rho"] / ratio if ratio > 0 else s["rho"]
-        new_rho = max(RHO_LO, min(RHO_HI, new_rho))
-
-        if s["n"] == 0:
-            s["rho"] = 0.5 * new_rho + 0.5 * self._global_rho
-        else:
-            s["rho"] = (1 - EWMA_ALPHA) * s["rho"] + EWMA_ALPHA * new_rho
-        s["errs"].append(under)
-        s["n"] += 1
-
-        # Update global
-        self._global_errs.append(under)
-        self._global_rho = (1 - GLOBAL_ALPHA) * self._global_rho + GLOBAL_ALPHA * new_rho
-        self.ratio = ratio
-
-    def get_rho(self, session_key: str) -> tuple:
-        """Return (rho, margin) for the given session."""
-        s = self._sessions.get(session_key)
-        if s is None:
-            return RHO_COLD, M_FLOOR_COLD
-        if s["n"] >= 3:
-            m = max(M_FLOOR, max(s["errs"]) if s["errs"] else 0)
-        else:
-            p99_g = 0.0
-            if len(self._global_errs) >= 10:
-                sorted_errs = sorted(self._global_errs)
-                p99_g = sorted_errs[int(len(sorted_errs) * 0.99)]
-            m = max(M_FLOOR_COLD, p99_g)
-        m = min(m + s.get("m_bump", 0.0), M_CAP)
-        return s["rho"], m
-
-    def bump_margin(self, session_key: str, amount: float = 0.05) -> None:
-        """On a vLLM 400, bump the session margin."""
-        s = self._sessions.get(session_key)
-        if s is None:
-            s = {"rho": self._global_rho, "errs": deque(maxlen=50), "n": 0, "m_bump": 0.0}
-            self._sessions[session_key] = s
-        s["m_bump"] = min(s.get("m_bump", 0.0) + amount, M_CAP)
-
-calibrator = _TokenCalibrator()
-
 def count_tokens(text: str, estimate: bool = False) -> int:
     """Count tokens in text.
 
-    Default uses the calibrated predictor: tokens = len(text) / rho.
-    Pure length arithmetic with zero tokenizer calls.
-    When CTXGATE_TOKEN_ESTIMATOR=exact, falls back to the tokenizer.
+    When `estimate=True`, returns a chars/8 approximation
+    calibrated on Qwen3.8-27B (measured ~7.5 chars/token on
+    real agent content). Use for bulk decisions where ±10%
+    error is acceptable.
+
+    When `estimate=False` (default), uses the loaded tokenizer
+    for exact counts. Falls back to chars/8 if the tokenizer is
+    unavailable.
     """
-    if ESTIMATOR_MODE == "exact" and enc is not None:
-        try:
-            return len(enc.encode(text).ids)
-        except AttributeError:
-            return len(enc.encode(text))
-    return max(1, int(len(text) / RHO_COLD))
+    if estimate:
+        return int(len(text) / 8.0) + 1
+    if not enc:
+        return int(len(text) / 8.0) + 1
+    try:
+        return len(enc.encode(text).ids)
+    except AttributeError:
+        return len(enc.encode(text))
 
 def count_message_tokens(msg: dict, estimate: bool = False) -> int:
-    """Predict tokens for a single message using pure length arithmetic.
-
-    No json.dumps, no encode, no join. O(1) per message.
-    """
-    total_chars = 0
-    content = msg.get("content")
-    if content:
-        if isinstance(content, str):
-            total_chars += len(content)
-        elif isinstance(content, list):
-            for p in content:
-                if isinstance(p, dict):
-                    total_chars += len(p.get("text", ""))
-    # Role + structural overhead
-    total_chars += len(msg.get("role", "")) + 4
-    # Tool calls: count name + arguments length (no json.dumps)
-    for tc in msg.get("tool_calls", []):
-        total_chars += len(tc.get("id", ""))
-        fn = tc.get("function", {})
-        total_chars += len(fn.get("name", ""))
-        total_chars += len(fn.get("arguments", ""))
-        total_chars += 10  # structural overhead
-    # tool_call_id
+    content = msg.get("content") or ""
+    if isinstance(content, list):
+        content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+    tokens = count_tokens(f"\n{msg.get('role', '')}", estimate) + count_tokens(content, estimate)
+    tc = msg.get("tool_calls")
+    if tc:
+        tokens += count_tokens(json.dumps(tc), estimate)
     if msg.get("tool_call_id"):
-        total_chars += len(msg["tool_call_id"])
-    return max(1, int(total_chars / RHO_COLD))
+        tokens += count_tokens(msg["tool_call_id"], estimate)
+    return tokens
 
 def count_messages_tokens(messages: list, estimate: bool = False) -> int:
-    """Predict total tokens for a message list using pure length arithmetic.
-
-    O(n) in the number of messages, zero tokenizer calls, no string
-    concatenation of the full content. Each message is counted independently.
-    """
     if not messages:
         return 0
-    total = 0
+    parts = []
     for m in messages:
-        total += count_message_tokens(m)
-    return total
+        r = m.get("role", "")
+        c = m.get("content") or ""
+        if isinstance(c, list):
+            c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+        parts.append("\n" + r + " " + c)
+        tc = m.get("tool_calls")
+        if tc: parts.append(" " + json.dumps(tc))
+        if m.get("tool_call_id"): parts.append(" " + m["tool_call_id"])
+    full = " ".join(parts)
+    if estimate:
+        return int(len(full) / 8.0) + len(messages) * 12
+    if not enc:
+        return int(len(full) / 8.0) + 1 + len(messages) * 12
+    try:
+        return len(enc.encode(full).ids) + len(messages) * 12
+    except AttributeError:
+        return len(enc.encode(full)) + len(messages) * 12
 
-def count_tools_tokens(tools: list) -> int:
-    """Predict tokens for a tools definition list.
 
-    Uses chars/k_tools. No full serialization needed.
+def _smart_messages_tokens(messages: list, low: int, high: int) -> int:
+    """Estimate message tokens; use exact count only if the
+    estimate falls in the sensitive window [low, high].
+
+    Rationale: outside the window, a ±10% estimate error does
+    not change the decision being made. Inside the window, the
+    exact tokenizer is invoked to avoid boundary errors.
+
+    The window is deliberately wider than the observed ±9%
+    estimate error (measured on Qwen3.8-27B content) so the
+    exact path is rarely taken.
     """
-    if not tools:
-        return 0
-    total_chars = 0
-    for t in tools:
-        fn = t.get("function", {})
-        total_chars += len(fn.get("name", ""))
-        total_chars += len(fn.get("description", ""))
-        params = fn.get("parameters", {})
-        if isinstance(params, dict):
-            total_chars += len(json.dumps(params, ensure_ascii=False, separators=(",", ":")))
-        total_chars += 30  # structural: {"type":"function","function":{...}}
-    return max(1, int(total_chars / K_TOOLS_COLD))
+    est = count_messages_tokens(messages, estimate=True)
+    if low <= est <= high:
+        return count_messages_tokens(messages)
+    return est
 def _prefix_diag(session_key: str, messages: list) -> None:
     """P8: compare per-message sha1 of the FINAL upstream messages against the
     previous request. Logs how many leading messages are byte-identical (the
@@ -2866,21 +2759,18 @@ def _emergency_shrink(kept: list, ceiling: int) -> list:
       6. if STILL over because PROTECTED material exceeds ceiling ->
          raise ContextCapacityError (caller turns into 413)
 
-    Returns the (possibly new) list; never mutates the caller list.
-    Uses O(n) incremental token tracking (no re-counting in loops)."""
+    Returns the (possibly new) list; never mutates the caller list."""
     before = count_messages_tokens(kept)
     if before <= ceiling:
         return kept
     metrics["emergency_shrink_total"] += 1
     work = [dict(m) for m in kept]
     protected = _protected_indices(work)
-    # Pre-compute per-message token estimates (O(n) once)
-    msg_toks = [count_message_tokens(m) for m in work]
-    running_total = sum(msg_toks)
-    
+    def _tok():
+        return count_messages_tokens(work)
     # (4) elide large tool bodies, oldest-first, SKIP protected
     for i in range(len(work)):
-        if running_total <= ceiling:
+        if _tok() <= ceiling:
             break
         if i in protected:
             continue
@@ -2890,15 +2780,10 @@ def _emergency_shrink(kept: list, ceiling: int) -> list:
         c = m.get("content")
         if not isinstance(c, str) or len(c) <= 2500:
             continue
-        new_content = _elided_tool_content(c)
-        old_tok = msg_toks[i]
-        work[i]["content"] = new_content
-        new_tok = count_message_tokens(work[i])
-        running_total += new_tok - old_tok
-        msg_toks[i] = new_tok
+        work[i]["content"] = _elided_tool_content(c)
     # (5) drop oldest whole groups while still over
     dropped_groups = 0
-    while running_total > ceiling:
+    while _tok() > ceiling:
         start = None
         for i in range(len(work)):
             if i in protected:
@@ -2916,23 +2801,264 @@ def _emergency_shrink(kept: list, ceiling: int) -> list:
                 j += 1
         while end > start and end in protected:
             end -= 1
-        # Subtract tokens of dropped range
-        for i in range(start, end + 1):
-            running_total -= msg_toks[i]
         del work[start:end + 1]
-        # Rebuild msg_toks after deletion
-        msg_toks = [count_message_tokens(m) for m in work]
         dropped_groups += 1
     metrics["emergency_shrink_groups_dropped"] += dropped_groups
     # (6) if STILL over: protected material alone exceeds ceiling
-    if running_total > ceiling:
-        log.error("EMERGENCY SHRINK: protected material exceeds ceiling (before=%d now=%d ceiling=%d)", before, running_total, ceiling)
+    if _tok() > ceiling:
+        after = _tok()
+        log.error("EMERGENCY SHRINK: protected material exceeds ceiling (before=%d now=%d ceiling=%d)", before, after, ceiling)
         raise ContextCapacityError(
             f"Protected current-turn data alone exceeds the safe budget "
-            f"({running_total} tokens > ceiling {ceiling}). Reduce input or increase CTXGATE_MAX_CONTEXT.",
+            f"({after} tokens > ceiling {ceiling}). Reduce input or increase CTXGATE_MAX_CONTEXT.",
             before, ceiling)
-    log.warning("EMERGENCY SHRINK: before=%d after=%d ceiling=%d groups_dropped=%d", before, running_total, ceiling, dropped_groups)
+    after = _tok()
+    log.warning("EMERGENCY SHRINK: before=%d after=%d ceiling=%d groups_dropped=%d", before, after, ceiling, dropped_groups)
     return work
+
+async def _window_persist(session_key: str, ws: dict) -> None:
+    """Upsert the window row. Feature-detects the table; a failure never fails a
+    request (skips persistence for 60s after an error, warns once)."""
+    global _window_persist_enabled, _window_persist_warned, _window_persist_cooldown_until
+    if _window_persist_enabled is False:
+        return
+    if not pool:
+        return
+    if time.monotonic() < _window_persist_cooldown_until:
+        return
+    try:
+        await pool.execute(
+            "INSERT INTO proxy.session_windows (session_key, cut, cut_anchor, cut_prev_anchor, seed_sig, summarized_through, dropped_total, updated_at) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,now()) "
+            "ON CONFLICT (session_key) DO UPDATE SET cut=$2, cut_anchor=$3, cut_prev_anchor=$4, seed_sig=$5, summarized_through=$6, dropped_total=$7, updated_at=now()",
+            session_key, ws["cut"], ws["cut_anchor"], ws["cut_prev_anchor"], ws["seed_sig"], ws["summarized_through"], ws["dropped_total"],
+        )
+        _window_persist_enabled = True
+    except Exception as e:
+        _window_persist_cooldown_until = time.monotonic() + 60
+        metrics["window_persist_errors"] += 1
+        if not _window_persist_warned:
+            _window_persist_warned = True
+            log.warning("session_windows persistence cooling down 60s after error: %s", e)
+
+async def _window_load(session_key: str) -> dict:
+    """Lazy load of a single window row. Returns {} if missing/absent."""
+    global _window_persist_enabled, _window_persist_warned
+    if _window_persist_enabled is False:
+        return {}
+    if not pool:
+        return {}
+    try:
+        row = await pool.fetchrow("SELECT cut, cut_anchor, cut_prev_anchor, seed_sig, summarized_through, dropped_total FROM proxy.session_windows WHERE session_key=$1", session_key)
+        _window_persist_enabled = True
+        if not row:
+            return {}
+        return {
+            "cut": row["cut"],
+            "cut_anchor": row["cut_anchor"] or "",
+            "cut_prev_anchor": row["cut_prev_anchor"] or "",
+            "seed_sig": row["seed_sig"] or "",
+            "summarized_through": row["summarized_through"],
+            "dropped_total": row["dropped_total"],
+        "in_flight": False
+        }
+    except Exception as e:
+        _window_persist_enabled = False
+        metrics["window_persist_errors"] += 1
+        if not _window_persist_warned:
+            _window_persist_warned = True
+            log.warning("session_windows load disabled for this process: %s", e)
+        return {}
+
+async def _window_cleanup_ttl() -> None:
+    """Delete window rows older than WINDOW_TTL_DAYS (this table only)."""
+    global _window_persist_enabled, _window_persist_warned, _window_persist_cooldown_until
+    if _window_persist_enabled is False or not pool:
+        return
+    if time.monotonic() < _window_persist_cooldown_until:
+        return
+    try:
+        await pool.execute("DELETE FROM proxy.session_windows WHERE updated_at < (now() - ($1 || ' days')::interval)", str(WINDOW_TTL_DAYS))
+    except Exception as e:
+        _window_persist_cooldown_until = time.monotonic() + 60
+        metrics["window_persist_errors"] += 1
+        if not _window_persist_warned:
+            _window_persist_warned = True
+            log.warning("session_windows cleanup cooling down 60s after error: %s", e)
+
+async def build_context(request_messages: list, task_uuid: str = None, session_key: str = None) -> list:
+    sk = session_key or ""
+    _note_n = _note_tok()  # tokens reserved for COMPACTION_NOTE (added after build_context)
+    async with _window_lock(sk):
+        ws = session_compactions.get(sk)
+        if ws is None and sk and sk not in _window_load_tried:
+            _window_load_tried.add(sk)
+            loaded = await _window_load(sk)
+            if loaded:
+                ws = loaded
+                session_compactions[sk] = ws
+                metrics["window_loads_db"] += 1
+        raw = request_messages
+        seed_raw = list(raw[:3])
+        rest_raw = raw[3:]
+        # FAST PATH: valid sticky cut -> O(kept) only; never tokenizes the dropped region.
+        if ws and _window_valid(ws, seed_raw, rest_raw) and ws["cut"] < len(rest_raw):
+            combined = _prep_messages(seed_raw + rest_raw[ws["cut"]:])
+            kept = list(combined)
+            # Insert the deterministic pinned newest-user copy when it lies before the
+            # cut (same as _kept_messages) so the prefix stays byte-stable between turns.
+            lu = _newest_user_idx(rest_raw)
+            if lu is not None and lu < ws["cut"]:
+                kept.insert(3, _make_pinned_copy(rest_raw[lu], distance=ws["cut"] - lu))
+            if STABLE_ELIDE:
+                if ws.get("elide_idx") is None:
+                    ws["elide_idx"] = _stable_elide_idx(ws["cut"], rest_raw)
+                # Deterministically elide the [cut, elide_idx) tool bodies so
+                # the kept window is byte-stable between requests.
+                # kept = seed(3) + [pinned(1)] + rest[cut:]
+                # so rest[cut] starts at kept[3+has_pin].
+                has_pin = 1 if (lu is not None and lu < ws["cut"]) else 0
+                base = 3 + has_pin
+                # rest[cut:elide_idx] maps to kept[base : base+(elide_idx-cut)]
+                _stable_elide_inplace(kept, base, base + (ws["elide_idx"] - ws["cut"]))
+            kept_tok = _smart_messages_tokens(
+                kept,
+                int(0.9 * MAX_INPUT),
+                int(1.1 * MAX_INPUT))
+            ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT) - _note_n
+            if kept_tok > ceiling:
+                # Sticky window exceeded the hard ceiling: bail out of the fast
+                # path and let the slow path re-cut to _trim_target(), update
+                # session_compactions, and kick the summarizer. The old code
+                # called _emergency_shrink here, dropping the oldest groups on
+                # every request while ws["cut"] stayed fixed — the first kept
+                # message changed each turn, killing the vLLM prefix cache.
+                log.info("sticky window over ceiling %d > %d: re-cutting", kept_tok, ceiling)
+            elif kept_tok <= MAX_INPUT - _note_n:
+                metrics["trim_sticky_reuse"] += 1
+                log.info("Context sticky-reuse: session=%s cut=%d kept_tokens=%d skipped=%d", sk, ws["cut"], kept_tok, ws["cut"])
+                # Verify context invariants (diagnostic + metrics)
+                _viols = verify_context_invariants(kept, raw, ceiling, kept_tok)
+                if _viols:
+                    _seed_fixable = []
+                    _other_viols = []
+                    for _v in _viols:
+                        if _v.startswith("tool_body"):
+                            metrics["recent_tool_preservation_failures"] += 1
+                        elif _v.startswith("newest_user") or _v.startswith("pinned"):
+                            metrics["pinned_user_preservation_failures"] += 1
+                        if _v.startswith("missing_tool_result"):
+                            _mi = re.search(r"ctx\[(\d+)\]", _v)
+                            if _mi and int(_mi.group(1)) < 3:
+                                _seed_fixable.append(_v)
+                                continue
+                        _other_viols.append(_v)
+                    if _other_viols:
+                        log.warning("Context invariant violations (fast path): %s", _other_viols[:3])
+                    if _seed_fixable:
+                        log.debug("Context invariant violations (fast path, seed-repairable): %s", _seed_fixable)
+                if task_uuid and ws["summarized_through"] < ws.get("dropped_total", ws["cut"]) and not ws.get("in_flight", False):
+                    la = _summary_last_attempt.get(task_uuid)
+                    if la is None or (time.time() - la[0]) > 120:
+                        ws["pending_cut"] = ws["cut"]
+                        ws["in_flight"] = True
+                        _spawn(_summarize_trimmed_messages(task_uuid, sk, rest_raw, pending_cut=ws["cut"]))
+                return kept
+        # SLOW PATH: no valid state (or kept over limit) -> full count + re-cut.
+        messages = _prep_messages(raw)
+        seed = list(messages[:3])
+        rest = messages[3:]
+        total = _smart_messages_tokens(
+            messages,
+            int(0.9 * MAX_INPUT),
+            int(1.1 * MAX_INPUT))
+        log.info("Context: %d messages, %d tokens (limit %d)", len(messages), total, MAX_INPUT)
+        if total <= MAX_INPUT - _note_n:
+            return messages
+        target = _trim_target()
+        # Pre-recut elision: shrink tool bodies up to the newest-4 boundary so
+        # _recut_to budgets on stable (post-elision) sizes, not full originals.
+        # messages is a fresh _prep_messages list (dict copies) -> caller safe.
+        _pre_elide = _stable_elide_idx(0, rest) if STABLE_ELIDE else 0
+        if STABLE_ELIDE:
+            # messages = seed(3) + rest; _pre_elide is a rest-index.
+            # Elide rest[0:_pre_elide] -> messages[3 : 3+_pre_elide]
+            _stable_elide_inplace(messages, 3, 3 + _pre_elide)
+        cut = _recut(messages)
+        elide_idx = max(cut, _pre_elide) if STABLE_ELIDE else 0
+        # F2b: never store a window anchored past the end of rest (caused the
+        # per-turn re-collapse, W2). Clamp so the anchor is a real message.
+        if rest and cut >= len(rest):
+            cut = len(rest) - 1
+        # F3: carry the summarizer watermark forward on a re-cut of the SAME session
+        # (seed unchanged, history only grew) - never reset to 0. Only a genuinely
+        # new/changed seed (or missing state) starts from 0.
+        st_start = 0
+        if ws:
+            if _window_valid(ws, seed_raw, rest_raw):
+                st_start = ws.get("summarized_through", 0)
+            elif ws.get("seed_sig") == _seed_sig(seed):
+                st_start = ws.get("summarized_through", 0)
+        new_ws = _new_window_state(cut, rest, seed, st_start)
+        session_compactions[sk] = new_ws
+        metrics["trim_events"] += 1
+        metrics["dropped_total"] += (cut - st_start) if cut > st_start else 0
+        metrics["compaction_events"] += 1
+        kept = _kept_messages(seed, rest, cut)
+        new_ws["elide_idx"] = elide_idx
+        if STABLE_ELIDE:
+            # Elide the [cut, elide_idx) tool bodies in the freshly built kept
+            # window. kept = seed(3) + [pinned(1)] + rest[cut:]
+            lu2 = _newest_user_idx(rest)
+            has_pin2 = 1 if (lu2 is not None and cut > lu2) else 0
+            base2 = 3 + has_pin2
+            # rest[cut:elide_idx] maps to kept[base2 : base2+(elide_idx-cut)]
+            _stable_elide_inplace(kept, base2, base2 + (elide_idx - cut))
+        kept_tok = _smart_messages_tokens(
+            kept,
+            int(0.9 * MAX_INPUT),
+            int(1.1 * MAX_INPUT))
+        ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT) - _note_n
+        if kept_tok > ceiling:
+            try:
+                kept = _emergency_shrink(kept, ceiling)
+            except ContextCapacityError as cce:
+                log.error("Context capacity exceeded in build_context: %s", cce)
+                raise cce
+            kept_tok = count_messages_tokens(kept)
+        if kept_tok > ceiling:
+            log.error("EMERGENCY SHRINK failed to meet ceiling: kept_tok=%d ceiling=%d (pathological single huge message)", kept_tok, ceiling)
+        # Verify context invariants (diagnostic + metrics)
+        _viols = verify_context_invariants(kept, raw, ceiling, kept_tok)
+        if _viols:
+            _seed_fixable = []
+            _other_viols = []
+            for _v in _viols:
+                if _v.startswith("tool_body"):
+                    metrics["recent_tool_preservation_failures"] += 1
+                elif _v.startswith("newest_user") or _v.startswith("pinned"):
+                    metrics["pinned_user_preservation_failures"] += 1
+                if _v.startswith("missing_tool_result"):
+                    _mi = re.search(r"ctx\[(\d+)\]", _v)
+                    if _mi and int(_mi.group(1)) < 3:
+                        _seed_fixable.append(_v)
+                        continue
+                _other_viols.append(_v)
+            if _other_viols:
+                log.warning("Context invariant violations (slow path): %s", _other_viols[:3])
+            if _seed_fixable:
+                log.debug("Context invariant violations (slow path, seed-repairable): %s", _seed_fixable)
+        headroom = ceiling - kept_tok
+        log.info("Context over limit: %d > %d, re-cut to low-watermark %d (%.0f%%)", total, MAX_INPUT, target, 100.0 * target / MAX_INPUT)
+        log.info("After trim: %d msgs, %d tokens (headroom %d ceiling %d)", len(kept), kept_tok, headroom, ceiling)
+        if kept_tok > target:
+            log.info("target missed by %d tokens", kept_tok - target)
+        if cut > st_start and task_uuid:
+            log.info("Dropped slice: session=%s msgs=%d -> summarizer", sk, cut - st_start)
+            new_ws["pending_cut"] = cut
+            new_ws["in_flight"] = True
+            _spawn(_summarize_trimmed_messages(task_uuid, sk, rest, pending_cut=cut))
+        return kept
 def _track_session_tokens(session_key: str, input_tokens: int, output_tokens: int = 0, count_req: bool = True):
     """Update per-session token counters. count_req=False for output-only updates."""
     global SESSION_LAST_ACTIVE
@@ -3572,11 +3698,6 @@ async def metrics_prometheus(request: Request):
         "# TYPE ctxgate_extract_queue_depth gauge", "ctxgate_extract_queue_depth %d" % _EXTRACT_IN_FLIGHT,
         "# TYPE ctxgate_worker_lag_seconds gauge", "ctxgate_worker_lag_seconds %.1f" % _read_worker_status().get("lag_seconds", 0),
         "# TYPE ctxgate_worker_pending gauge", "ctxgate_worker_pending %d" % _worker_pending,
-        "# TYPE ctxgate_estimator_under_total counter", "ctxgate_estimator_under_total %d" % calibrator.under_total,
-        "# TYPE ctxgate_estimator_over_total counter", "ctxgate_estimator_over_total %d" % calibrator.over_total,
-        "# TYPE ctxgate_estimator_max_under_pct gauge", "ctxgate_estimator_max_under_pct %.4f" % calibrator.max_under_pct,
-        "# TYPE ctxgate_estimator_max_over_pct gauge", "ctxgate_estimator_max_over_pct %.4f" % calibrator.max_over_pct,
-        "# TYPE ctxgate_estimator_ratio gauge", "ctxgate_estimator_ratio %.4f" % calibrator.ratio,
     ]
     # LM token usage per call kind (knowledge/phase/root/other x prompt/completion)
     lines.extend([
@@ -4055,7 +4176,8 @@ async def chat_completions(request: Request):
         _t0 = time.monotonic()
         _sensitive_input_lo = MAX_CONTEXT - SAFETY_MARGIN - MAX_OUTPUT - int(0.1 * MAX_OUTPUT)
         _sensitive_input_hi = MAX_CONTEXT - SAFETY_MARGIN - MAX_OUTPUT + int(0.1 * MAX_OUTPUT)
-        input_tokens = count_messages_tokens(built)
+        input_tokens = _smart_messages_tokens(
+            built, _sensitive_input_lo, _sensitive_input_hi)
         _dt = (time.monotonic() - _t0) * 1000
         if _dt > 50:
             log.warning("SLOW: count_messages_tokens %.0fms (tokens=%d)", _dt, input_tokens)
@@ -4419,15 +4541,8 @@ async def forward_to_vllm_passthrough(vllm_body: dict,
         out_tok = data["usage"].get("completion_tokens", 0)
         cached = (data["usage"].get(
             "prompt_tokens_details") or {}).get("cached_tokens", 0)
-        _real_pt = data["usage"].get("prompt_tokens", 0)
-        if _real_pt > 0:
-            calibrator.observe(session_key, input_tokens, _real_pt)
-            log.info("TOKEST est=%d real=%d err=%+.1f%% ratio=%.3f m=%.3f session=%s",
-                     input_tokens, _real_pt, 100.0*(input_tokens-_real_pt)/_real_pt,
-                     calibrator.ratio, calibrator.get_rho(session_key)[1], session_key)
-        # K10: forward vLLM's real prompt_tokens (not the estimate)
-        data["usage"]["prompt_tokens"] = _real_pt if _real_pt > 0 else input_tokens
-        data["usage"]["total_tokens"] = data["usage"]["prompt_tokens"] + out_tok
+        data["usage"]["prompt_tokens"] = input_tokens
+        data["usage"]["total_tokens"] = input_tokens + out_tok
         metrics["requests_ok"] += 1
         metrics["tokens_out_total"] += out_tok
         metrics["cached_tokens_total"] += cached
@@ -4501,7 +4616,6 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                 p in _et for p in ("context", "max_tokens", "max_completion_tokens", "maximum", "greater than"))
             if _is_ctx400:
                 log.warning("vLLM 400 (context/max_tokens) - re-shrinking and retrying: %s", resp.text[:200])
-                calibrator.bump_margin(session_key)
                 reduced_limit = int(input_tokens * 0.8)
                 vllm_body["messages"] = _emergency_shrink(vllm_body["messages"], reduced_limit)
                 new_input_tokens = count_messages_tokens(vllm_body["messages"])
@@ -5024,7 +5138,6 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                     and any(p in _et for p in ("context", "max_tokens", "max_completion_tokens", "maximum", "greater than"))):
                                 shrink_retried = True
                                 log.warning("Stream 400 (context/max_tokens) - re-shrinking and retrying: %s", _et[:200])
-                                calibrator.bump_margin(session_key)
                                 try:
                                     current_body["messages"] = _emergency_shrink(current_body["messages"], int(input_tokens * 0.8))
                                 except ContextCapacityError as cce:
@@ -5064,14 +5177,8 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                     if usage.get("completion_tokens"):
                                         seg_output_tokens = usage["completion_tokens"]
                                     total_cached_tokens += (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-                                    _real_pt_s = usage.get("prompt_tokens", 0)
-                                    if _real_pt_s > 0:
-                                        calibrator.observe(session_key, input_tokens, _real_pt_s)
-                                        log.info("TOKEST est=%d real=%d err=%+.1f%% ratio=%.3f m=%.3f session=%s",
-                                                 input_tokens, _real_pt_s, 100.0*(input_tokens-_real_pt_s)/_real_pt_s,
-                                                 calibrator.ratio, calibrator.get_rho(session_key)[1], session_key)
-                                    usage["prompt_tokens"] = _real_pt_s if _real_pt_s > 0 else input_tokens
-                                    usage["total_tokens"] = usage["prompt_tokens"] + (usage.get("completion_tokens") or 0)
+                                    usage["prompt_tokens"] = input_tokens
+                                    usage["total_tokens"] = input_tokens + (usage.get("completion_tokens") or 0)
                                 choices = chunk.get("choices", [])
                                 if not choices:
                                     continue
@@ -5368,7 +5475,6 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                         and any(p in _et for p in ("context", "max_tokens", "max_completion_tokens", "maximum", "greater than"))):
                                     shrink_retried = True
                                     log.warning("Stream 400 retry (context/max_tokens) - re-shrinking: %s", _et[:200])
-                                    calibrator.bump_margin(session_key)
                                     try:
                                         current_body["messages"] = _emergency_shrink(current_body["messages"], int(input_tokens * 0.8))
                                     except ContextCapacityError as cce:
@@ -5408,14 +5514,8 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str):
                                         if usage.get("completion_tokens"):
                                             seg_output_tokens = usage["completion_tokens"]
                                         total_cached_tokens += (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-                                        _real_pt_r = usage.get("prompt_tokens", 0)
-                                        if _real_pt_r > 0:
-                                            calibrator.observe(session_key, input_tokens, _real_pt_r)
-                                            log.info("TOKEST est=%d real=%d err=%+.1f%% ratio=%.3f m=%.3f session=%s",
-                                                     input_tokens, _real_pt_r, 100.0*(input_tokens-_real_pt_r)/_real_pt_r,
-                                                     calibrator.ratio, calibrator.get_rho(session_key)[1], session_key)
-                                        usage["prompt_tokens"] = _real_pt_r if _real_pt_r > 0 else input_tokens
-                                        usage["total_tokens"] = usage["prompt_tokens"] + (usage.get("completion_tokens") or 0)
+                                        usage["prompt_tokens"] = input_tokens
+                                        usage["total_tokens"] = input_tokens + (usage.get("completion_tokens") or 0)
                                         try:
                                             _ptd = usage.get("prompt_tokens_details") or {}
                                             _ct = _ptd.get("cached_tokens", 0)
@@ -6432,13 +6532,12 @@ def _check_config():
     elif "CHANGE_ME" in dsn:
         problems.append("DSN contains CHANGE_ME placeholder")
     
-    # Tokenizer (only required in exact mode)
-    if ESTIMATOR_MODE == "exact":
-        tok = os.environ.get("CTXGATE_QWEN_TOKENIZER", "")
-        if not tok:
-            problems.append("CTXGATE_QWEN_TOKENIZER is required for exact mode")
-        elif not os.path.isfile(tok):
-            problems.append(f"Tokenizer file not found: {tok}")
+    # Tokenizer
+    tok = os.environ.get("CTXGATE_QWEN_TOKENIZER", "")
+    if not tok:
+        problems.append("CTXGATE_QWEN_TOKENIZER is required")
+    elif not os.path.isfile(tok):
+        problems.append(f"Tokenizer file not found: {tok}")
     
     # Auth
     keys = _parse_api_keys()

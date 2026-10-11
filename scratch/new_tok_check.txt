@@ -1,0 +1,7 @@
+    # Tokenizer (only required in exact mode)
+    if ESTIMATOR_MODE == "exact":
+        tok = os.environ.get("CTXGATE_QWEN_TOKENIZER", "")
+        if not tok:
+            problems.append("CTXGATE_QWEN_TOKENIZER is required for exact mode")
+        elif not os.path.isfile(tok):
+            problems.append(f"Tokenizer file not found: {tok}")

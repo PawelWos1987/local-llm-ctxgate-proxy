@@ -1,0 +1,80 @@
+def _emergency_shrink(kept: list, ceiling: int) -> list:
+    """Hard invariant: shrink a built window to <= ceiling tokens without breaking
+    the tool-call graph. Used by build_context (both paths) and the 400 re-trim.
+
+    Canonical order:
+      1. preserve seed
+      2. preserve pinned newest-user copy
+      3. preserve newest-4 tool groups (via protected_tool_groups)
+      4. elide OLDER tool bodies only (skip protected)
+      5. drop oldest complete assistant/user/tool groups
+      6. if STILL over because PROTECTED material exceeds ceiling ->
+         raise ContextCapacityError (caller turns into 413)
+
+    Returns the (possibly new) list; never mutates the caller list.
+    Uses O(n) incremental token tracking (no re-counting in loops)."""
+    before = count_messages_tokens(kept)
+    if before <= ceiling:
+        return kept
+    metrics["emergency_shrink_total"] += 1
+    work = [dict(m) for m in kept]
+    protected = _protected_indices(work)
+    # Pre-compute per-message token estimates (O(n) once)
+    msg_toks = [count_message_tokens(m) for m in work]
+    running_total = sum(msg_toks)
+    
+    # (4) elide large tool bodies, oldest-first, SKIP protected
+    for i in range(len(work)):
+        if running_total <= ceiling:
+            break
+        if i in protected:
+            continue
+        m = work[i]
+        if m.get("role") != "tool":
+            continue
+        c = m.get("content")
+        if not isinstance(c, str) or len(c) <= 2500:
+            continue
+        new_content = _elided_tool_content(c)
+        old_tok = msg_toks[i]
+        work[i]["content"] = new_content
+        new_tok = count_message_tokens(work[i])
+        running_total += new_tok - old_tok
+        msg_toks[i] = new_tok
+    # (5) drop oldest whole groups while still over
+    dropped_groups = 0
+    while running_total > ceiling:
+        start = None
+        for i in range(len(work)):
+            if i in protected:
+                continue
+            if work[i].get("role") in ("assistant", "user"):
+                start = i
+                break
+        if start is None:
+            break
+        end = start
+        if work[start].get("role") == "assistant" and work[start].get("tool_calls"):
+            j = start + 1
+            while j < len(work) and work[j].get("role") == "tool":
+                end = j
+                j += 1
+        while end > start and end in protected:
+            end -= 1
+        # Subtract tokens of dropped range
+        for i in range(start, end + 1):
+            running_total -= msg_toks[i]
+        del work[start:end + 1]
+        # Rebuild msg_toks after deletion
+        msg_toks = [count_message_tokens(m) for m in work]
+        dropped_groups += 1
+    metrics["emergency_shrink_groups_dropped"] += dropped_groups
+    # (6) if STILL over: protected material alone exceeds ceiling
+    if running_total > ceiling:
+        log.error("EMERGENCY SHRINK: protected material exceeds ceiling (before=%d now=%d ceiling=%d)", before, running_total, ceiling)
+        raise ContextCapacityError(
+            f"Protected current-turn data alone exceeds the safe budget "
+            f"({running_total} tokens > ceiling {ceiling}). Reduce input or increase CTXGATE_MAX_CONTEXT.",
+            before, ceiling)
+    log.warning("EMERGENCY SHRINK: before=%d after=%d ceiling=%d groups_dropped=%d", before, running_total, ceiling, dropped_groups)
+    return work

@@ -1,0 +1,174 @@
+async def build_context(request_messages: list, task_uuid: str = None, session_key: str = None) -> list:
+    sk = session_key or ""
+    _note_n = _note_tok()  # tokens reserved for COMPACTION_NOTE (added after build_context)
+    async with _window_lock(sk):
+        ws = session_compactions.get(sk)
+        if ws is None and sk and sk not in _window_load_tried:
+            _window_load_tried.add(sk)
+            loaded = await _window_load(sk)
+            if loaded:
+                ws = loaded
+                session_compactions[sk] = ws
+                metrics["window_loads_db"] += 1
+        raw = request_messages
+        seed_raw = list(raw[:3])
+        rest_raw = raw[3:]
+        # FAST PATH: valid sticky cut -> O(kept) only; never tokenizes the dropped region.
+        if ws and _window_valid(ws, seed_raw, rest_raw) and ws["cut"] < len(rest_raw):
+            combined = _prep_messages(seed_raw + rest_raw[ws["cut"]:])
+            kept = list(combined)
+            # Insert the deterministic pinned newest-user copy when it lies before the
+            # cut (same as _kept_messages) so the prefix stays byte-stable between turns.
+            lu = _newest_user_idx(rest_raw)
+            if lu is not None and lu < ws["cut"]:
+                kept.insert(3, _make_pinned_copy(rest_raw[lu], distance=ws["cut"] - lu))
+            if STABLE_ELIDE:
+                if ws.get("elide_idx") is None:
+                    ws["elide_idx"] = _stable_elide_idx(ws["cut"], rest_raw)
+                # Deterministically elide the [cut, elide_idx) tool bodies so
+                # the kept window is byte-stable between requests.
+                # kept = seed(3) + [pinned(1)] + rest[cut:]
+                # so rest[cut] starts at kept[3+has_pin].
+                has_pin = 1 if (lu is not None and lu < ws["cut"]) else 0
+                base = 3 + has_pin
+                # rest[cut:elide_idx] maps to kept[base : base+(elide_idx-cut)]
+                _stable_elide_inplace(kept, base, base + (ws["elide_idx"] - ws["cut"]))
+            kept_tok = _smart_messages_tokens(
+                kept,
+                int(0.9 * MAX_INPUT),
+                int(1.1 * MAX_INPUT))
+            ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT) - _note_n
+            if kept_tok > ceiling:
+                # Sticky window exceeded the hard ceiling: bail out of the fast
+                # path and let the slow path re-cut to _trim_target(), update
+                # session_compactions, and kick the summarizer. The old code
+                # called _emergency_shrink here, dropping the oldest groups on
+                # every request while ws["cut"] stayed fixed — the first kept
+                # message changed each turn, killing the vLLM prefix cache.
+                log.info("sticky window over ceiling %d > %d: re-cutting", kept_tok, ceiling)
+            elif kept_tok <= MAX_INPUT - _note_n:
+                metrics["trim_sticky_reuse"] += 1
+                log.info("Context sticky-reuse: session=%s cut=%d kept_tokens=%d skipped=%d", sk, ws["cut"], kept_tok, ws["cut"])
+                # Verify context invariants (diagnostic + metrics)
+                _viols = verify_context_invariants(kept, raw, ceiling, kept_tok)
+                if _viols:
+                    _seed_fixable = []
+                    _other_viols = []
+                    for _v in _viols:
+                        if _v.startswith("tool_body"):
+                            metrics["recent_tool_preservation_failures"] += 1
+                        elif _v.startswith("newest_user") or _v.startswith("pinned"):
+                            metrics["pinned_user_preservation_failures"] += 1
+                        if _v.startswith("missing_tool_result"):
+                            _mi = re.search(r"ctx\[(\d+)\]", _v)
+                            if _mi and int(_mi.group(1)) < 3:
+                                _seed_fixable.append(_v)
+                                continue
+                        _other_viols.append(_v)
+                    if _other_viols:
+                        log.warning("Context invariant violations (fast path): %s", _other_viols[:3])
+                    if _seed_fixable:
+                        log.debug("Context invariant violations (fast path, seed-repairable): %s", _seed_fixable)
+                if task_uuid and ws["summarized_through"] < ws.get("dropped_total", ws["cut"]) and not ws.get("in_flight", False):
+                    la = _summary_last_attempt.get(task_uuid)
+                    if la is None or (time.time() - la[0]) > 120:
+                        ws["pending_cut"] = ws["cut"]
+                        ws["in_flight"] = True
+                        _spawn(_summarize_trimmed_messages(task_uuid, sk, rest_raw, pending_cut=ws["cut"]))
+                return kept
+        # SLOW PATH: no valid state (or kept over limit) -> full count + re-cut.
+        messages = _prep_messages(raw)
+        seed = list(messages[:3])
+        rest = messages[3:]
+        total = _smart_messages_tokens(
+            messages,
+            int(0.9 * MAX_INPUT),
+            int(1.1 * MAX_INPUT))
+        log.info("Context: %d messages, %d tokens (limit %d)", len(messages), total, MAX_INPUT)
+        if total <= MAX_INPUT - _note_n:
+            return messages
+        target = _trim_target()
+        # Pre-recut elision: shrink tool bodies up to the newest-4 boundary so
+        # _recut_to budgets on stable (post-elision) sizes, not full originals.
+        # messages is a fresh _prep_messages list (dict copies) -> caller safe.
+        _pre_elide = _stable_elide_idx(0, rest) if STABLE_ELIDE else 0
+        if STABLE_ELIDE:
+            # messages = seed(3) + rest; _pre_elide is a rest-index.
+            # Elide rest[0:_pre_elide] -> messages[3 : 3+_pre_elide]
+            _stable_elide_inplace(messages, 3, 3 + _pre_elide)
+        cut = _recut(messages)
+        elide_idx = max(cut, _pre_elide) if STABLE_ELIDE else 0
+        # F2b: never store a window anchored past the end of rest (caused the
+        # per-turn re-collapse, W2). Clamp so the anchor is a real message.
+        if rest and cut >= len(rest):
+            cut = len(rest) - 1
+        # F3: carry the summarizer watermark forward on a re-cut of the SAME session
+        # (seed unchanged, history only grew) - never reset to 0. Only a genuinely
+        # new/changed seed (or missing state) starts from 0.
+        st_start = 0
+        if ws:
+            if _window_valid(ws, seed_raw, rest_raw):
+                st_start = ws.get("summarized_through", 0)
+            elif ws.get("seed_sig") == _seed_sig(seed):
+                st_start = ws.get("summarized_through", 0)
+        new_ws = _new_window_state(cut, rest, seed, st_start)
+        session_compactions[sk] = new_ws
+        metrics["trim_events"] += 1
+        metrics["dropped_total"] += (cut - st_start) if cut > st_start else 0
+        metrics["compaction_events"] += 1
+        kept = _kept_messages(seed, rest, cut)
+        new_ws["elide_idx"] = elide_idx
+        if STABLE_ELIDE:
+            # Elide the [cut, elide_idx) tool bodies in the freshly built kept
+            # window. kept = seed(3) + [pinned(1)] + rest[cut:]
+            lu2 = _newest_user_idx(rest)
+            has_pin2 = 1 if (lu2 is not None and cut > lu2) else 0
+            base2 = 3 + has_pin2
+            # rest[cut:elide_idx] maps to kept[base2 : base2+(elide_idx-cut)]
+            _stable_elide_inplace(kept, base2, base2 + (elide_idx - cut))
+        kept_tok = _smart_messages_tokens(
+            kept,
+            int(0.9 * MAX_INPUT),
+            int(1.1 * MAX_INPUT))
+        ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT) - _note_n
+        if kept_tok > ceiling:
+            try:
+                kept = _emergency_shrink(kept, ceiling)
+            except ContextCapacityError as cce:
+                log.error("Context capacity exceeded in build_context: %s", cce)
+                raise cce
+            kept_tok = count_messages_tokens(kept)
+        if kept_tok > ceiling:
+            log.error("EMERGENCY SHRINK failed to meet ceiling: kept_tok=%d ceiling=%d (pathological single huge message)", kept_tok, ceiling)
+        # Verify context invariants (diagnostic + metrics)
+        _viols = verify_context_invariants(kept, raw, ceiling, kept_tok)
+        if _viols:
+            _seed_fixable = []
+            _other_viols = []
+            for _v in _viols:
+                if _v.startswith("tool_body"):
+                    metrics["recent_tool_preservation_failures"] += 1
+                elif _v.startswith("newest_user") or _v.startswith("pinned"):
+                    metrics["pinned_user_preservation_failures"] += 1
+                if _v.startswith("missing_tool_result"):
+                    _mi = re.search(r"ctx\[(\d+)\]", _v)
+                    if _mi and int(_mi.group(1)) < 3:
+                        _seed_fixable.append(_v)
+                        continue
+                _other_viols.append(_v)
+            if _other_viols:
+                log.warning("Context invariant violations (slow path): %s", _other_viols[:3])
+            if _seed_fixable:
+                log.debug("Context invariant violations (slow path, seed-repairable): %s", _seed_fixable)
+        headroom = ceiling - kept_tok
+        log.info("Context over limit: %d > %d, re-cut to low-watermark %d (%.0f%%)", total, MAX_INPUT, target, 100.0 * target / MAX_INPUT)
+        log.info("After trim: %d msgs, %d tokens (headroom %d ceiling %d)", len(kept), kept_tok, headroom, ceiling)
+        if kept_tok > target:
+            log.info("target missed by %d tokens", kept_tok - target)
+        if cut > st_start and task_uuid:
+            log.info("Dropped slice: session=%s msgs=%d -> summarizer", sk, cut - st_start)
+            new_ws["pending_cut"] = cut
+            new_ws["in_flight"] = True
+            _spawn(_summarize_trimmed_messages(task_uuid, sk, rest, pending_cut=cut))
+        return kept
+
