@@ -1,0 +1,27 @@
+{
+  "predictor": "P1_chars_div_rho",
+  "formula": "tokens = chars / rho + n * msg_overhead + tools_chars / k_tools",
+  "rho_cold": 3.3912,
+  "rho_lo": 2.6946,
+  "rho_hi": 4.0257,
+  "msg_overhead": 0,
+  "a_ewma": 0.5,
+  "a_global": 0.1,
+  "m_floor": 0.08,
+  "m_floor_cold": 0.2,
+  "m_cap": 0.25,
+  "k_tools_cold": 1.537,
+  "data": {
+    "prefix_requests": 1310,
+    "sessions": 250,
+    "test_requests": 657,
+    "rho_samples": 1310
+  },
+  "gates": {
+    "g1_p99_under": 0.06049953741138102,
+    "g2_max_under": 0.13726038861378045,
+    "g3_p99_over": 0.30516628262633433,
+    "g4_steady_max": 0.13726038861378045,
+    "all_pass": false
+  }
+}
