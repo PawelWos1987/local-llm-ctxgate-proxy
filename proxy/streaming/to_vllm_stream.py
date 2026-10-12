@@ -21,9 +21,9 @@ log = logging.getLogger("ctxgate-proxy")
 async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, live_prompt_hash: str = ""):
     # TODO(I4): replace with AppContext
     from proxy.app import (metrics, _vllm_client, VLLM_URL, VLLM_MODEL,
-                           CTXGATE_MAX_TOTAL_OUTPUT, MAX_OUTPUT, MIN_OUTPUT, MAX_INPUT,
+                           CTXGATE_MAX_TOTAL_OUTPUT, MAX_OUTPUT, MAX_INPUT,
                            MAX_CONTEXT, SAFETY_MARGIN,
-                           _output_budget, _strip_proxy_metadata, _validate_outgoing_payload,
+                           _output_budget, _validate_outgoing_payload,
                            _check_vllm_breaker, _note_tok, _emergency_shrink, _recut_to,
                            count_messages_tokens, estimate_full_payload_tokens, _trim_target,
                            _is_context_length_error, _record_call, CTXGATE_MIN_CONTINUATION_OUTPUT,
@@ -36,16 +36,6 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                            _unbounded_replace_loop, _vllm_breaker, calibrator)
     from starlette.responses import StreamingResponse
     global metrics
-    # Phase 08: Unified validation before sending
-    vllm_body["messages"] = _strip_proxy_metadata(vllm_body.get("messages", []))
-    _vok, _verr = _validate_outgoing_payload(vllm_body, live_prompt_hash)
-    if not _vok:
-        metrics["requests_error"] += 1
-        log.error("Outgoing payload validation failed (stream): %s (session=%s)", _verr, session_key)
-        async def _err_gen():
-            yield "data: " + json.dumps({"error": {"type": _verr, "message": f"Outgoing payload validation failed: {_verr}"}}) + chr(10)*2
-            yield "data: [DONE]" + chr(10)*2
-        return StreamingResponse(_err_gen(), media_type="text/event-stream")
     async def generate():
         global metrics
         nonlocal input_tokens
@@ -151,8 +141,8 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
             _caller_cap = vllm_body.get("max_tokens") or 0
             if _caller_cap > 0:
                 max_tokens = min(max_tokens, _caller_cap)
-            if max_tokens < MIN_OUTPUT:
-                log.info("Stream: initial output budget %d < MIN_OUTPUT %d - stopping", max_tokens, MIN_OUTPUT)
+            if max_tokens < MAX_OUTPUT:
+                log.info("Stream: initial output budget %d < MAX_OUTPUT %d - stopping", max_tokens, MAX_OUTPUT)
                 exit_reason = "total_output_budget"
                 metrics["output_total_budget_exhausted"] += 1
                 for x in _flush_seam():
@@ -220,7 +210,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                                 # Parse actual token count from vLLM error for accurate recut target
                                 _actual_in, _actual_max = _parse_vllm_actual_tokens(_et)
                                 if _actual_in:
-                                    _desired_out = min(_actual_max or MIN_OUTPUT, MAX_OUTPUT)
+                                    _desired_out = min(_actual_max or MAX_OUTPUT, MAX_OUTPUT)
                                     _recut_target = MAX_CONTEXT - SAFETY_MARGIN - _desired_out
                                     log.info("Recut using vLLM actual: input=%d max_tokens=%d target_input=%d",
                                              _actual_in, _desired_out, _recut_target)

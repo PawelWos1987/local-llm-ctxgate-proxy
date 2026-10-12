@@ -226,6 +226,9 @@ _window_persist_enabled: Optional[bool] = None
 _window_persist_warned = False
 _window_persist_cooldown_until: float = 0.0
 _window_locks: dict = {}
+last_context_path = "unknown"
+last_msg_counts = {}
+last_prefix_cache = "n/a"
 _summary_task_locks: dict = {}
 _summary_last_attempt: dict = {}
 session_prefix_hashes: dict = {}
@@ -401,7 +404,7 @@ if __name__ == "__main__":
     asyncio.set_event_loop(_loop)
     _loop.set_exception_handler(_global_asyncio_exception_handler)
 
-    config = uvicorn.Config(app, host=CTXGATE_HOST, port=PROXY_PORT, log_level="warning", timeout_graceful_shutdown=3, limit_concurrency=100, timeout_keep_alive=65)
+    config = uvicorn.Config(app, host=CTXGATE_HOST, port=PROXY_PORT, log_level="warning", timeout_graceful_shutdown=60, limit_concurrency=100, timeout_keep_alive=65)
     server = uvicorn.Server(config)
     server.install_signal_handlers = lambda: None
     import contextlib as _contextlib

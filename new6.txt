@@ -1,1 +1,0 @@
-            _stream_truncated = (exit_reason not in ("ok", "tool_calls_complete")) or loop_in_content or loop_in_reasoning

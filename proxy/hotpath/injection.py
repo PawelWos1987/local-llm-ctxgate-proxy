@@ -6,7 +6,7 @@ import time
 from proxy.config import (
     CTXGATE_INJECT_EPOCH_FREEZE_ON, CTXGATE_INJECT_MAX_TOKENS_CFG,
     CTXGATE_INJECT_MAX_TOKENS_RECAP_CFG, MAX_INPUT, MAX_CONTEXT,
-    SAFETY_MARGIN, MIN_OUTPUT,
+    SAFETY_MARGIN, MAX_OUTPUT,
 )
 from proxy.window.state import _msg_anchor
 from proxy.utils.helpers import _detect_recap_intent, _compute_epoch_key, _fit_to_budget
@@ -89,7 +89,7 @@ async def _apply_epoch_injection(
             if _recap:
                 _inject_budget = CTXGATE_INJECT_MAX_TOKENS_RECAP_CFG
             # Hard-clamp: never exceed ceiling - 500
-            _ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
+            _ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MAX_OUTPUT)
             _inject_budget = min(_inject_budget, _ceiling - 500)
 
             _block = ""

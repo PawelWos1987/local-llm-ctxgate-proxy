@@ -57,9 +57,9 @@ def validate_config() -> list:
     except Exception as e:
         problems.append(f"VLLM_URL unparseable: {e}")
 
-    # 3. MAX_INPUT + SAFETY_MARGIN + MIN_OUTPUT <= MAX_CONTEXT
-    if _c.MAX_INPUT + _c.SAFETY_MARGIN + _c.MIN_OUTPUT > _c.MAX_CONTEXT:
-        problems.append(f"MAX_INPUT({_c.MAX_INPUT}) + SAFETY_MARGIN({_c.SAFETY_MARGIN}) + MIN_OUTPUT({_c.MIN_OUTPUT}) > MAX_CONTEXT({_c.MAX_CONTEXT})")
+    # 3. MAX_INPUT + SAFETY_MARGIN + MAX_OUTPUT <= MAX_CONTEXT
+    if _c.MAX_INPUT + _c.SAFETY_MARGIN + _c.MAX_OUTPUT > _c.MAX_CONTEXT:
+        problems.append(f"MAX_INPUT({_c.MAX_INPUT}) + SAFETY_MARGIN({_c.SAFETY_MARGIN}) + MAX_OUTPUT({_c.MAX_OUTPUT}) > MAX_CONTEXT({_c.MAX_CONTEXT})")
 
     # 4. MAX_OUTPUT >= 1
     if _c.MAX_OUTPUT < 1:

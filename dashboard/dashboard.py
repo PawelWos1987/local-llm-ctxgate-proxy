@@ -837,7 +837,15 @@ def _proc_snapshot() -> list:
         return any(p in s for p in _FLOW)
     rows = [r for r in rows if _is_flow(r)]
     rows.sort(key=lambda r: r["rss_kb"], reverse=True)
-    return rows[:12]
+    # Guarantee proxy, worker, dashboard are always shown
+    _must_have = ("app.py", "worker.py", "dashboard.py")
+    selected = list(rows[:12])
+    for mh in _must_have:
+        if not any(mh in (r["name"] + " " + r.get("cmdline", "")).lower() for r in selected):
+            match = next((r for r in rows if mh in (r["name"] + " " + r.get("cmdline", "")).lower()), None)
+            if match:
+                selected.append(match)
+    return selected
 
 
 def _uptime() -> float:
@@ -971,8 +979,17 @@ _PROC_LABELS = {
     "goose":  ("goose",),
     "proxy":  ("proxy/app.py", "app.py"),
     "worker": ("worker/worker.py", "worker.py"),
+    "dashboard": ("dashboard.py",),
 }
 
+# Number of cores each process is pinned to (for % of allocation)
+_PROC_CORES = {
+    "vllm": 1,
+    "goose": 2,    # C4 + C5
+    "proxy": 1,    # C4
+    "worker": 1,   # C4
+    "dashboard": 1, # C4
+}
 
 async def sample_gpu() -> dict:
     """Per-GPU utilization, VRAM, temp, power via nvidia-smi (real data)."""
@@ -1046,7 +1063,8 @@ def sample_process_util() -> dict:
             continue
         if prev and prev.get("pids") == plist and prev["ts"] > 0:
             dt = max(0.05, now - prev["ts"])
-            cpu_pct = 100.0 * (max(0, t - prev["ticks"]) / _CLK_TCK) / dt
+            cores = _PROC_CORES.get(label, 1)
+            cpu_pct = 100.0 * (max(0, t - prev["ticks"]) / _CLK_TCK) / dt / cores
         else:
             cpu_pct = 0.0  # baseline tick (new pids) -> no delta yet
         _proc_prev[label] = {"ticks": t, "ts": now, "pids": plist}
@@ -1492,21 +1510,21 @@ def _deliverable_html(rows) -> str:
             "h1{font-size:20px}table{border-collapse:collapse;width:100%;font-size:13px}"
             "th,td{border:1px solid #2a2f3a;padding:6px 8px;text-align:left;vertical-align:top}"
             "th{background:#1a1f2b;position:sticky;top:0}tr:nth-child(even){background:#141821}"
-            "a{color:#5ab0ff}td:first-child{font-family:monospace;color:#888}
-/* Worker 4B: enhanced section */
-.wk-badge{margin-left:auto;font-size:.75em;font-weight:bold;padding:2px 8px;border-radius:3px;letter-spacing:.5px}
-.wk-badge.healthy{background:#0a2a1a;color:var(--green);border:1px solid #1a5a3a}
-.wk-badge.warn{background:#2a1a0a;color:var(--yellow);border:1px solid #5a4a1a}
-.wk-badge.throttled{background:#2a0a0a;color:var(--red);border:1px solid #5a1a1a}
-.wk-badge.starved{background:#1a0a2a;color:#c084fc;border:1px solid #5a3a7a}
-.wk-badge.degraded{background:#2a1a0a;color:var(--yellow);border:1px solid #5a4a1a}
-.wk-badge.down{background:#2a0a0a;color:var(--red);border:1px solid #5a1a1a}
-.wk-bar-track{height:5px;background:#05080d;border:1px solid var(--border);border-radius:3px;overflow:hidden;margin:1px 0 3px 0}
-.wk-bar-fill{height:100%;border-radius:3px;transition:width .5s ease,background .5s ease;background:var(--green)}
-.wk-bar-fill.warn{background:var(--yellow)}
-.wk-bar-fill.danger{background:var(--red)}
-.fill-ctx{background:linear-gradient(90deg,var(--cyan),var(--blue))}
-</style></head>"
+            "a{color:#5ab0ff}td:first-child{font-family:monospace;color:#888}"
+"/* Worker 4B: enhanced section */"
+".wk-badge{margin-left:auto;font-size:.75em;font-weight:bold;padding:2px 8px;border-radius:3px;letter-spacing:.5px}"
+".wk-badge.healthy{background:#0a2a1a;color:var(--green);border:1px solid #1a5a3a}"
+".wk-badge.warn{background:#2a1a0a;color:var(--yellow);border:1px solid #5a4a1a}"
+".wk-badge.throttled{background:#2a0a0a;color:var(--red);border:1px solid #5a1a1a}"
+".wk-badge.starved{background:#1a0a2a;color:#c084fc;border:1px solid #5a3a7a}"
+".wk-badge.degraded{background:#2a1a0a;color:var(--yellow);border:1px solid #5a4a1a}"
+".wk-badge.down{background:#2a0a0a;color:var(--red);border:1px solid #5a1a1a}"
+".wk-bar-track{height:5px;background:#05080d;border:1px solid var(--border);border-radius:3px;overflow:hidden;margin:1px 0 3px 0}"
+".wk-bar-fill{height:100%;border-radius:3px;transition:width .5s ease,background .5s ease;background:var(--green)}"
+".wk-bar-fill.warn{background:var(--yellow)}"
+".wk-bar-fill.danger{background:var(--red)}"
+".fill-ctx{background:linear-gradient(90deg,var(--cyan),var(--blue))}"
+"</style></head>"
             "<body><h1>Agent Deliverables</h1>"
             "<table><thead><tr><th>id</th><th>name</th><th>session</th>"
             "<th>working_dir</th><th>provider</th><th>summary</th>"
@@ -1770,7 +1788,7 @@ DASHBOARD_HTML = r"""
 --green:#00ff88;--yellow:#ffaa00;--red:#ff3344;--blue:#4488ff;
 --cyan:#22d3ee;--text:#c8d8e8;--dim:#4a6a8a;
 }
-body{font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background:var(--bg);color:var(--text);height:100vh;overflow:hidden;display:flex;flex-direction:column}
+body{font-size:21px;font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background:var(--bg);color:var(--text);height:100vh;overflow:hidden;display:flex;flex-direction:column}
 /* Header */
 .header{background:#080c12;border-bottom:2px solid var(--border);padding:6px 20px;display:flex;justify-content:space-between;align-items:center;height:46px;flex-shrink:0;gap:12px}
 .header .left{display:flex;align-items:center;gap:10px}
@@ -1780,7 +1798,7 @@ body{font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background
 .btn:hover{border-color:var(--green);color:var(--green)}
 .btn.green{color:var(--green)}
 /* Main grid: top row = 5 service boxes, bottom row = system + processes */
-.main{flex:1;display:grid;grid-template-columns:repeat(6,1fr) 1.6fr;grid-template-rows:auto 1fr;gap:8px;padding:10px;min-height:0}
+.main{flex:1;display:grid;grid-template-columns:1fr 1fr 1fr;grid-template-rows:auto 1fr;gap:8px;padding:10px;min-height:0}
 /* Service boxes (top row) */
 .box{background:var(--panel);border:2px solid var(--border);border-radius:6px;padding:10px;position:relative;display:flex;flex-direction:column;transition:border-color .3s,box-shadow .3s;min-width:0}
 .box.up{border-color:var(--green);box-shadow:0 0 14px #00ff8833}
@@ -1807,6 +1825,7 @@ body{font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background
 .controls button:disabled{opacity:.4;cursor:wait}
 /* System panel (bottom-left area) */
 .syspanel{background:var(--panel);border:2px solid var(--border);border-radius:6px;padding:10px;display:grid;grid-template-columns:1fr 1fr;gap:8px 14px;align-content:start}
+.svc-stack{display:flex;flex-direction:column;gap:8px;min-height:0;overflow-y:auto}
 .syspanel .sp-title{grid-column:1/3;font-size:.72em;font-weight:bold;text-transform:uppercase;letter-spacing:1.5px;color:var(--cyan);margin-bottom:2px}
 .gauge{display:flex;flex-direction:column;gap:3px}
 .gauge .gl{display:flex;justify-content:space-between;font-size:.7em}
@@ -1828,10 +1847,11 @@ body{font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background
 .util-grid-6{grid-template-columns:repeat(6,1fr)}
 .util-grid-8{grid-template-columns:repeat(8,1fr)}
 .util-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px}
-.util-grid-3{grid-template-columns:repeat(3,1fr);display:grid;gap:6px;flex:1}
+.util-grid-3{grid-template-columns:repeat(3,1fr);display:grid;gap:6px}
 
 .ccard{padding:5px}
 .ccard .uc-name{font-size:.65em}
+.ccard{min-height:32px!important;padding:5px 8px}
 .ccard .uc-val{font-size:.9em;margin-left:auto}
 .ccard .bar-track{height:6px}
 .ccard .bar-fill{transition:width .5s,background .5s}
@@ -1841,7 +1861,7 @@ body{font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background
 .corebar-fill{height:100%;border-radius:1px;transition:width .5s}
 .fill-mio{background:linear-gradient(90deg,#38bdf8,#06b6d4)}
 .fill-pf{background:linear-gradient(90deg,#fbbf24,#f59e0b)}
-.ucard{background:#0a0e14;border:1px solid var(--border);border-radius:5px;padding:8px;display:flex;flex-direction:column;gap:5px;transition:border-color .3s}
+.ucard{background:#0a0e14;border:1px solid var(--border);border-radius:5px;padding:8px;display:flex;flex-direction:column;gap:5px;min-height:72px;transition:border-color .3s}
 .uc-head{display:flex;align-items:center;gap:6px}
 .uc-ic{font-size:1.1em}
 .uc-name{font-size:.72em;color:var(--dim);text-transform:uppercase;letter-spacing:.5px}
@@ -1862,12 +1882,12 @@ body{font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background
 .kvbar-l .k{color:var(--dim)}
 .kvbar-l .v{color:var(--text)}
 /* Top processes table (bottom-right) */
-.procs{background:var(--panel);border:2px solid var(--border);border-radius:6px;display:flex;flex-direction:column;min-height:0;overflow:hidden}
+.procs{background:var(--panel);border:2px solid var(--border);border-radius:6px;display:flex;flex-direction:column;max-height:350px;min-height:0;overflow:hidden}
 .procs .pt{font-size:.72em;font-weight:bold;text-transform:uppercase;letter-spacing:1.5px;color:var(--cyan);padding:2px 0 6px}
-.procs .table-wrap{flex:1;overflow-y:auto;min-height:0}
+.procs .table-wrap{flex:1;overflow-y:auto;min-height:0;max-height:288px}
 .ptable{width:100%;border-collapse:collapse;font-size:.72em}
 .ptable th{text-align:left;padding:4px 6px;border-bottom:2px solid var(--border);color:var(--dim);font-size:.72em;letter-spacing:.5px;text-transform:uppercase;position:sticky;top:0;background:var(--panel)}
-.ptable td{padding:3px 6px;border-bottom:1px solid #111;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ptable td{padding:4px 6px;border-bottom:1px solid #111;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ptable tr:hover td{background:rgba(255,255,255,.03)}
 .ptable .num{text-align:right;color:var(--cyan)}
 .ptable .pname{max-width:120px}
@@ -1956,7 +1976,62 @@ body{font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background
 </div>
 
 <div class="main">
-  <!-- Row 1: service boxes -->
+  <!-- [0,0] VLLM 27B -->
+  <div class="box" id="box-vllm">
+  <div class="title"><span class="led"></span>VLLM 27B</div>
+  <div class="metrics">
+  <div class="metric-row"><span class="k">Status</span><span class="v" id="vl-status">--</span></div>
+  <div class="metric-row"><span class="k">Latency</span><span class="v" id="vl-lat">--</span></div>
+  <div class="metric-row"><span class="k">Prefill 5m</span><span class="v big" id="vl-prefill">--</span></div>
+  <div class="metric-row"><span class="k">Gen real</span><span class="v big" id="vl-genreal">--</span></div>
+  <div class="metric-row"><span class="k">Gen total</span><span class="v" id="vl-gentotal">--</span></div>
+  <div class="metric-row"><span class="k">Reqs run/w</span><span class="v" id="vl-reqs">--</span></div>
+  <div class="kvbar"><div class="kvbar-l"><span class="k">KV cache</span><span class="v" id="vl-kv">--</span></div>
+  <div class="bar-track"><div class="bar-fill fill-kv" id="b-kv" style="width:0%"></div></div></div>
+  <div class="kvbar"><div class="kvbar-l"><span class="k">Pfx cache hit</span><span class="v" id="vl-pfx">--</span></div>
+  <div class="bar-track"><div class="bar-fill fill-pfx" id="b-pfx" style="width:0%"></div></div></div>
+  </div>
+  <div class="note">:29000 Qwen3.8-27B. 5m rolling rates from /metrics (real data).</div>
+  </div>
+
+  <!-- [1,0] WORKER 4B -->
+  <div class="box" id="box-worker">
+  <div class="title" data-tip="WORKER 4B|Memory-extraction daemon. Consumes context-gate events, distils them into durable memories in PostgreSQL. Rolling 60s/5m windows computed dashboard-side."><span class="led"></span>WORKER 4B<span class="wk-badge" id="wk-badge">--</span></div>
+  <div class="metrics">
+  <div class="metric-row" data-tip="Status|HEALTHY / WARN / THROTTLED / STARVED / DEGRADED / DOWN. Derived from utilization, queue depth, latency, context pressure."><span class="k">Status</span><span class="v" id="wk-status">--</span></div>
+  <div class="metric-row" data-tip="PID / Heartbeat|OS process ID and seconds since last heartbeat."><span class="k">PID / HB</span><span class="v" id="wk-pid">--</span></div>
+  <div class="metric-row" data-tip="Queue|Processing / Pending / Done today / Failed today."><span class="k">Queue</span><span class="v" id="wk-queue">--</span></div>
+  <div class="metric-row" data-tip="Req/min (60s)|Actual requests in the last 60s vs the configured RPM limit."><span class="k">Req/min</span><span class="v" id="wk-rpm">--</span></div>
+  <div class="wk-bar-track"><div class="wk-bar-fill" id="wk-rpm-bar" style="width:0%"></div></div>
+  <div class="metric-row" data-tip="Tok/min (60s)|Total tokens (in+out) in the last 60s vs the token limit."><span class="k">Tok/min</span><span class="v" id="wk-tok">--</span></div>
+  <div class="wk-bar-track"><div class="wk-bar-fill" id="wk-tok-bar" style="width:0%"></div></div>
+  <div class="metric-row" data-tip="Context|Avg / Max / Limit tokens. Warns at >=80% of context window."><span class="k">Context</span><span class="v" id="wk-ctx">--</span></div>
+  <div class="wk-bar-track"><div class="wk-bar-fill fill-ctx" id="wk-ctx-bar" style="width:0%"></div></div>
+  <div class="metric-row" data-tip="Latency (60s)|avg / p50 / p95 / p99 in the last 60 seconds."><span class="k">Latency</span><span class="v" id="wk-lat">--</span></div>
+  <div class="metric-row" data-tip="In/Out (60s)|Avg and p95 input & output tokens per request."><span class="k">In/Out</span><span class="v" id="wk-io">--</span></div>
+  <div class="metric-row" data-tip="ETA drain|Estimated time to clear the pending queue at the current 60s rate."><span class="k">ETA drain</span><span class="v" id="wk-eta">--</span></div>
+  </div>
+  <div class="controls">
+  <button class="s" onclick="ctrl(event,'worker','start')">START</button>
+  <button class="p" onclick="ctrl(event,'worker','stop')">STOP</button>
+  <button class="r" onclick="ctrl(event,'worker','restart')">RESTART</button>
+  </div>
+  <div class="note">qwen3-4b · rolling 60s/5m · limits from env</div>
+  </div>
+
+  <!-- [2,0] TOP PROCESSES -->
+  <div class="procs" id="procs">
+  <div class="pt">&#128202; TOP PROCESSES (by memory)</div>
+  <div class="table-wrap">
+  <table class="ptable">
+  <thead><tr><th>PID</th><th>NAME</th><th>MEM</th><th>MEM%</th><th>CORE</th><th>CORE%</th></tr></thead>
+  <tbody id="procBody"><tr><td colspan="6" style="color:var(--dim)">loading…</td></tr></tbody>
+  </table>
+  </div>
+  </div>
+
+  <!-- [0,1] Service stack: PG, Proxy, Sync, System -->
+  <div class="svc-stack" style="grid-column:1;grid-row:2">
   <div class="box" id="box-pg">
     <div class="title"><span class="led"></span>POSTGRESQL</div>
     <div class="metrics">
@@ -1984,47 +2059,6 @@ body{font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background
     <div class="note">:9201 Context window manager. STOP/RESTART are graceful (SIGTERM → drains in-flight).</div>
   </div>
 
-  <div class="box" id="box-vllm">
-    <div class="title"><span class="led"></span>VLLM 27B</div>
-    <div class="metrics">
-      <div class="metric-row"><span class="k">Status</span><span class="v" id="vl-status">--</span></div>
-      <div class="metric-row"><span class="k">Latency</span><span class="v" id="vl-lat">--</span></div>
-      <div class="metric-row"><span class="k">Prefill 5m</span><span class="v big" id="vl-prefill">--</span></div>
-      <div class="metric-row"><span class="k">Gen real</span><span class="v big" id="vl-genreal">--</span></div>
-      <div class="metric-row"><span class="k">Gen total</span><span class="v" id="vl-gentotal">--</span></div>
-      <div class="metric-row"><span class="k">Reqs run/w</span><span class="v" id="vl-reqs">--</span></div>
-      <div class="kvbar"><div class="kvbar-l"><span class="k">KV cache</span><span class="v" id="vl-kv">--</span></div>
-        <div class="bar-track"><div class="bar-fill fill-kv" id="b-kv" style="width:0%"></div></div></div>
-      <div class="kvbar"><div class="kvbar-l"><span class="k">Pfx cache hit</span><span class="v" id="vl-pfx">--</span></div>
-        <div class="bar-track"><div class="bar-fill fill-pfx" id="b-pfx" style="width:0%"></div></div></div>
-    </div>
-    <div class="note">:29000 Qwen3.8-27B. 5m rolling rates from /metrics (real data).</div>
-  </div>
-
-  <div class="box" id="box-worker">
-    <div class="title" data-tip="WORKER 4B|Memory-extraction daemon. Consumes context-gate events, distils them into durable memories in PostgreSQL. Rolling 60s/5m windows computed dashboard-side."><span class="led"></span>WORKER 4B<span class="wk-badge" id="wk-badge">--</span></div>
-    <div class="metrics">
-      <div class="metric-row" data-tip="Status|HEALTHY / WARN / THROTTLED / STARVED / DEGRADED / DOWN. Derived from utilization, queue depth, latency, context pressure."><span class="k">Status</span><span class="v" id="wk-status">--</span></div>
-      <div class="metric-row" data-tip="PID / Heartbeat|OS process ID and seconds since last heartbeat."><span class="k">PID / HB</span><span class="v" id="wk-pid">--</span></div>
-      <div class="metric-row" data-tip="Queue|Processing / Pending / Done today / Failed today."><span class="k">Queue</span><span class="v" id="wk-queue">--</span></div>
-      <div class="metric-row" data-tip="Req/min (60s)|Actual requests in the last 60s vs the configured RPM limit."><span class="k">Req/min</span><span class="v" id="wk-rpm">--</span></div>
-      <div class="wk-bar-track"><div class="wk-bar-fill" id="wk-rpm-bar" style="width:0%"></div></div>
-      <div class="metric-row" data-tip="Tok/min (60s)|Total tokens (in+out) in the last 60s vs the token limit."><span class="k">Tok/min</span><span class="v" id="wk-tok">--</span></div>
-      <div class="wk-bar-track"><div class="wk-bar-fill" id="wk-tok-bar" style="width:0%"></div></div>
-      <div class="metric-row" data-tip="Context|Avg / Max / Limit tokens. Warns at >=80% of context window."><span class="k">Context</span><span class="v" id="wk-ctx">--</span></div>
-      <div class="wk-bar-track"><div class="wk-bar-fill fill-ctx" id="wk-ctx-bar" style="width:0%"></div></div>
-      <div class="metric-row" data-tip="Latency (60s)|avg / p50 / p95 / p99 in the last 60 seconds."><span class="k">Latency</span><span class="v" id="wk-lat">--</span></div>
-      <div class="metric-row" data-tip="In/Out (60s)|Avg and p95 input & output tokens per request."><span class="k">In/Out</span><span class="v" id="wk-io">--</span></div>
-      <div class="metric-row" data-tip="ETA drain|Estimated time to clear the pending queue at the current 60s rate."><span class="k">ETA drain</span><span class="v" id="wk-eta">--</span></div>
-    </div>
-    <div class="controls">
-      <button class="s" onclick="ctrl(event,'worker','start')">START</button>
-      <button class="p" onclick="ctrl(event,'worker','stop')">STOP</button>
-      <button class="r" onclick="ctrl(event,'worker','restart')">RESTART</button>
-    </div>
-    <div class="note">qwen3-4b · rolling 60s/5m · limits from env</div>
-  </div>
-
   <div class="box" id="box-sync">
     <div class="title" data-tip="Session Sync|Syncs Goose sessions from SQLite into PostgreSQL proxy.tasks every 15 minutes. Runs as a systemd user unit (ctxgate-session-sync.service)."><span class="led"></span>SESSION SYNC</div>
     <div class="metrics">
@@ -2041,8 +2075,6 @@ body{font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background
     </div>
     <div class="note">Goose sessions → PG tasks. 15-min sync cycle.</div>
   </div>
-
-  <!-- Row 2: system panel + top processes -->
   <div class="syspanel" id="syspanel">
     <div class="sp-title">&#128450; SYSTEM</div>
     <div class="gauge">
@@ -2075,18 +2107,10 @@ body{font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background
       <div class="gl"><span class="k">CPU PSI</span><span class="v" id="s-psi-cpu">--</span></div>
     </div>
   </div>
-
-  <div class="procs">
-    <div class="pt" data-tip="Top Processes (by memory)|12 heaviest by RSS. CORE = physical core the process is on.">&#128202; TOP PROCESSES (by memory)</div>
-    <div class="table-wrap">
-      <table class="ptable">
-        <thead><tr><th data-tip="PID|Process ID.">PID</th><th data-tip="Name|Process name from /proc/PID/comm (truncated to 20 chars).">NAME</th><th data-tip="Memory|Resident set size (physical RAM currently in use).">MEM</th><th data-tip="Memory %|RSS &divide; 60 GB total, i.e. the share of host RAM.">MEM%</th><th data-tip="CORE|Physical core (0-31) the process is running on RIGHT NOW (/proc/PID/stat field 39). Changes as scheduler moves threads. Pinned procs stay put.">CORE</th></tr></thead>
-        <tbody id="procBody"><tr><td colspan="5" style="color:var(--dim)">loading…</td></tr></tbody>
-      </table>
-    </div>
   </div>
 
-  <div class="utilpanel" id="utilpanel">
+  <!-- [1-2,1] UTILIZATION -->
+  <div class="utilpanel" id="utilpanel" style="grid-column:2/4;grid-row:2">
     <div class="sp-title">&#9889; UTILIZATION <span class="util-hint">100% = saturated &rarr; optimize (e.g. vLLM parallel=2)</span></div>
 
     <!-- Row 1: CPU -->
@@ -2155,6 +2179,9 @@ body{font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background
       <div class="ucard ccard" id="cc-7"><div class="uc-head"><span class="uc-name">C7</span><span class="uc-val" id="c-7-v">--</span></div><div class="bar-track"><div class="bar-fill" id="c-7-b" style="width:0%"></div></div></div>
     </div>
   </div>
+</div>
+</div>
+</div>
 </div>
 
 <!-- Bottom bar: TODAY (big) / YESTERDAY (small) - starting point = local midnight (00:00), not any service boot -->
@@ -2381,12 +2408,13 @@ if(sys.procs&&sys.procs.length){
     if(pin) tip+=' &middot; pinned to '+pin+' ('+p.pin_count+' cores) &middot; '+pc.toFixed(1)+'% per core';
     else tip+=' &middot; not pinned (spread across all cores)';
     tip+=' &middot; RSS '+fmtKB(p.rss_kb);
+    var cu=(p.core_now>=0&&sys.cpu_per_core&&sys.cpu_per_core[p.core_now]!=null)?sys.cpu_per_core[p.core_now]:pc;
     return '<tr data-tip="'+tip+'">'+
-      '<td class="num">'+p.pid+'</td><td class="pname">'+p.name+'</td><td class="num">'+fmtKB(p.rss_kb)+'</td><td class="num">'+mp.toFixed(1)+'%</td><td class="num" style="color:var(--cyan)">'+(p.core_now>=0?p.core_now:'?')+'</td></tr>';
+      '<td class="num">'+p.pid+'</td><td class="pname">'+p.name+'</td><td class="num">'+fmtKB(p.rss_kb)+'</td><td class="num">'+mp.toFixed(1)+'%</td><td class="num" style="color:var(--cyan)">'+(p.core_now>=0?p.core_now:'?')+'</td><td class="num" style="color:'+(cu>=90?'var(--red)':(cu>=70?'var(--yellow)':'var(--green)'))+'">'+cu.toFixed(1)+'%</td></tr>';
   }).join('');
   $('procBody').innerHTML=rows;
 }else{
-  $('procBody').innerHTML='<tr><td colspan="5" style="color:var(--dim)">no data</td></tr>';
+  $('procBody').innerHTML='<tr><td colspan="6" style="color:var(--dim)">no data</td></tr>';
 }
 
 // --- Utilization panel (6 cards = optimize signal) ---
@@ -2434,7 +2462,7 @@ spark('u-pf-s',H.map(function(x){return (x.pgfault||0)/10||0}),100);
 spark('u-gpu-s',H.map(function(x){return x.gpu_util||0}),100);
 spark('u-vmem-s',H.map(function(x){return x.gpu_mem||0}),100);
 var pu=d.process_util||{};var pb=$('procbars');
-if(pb){var order=[['vllm','vLLM'],['goose','Goose'],['proxy','Proxy'],['worker','Worker']];pb.innerHTML=order.map(function(o){var p=pu[o[0]]||{};var v=p.cpu_pct!=null?p.cpu_pct:0;var col=v>=90?'var(--red)':(v>=70?'var(--yellow)':'var(--green)');return '<div class="pbar"><span class="pbar-name">'+o[1]+'</span><div class="bar-track"><div class="bar-fill" style="width:'+Math.min(100,v)+'%;background:'+col+'"></div></div><span class="pbar-val">'+v.toFixed(0)+'%</span></div>';}).join('');}
+if(pb){var order=[['vllm','vLLM'],['goose','Goose'],['proxy','Proxy'],['worker','Worker'],['dashboard','Dashboard']];pb.innerHTML=order.map(function(o){var p=pu[o[0]]||{};var v=p.cpu_pct!=null?p.cpu_pct:0;var col=v>=90?'var(--red)':(v>=70?'var(--yellow)':'var(--green)');return '<div class="pbar"><span class="pbar-name">'+o[1]+'</span><div class="bar-track"><div class="bar-fill" style="width:'+Math.min(100,v)+'%;background:'+col+'"></div></div><span class="pbar-val">'+v.toFixed(0)+'%</span></div>';}).join('');}
 
 }catch(e){console.error('poll-main',e)}
 try{

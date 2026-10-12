@@ -1,1 +1,1 @@
-ENOENT: no such file or directory, open '/home/pawelw/ctxproxy/proxy/window/context.py'
+# Placeholder - context building lives in proxy/hotpath/context.py

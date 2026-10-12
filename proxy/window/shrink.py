@@ -11,6 +11,10 @@ log = logging.getLogger("ctxgate-proxy")
 
 # TODO(I4): replace with AppContext
 
+# Prefixes that identify the proxy-injected block within the last user message.
+# When allow_injection_prune=True, _emergency_shrink can remove these.
+_INJECTION_PREFIXES = ("Relevant knowledge:", "Task memory:", "Session digest:")
+
 
 class ContextCapacityError(Exception):
     """Raised when protected material alone exceeds the ceiling even after
@@ -22,15 +26,16 @@ class ContextCapacityError(Exception):
         self.ceiling = ceiling
 
 
-def _protected_indices(work: list) -> set:
-    """Indices that _emergency_shrink must never drop: the seed (first 3), the
-    pinned newest-user copy (flagged), and
-    the canonical protected tool groups (newest 4 tool results + their assistant
-    tool_calls declarations). Uses protected_tool_groups as the single source
-    of truth for recent tool body protection."""
+def _protected_indices(work: list, aggressive: bool = False) -> set:
+    """Indices that _emergency_shrink must never drop.
+
+    Standard mode: seed (first 3) + protected tool groups + live prompt.
+    Aggressive mode: seed (first 3) + live prompt ONLY (tool groups unprotected).
+    """
     protected = set(range(min(3, len(work))))
-    # Canonical: newest 4 tool groups (replaces old "newest 6" ad-hoc logic)
-    protected |= protected_tool_groups(work)
+    if not aggressive:
+        # Canonical: newest 4 tool groups (replaces old "newest 6" ad-hoc logic)
+        protected |= protected_tool_groups(work)
     # Live prompt (last user message) must NEVER be elided
     for k in range(len(work) - 1, -1, -1):
         if work[k].get("role") == "user":
@@ -55,29 +60,97 @@ def _truncate_message_content(msg: dict, max_tokens: int) -> dict:
     return new_msg
 
 
-def _emergency_shrink(kept: list, ceiling: int) -> list:
+def _strip_injection_block(content: str) -> str:
+    """Remove the proxy-injected block from a message's content string.
+
+    The injection block consists of sections prefixed with:
+    - "Relevant knowledge:"
+    - "Task memory:"
+    - "Session digest:"
+
+    Returns the content with the injection block removed. If no injection
+    block is found, returns the original content unchanged.
+    """
+    if not isinstance(content, str):
+        return content
+
+    # Find the earliest injection prefix
+    earliest_pos = -1
+    for prefix in _INJECTION_PREFIXES:
+        pos = content.find(prefix)
+        if pos != -1:
+            if earliest_pos == -1 or pos < earliest_pos:
+                earliest_pos = pos
+
+    if earliest_pos == -1:
+        return content
+
+    # Remove everything from the earliest injection prefix to the end
+    # (the injection block is always appended at the end of the user message)
+    stripped = content[:earliest_pos].rstrip()
+    return stripped if stripped else content
+
+
+def _emergency_shrink(kept: list, ceiling: int, aggressive: bool = False,
+                      allow_injection_prune: bool = False,
+                      actual_total: int = 0) -> list:
     """Hard invariant: shrink a built window to <= ceiling tokens without breaking
     the tool-call graph. Uses O(n) incremental token tracking (no re-counting in loops).
     
     Strategy (in order of destructiveness):
     1. Elide large tool bodies (oldest first, skip protected)
     2. Drop oldest whole turn groups (skip protected)
-    3. Truncate the live prompt (newest user message) to fit remaining budget
-    4. If STILL over ceiling -> raise ContextCapacityError (configuration issue)
+    3. If allow_injection_prune=True: remove the injection block from the live prompt
+    4. Truncate the live prompt (newest user message) to fit remaining budget
+    5. If STILL over ceiling -> raise ContextCapacityError (configuration issue)
+    
+    When aggressive=True, the protection set is reduced to only the seed (first 3)
+    and the live prompt (last user message). Tool groups are NOT protected, allowing
+    much more aggressive reduction when the standard shrink cannot meet the ceiling.
+
+    When allow_injection_prune=True (used by the reconciliation path), the function
+    is additionally allowed to remove the proxy-injected block (knowledge + memory +
+    digest) from the last user message before attempting live-prompt truncation.
+
+    When actual_total > 0, it is used as the authoritative total token count for the
+    initial "do we need to shrink?" check. This accounts for non-message overhead
+    (tool definitions, template separators, injection) that count_messages_tokens
+    does not include. Without this, the function can exit early when message tokens
+    are below the ceiling but the full payload (messages + overhead) exceeds it.
     """
     import proxy.app as _app
     metrics = _app.metrics
 
     before = count_messages_tokens(kept)
-    if before <= ceiling:
+    # Use actual_total (full payload estimate) if provided, as it accounts for
+    # non-message overhead (tools, template, injection) that message tokens miss.
+    effective_before = max(before, actual_total) if actual_total > 0 else before
+    if effective_before <= ceiling:
         return kept
     metrics["emergency_shrink_total"] += 1
+    if aggressive:
+        metrics["emergency_shrink_aggressive"] = metrics.get("emergency_shrink_aggressive", 0) + 1
     work = [dict(m) for m in kept]
-    protected = _protected_indices(work)
+    protected = _protected_indices(work, aggressive=aggressive)
     # Pre-compute per-message token estimates (O(n) once)
     msg_toks = [count_message_tokens(m) for m in work]
     running_total = sum(msg_toks)
-    target = _trim_target()
+    # Target: max message tokens such that (messages + overhead) <= ceiling.
+    # Overhead = actual_total - running_total (tools, system, injection).
+    # Uses a DIFFERENCE (stable across calls), not a ratio (which ratchets).
+    if actual_total > 0 and actual_total > running_total:
+        overhead = actual_total - running_total
+        # Guard: if overhead exceeds the ceiling itself, the actual_total is
+        # stale (e.g., from a pre-shrink vLLM response). A real overhead
+        # (tools + template) is at most a few thousand tokens.
+        if overhead > ceiling:
+            log.debug("EMERGENCY SHRINK: stale baseline detected (overhead=%d > ceiling=%d) - using trim_target", overhead, ceiling)
+            target = min(_trim_target(), ceiling)
+        else:
+            target = ceiling - overhead
+    else:
+        target = min(_trim_target(), ceiling)
+    target = max(target, 0)
     
     # (1) elide large tool bodies, oldest-first, SKIP protected
     for i in range(len(work)):
@@ -122,11 +195,33 @@ def _emergency_shrink(kept: list, ceiling: int) -> list:
         for i in range(start, end + 1):
             running_total -= msg_toks[i]
         del work[start:end + 1]
-        msg_toks = [count_message_tokens(m) for m in work]
+        del msg_toks[start:end + 1]
         dropped_groups += 1
     metrics["emergency_shrink_groups_dropped"] += dropped_groups
     
-    # (3) If still over ceiling, truncate the live prompt (newest user message)
+    # (3) If allow_injection_prune and still over ceiling, remove the injection
+    #     block from the live prompt before truncating it.
+    if allow_injection_prune and running_total > ceiling:
+        lu_idx = None
+        for k in range(len(work) - 1, -1, -1):
+            if work[k].get("role") == "user":
+                lu_idx = k
+                break
+        if lu_idx is not None:
+            content = work[lu_idx].get("content")
+            if isinstance(content, str):
+                stripped = _strip_injection_block(content)
+                if stripped != content:
+                    old_tok = msg_toks[lu_idx]
+                    work[lu_idx]["content"] = stripped
+                    new_tok = count_message_tokens(work[lu_idx])
+                    running_total += new_tok - old_tok
+                    msg_toks[lu_idx] = new_tok
+                    metrics["emergency_shrink_injection_pruned"] = metrics.get("emergency_shrink_injection_pruned", 0) + 1
+                    log.info("EMERGENCY SHRINK: pruned injection block from live prompt (saved %d tokens)",
+                             old_tok - new_tok)
+    
+    # (4) If still over ceiling, truncate the live prompt (newest user message)
     if running_total > ceiling:
         # Find the newest user message in work
         lu_idx = None
@@ -152,7 +247,7 @@ def _emergency_shrink(kept: list, ceiling: int) -> list:
                 log.warning("EMERGENCY SHRINK: truncated live prompt from %d to %d tokens (over_by=%d)",
                            current_lu_tok, new_lu_tok, over_by)
     
-    # (4) Final check: if STILL over ceiling, it's a configuration problem
+    # (5) Final check: if STILL over ceiling, it's a configuration problem
     if running_total > ceiling:
         log.error("EMERGENCY SHRINK: protected material exceeds ceiling even after live-prompt truncation (before=%d now=%d ceiling=%d)", before, running_total, ceiling)
         raise ContextCapacityError(

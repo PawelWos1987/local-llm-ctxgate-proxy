@@ -13,7 +13,7 @@ log = logging.getLogger("ctxgate-proxy")
 
 async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, live_prompt_hash: str = ""):
     # TODO(I4): replace with AppContext
-    from proxy.app import (metrics, _vllm_client, CTXGATE_MAX_TOTAL_OUTPUT, MAX_OUTPUT, MIN_OUTPUT,
+    from proxy.app import (metrics, _vllm_client, CTXGATE_MAX_TOTAL_OUTPUT, MAX_OUTPUT,
                            MAX_INPUT, MAX_CONTEXT, SAFETY_MARGIN,
                            _output_budget, _strip_proxy_metadata, _validate_outgoing_payload,
                            VLLM_URL, VLLM_MODEL, _is_context_length_error, _trim_target, _recut_to,
@@ -38,8 +38,8 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
         _caller_cap = vllm_body.get("max_tokens") or 0
         if _caller_cap > 0:
             max_tokens = min(max_tokens, _caller_cap)
-        if max_tokens < MIN_OUTPUT:
-            log.info("Non-stream: output budget %d < MIN_OUTPUT %d - stopping", max_tokens, MIN_OUTPUT)
+        if max_tokens < MAX_OUTPUT:
+            log.info("Non-stream: output budget %d < MAX_OUTPUT %d - stopping", max_tokens, MAX_OUTPUT)
             return JSONResponse({"error": {"message": "Output budget exhausted", "explanation": explain_status("budget")}}, status_code=413)
         vllm_body["max_tokens"] = max_tokens
         metrics["output_max_tokens_seen"] = max(metrics["output_max_tokens_seen"], max_tokens)
@@ -104,7 +104,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
                 # Parse actual token count from vLLM error for accurate recut target
                 _actual_in, _actual_max = _parse_vllm_actual_tokens(resp.text)
                 if _actual_in:
-                    _desired_out = min(_actual_max or MIN_OUTPUT, MAX_OUTPUT)
+                    _desired_out = min(_actual_max or MAX_OUTPUT, MAX_OUTPUT)
                     target = MAX_CONTEXT - SAFETY_MARGIN - _desired_out
                     log.info("Recut using vLLM actual: input=%d max_tokens=%d target_input=%d",
                              _actual_in, _desired_out, target)

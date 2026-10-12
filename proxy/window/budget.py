@@ -1,7 +1,7 @@
 """Budget calculation: safe admitted budget, output budget, token estimation."""
 import logging
 
-from proxy.config.constants import MAX_INPUT, MAX_CONTEXT, SAFETY_MARGIN, MIN_OUTPUT, MAX_OUTPUT, ESTIMATOR_MODE, CTXGATE_INPUT_ESTIMATE_HEADROOM
+from proxy.config.constants import MAX_INPUT, MAX_CONTEXT, SAFETY_MARGIN, MAX_OUTPUT, ESTIMATOR_MODE, CTXGATE_INPUT_ESTIMATE_HEADROOM
 from proxy.token.counter import count_messages_tokens, count_tools_tokens
 from proxy.token.calibrator import calibrator
 
@@ -11,8 +11,15 @@ log = logging.getLogger("ctxgate-proxy")
 
 
 def _safe_admitted_budget() -> int:
-    """The safe admitted input budget: the effective ceiling for input tokens."""
-    return min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
+    """The safe admitted input budget: the effective ceiling for input tokens.
+
+    The -1 accounts for the absolute floor in _output_budget
+    (MAX_CONTEXT - effective_input - SAFETY_MARGIN - 1).
+    Without it, a perfect shrink to this ceiling yields budget = MAX_OUTPUT - 1
+    (off-by-one). The corrected formula guarantees budget >= MAX_OUTPUT when
+    input is shrunk exactly to this ceiling.
+    """
+    return min(MAX_INPUT, int((MAX_CONTEXT - SAFETY_MARGIN - 1 - MAX_OUTPUT) / (1.0 + CTXGATE_INPUT_ESTIMATE_HEADROOM)))
 
 
 def _estimate_delta(messages: list) -> int:
@@ -43,7 +50,7 @@ def _estimate_delta(messages: list) -> int:
     # (that was the last message in the previous request)
     start_idx = user_indices[-2] + 1
     new_msgs = messages[start_idx:]
-    return count_messages_tokens(new_msgs, estimate=True)
+    return count_messages_tokens(new_msgs)
 
 
 def estimate_full_payload_tokens(messages: list, tools: list, note_tokens: int,
@@ -77,6 +84,30 @@ def estimate_full_payload_tokens(messages: list, tools: list, note_tokens: int,
     # Get real baseline from tracker
     last_real = calibrator.get_last_real(session_key)
 
+    # Detect stale baseline: if the current message count is LESS than what
+    # was sent in the previous request, the window has been trimmed (old
+    # messages dropped by build_context). In that case, last_real reflects
+    # the OLD, larger request and is NOT a valid baseline for the current
+    # (smaller) window. Fall back to cold-path full estimation.
+    if last_real > 0:
+        # Guard: poisoned baseline (real >= MAX_CONTEXT from a previous oversized request)
+        if last_real >= MAX_CONTEXT:
+            log.warning(
+                "Poisoned baseline detected: last_real=%d >= MAX_CONTEXT=%d - using cold path",
+                last_real, MAX_CONTEXT,
+            )
+            last_real = 0
+        else:
+            # Detect stale baseline: if the current message count is LESS than what
+            # was sent in the previous request, the window has been trimmed
+            prev_msg_count = calibrator.get_msg_count(session_key)
+            if prev_msg_count > 0 and len(messages) < prev_msg_count:
+                log.debug(
+                    "Stale baseline detected: current_msgs=%d < prev_msgs=%d (window trimmed) - using cold path",
+                    len(messages), prev_msg_count,
+                )
+                last_real = 0
+
     if last_real > 0:
         # Warm path: estimate only the delta
         # The delta is the new content added since the last response
@@ -84,7 +115,7 @@ def estimate_full_payload_tokens(messages: list, tools: list, note_tokens: int,
         total = last_real + delta_tokens + note_tokens
     else:
         # Cold path: full estimation (same as before)
-        msg_tokens = count_messages_tokens(messages, estimate=True)
+        msg_tokens = count_messages_tokens(messages)
         tools_tokens = count_tools_tokens(tools) if tools else 0
         template_overhead = len(messages) * 4
         total = msg_tokens + tools_tokens + template_overhead + note_tokens
@@ -103,11 +134,14 @@ def estimate_full_payload_tokens(messages: list, tools: list, note_tokens: int,
 
 def _output_budget(input_tokens: int) -> int:
     """Single authoritative output budget: never exceed MAX_OUTPUT, and never go
-    negative. The caller enforces the MIN_OUTPUT floor (via _emergency_shrink /
+    negative. The caller enforces the MAX_OUTPUT floor (via _emergency_shrink /
     a 413) before sending a starved request.
 
     Applies CTXGATE_INPUT_ESTIMATE_HEADROOM to proactively reduce max_tokens,
     absorbing estimator underestimation without waiting for a recut.
+
+    The result is clamped to >= 0. Use _output_budget_checked() to distinguish
+    "clamped to 0" from "genuinely 0".
     """
     effective_input = int(input_tokens * (1.0 + CTXGATE_INPUT_ESTIMATE_HEADROOM))
     if effective_input != input_tokens:
@@ -115,4 +149,23 @@ def _output_budget(input_tokens: int) -> int:
             "Input headroom: raw=%d effective=%d (headroom=%.2f)",
             input_tokens, effective_input, CTXGATE_INPUT_ESTIMATE_HEADROOM,
         )
-    return min(MAX_OUTPUT, MAX_CONTEXT - effective_input - SAFETY_MARGIN - 1)  # -1: absolute floor for estimator off-by-one
+    raw = MAX_CONTEXT - effective_input - SAFETY_MARGIN - 1
+    return max(0, min(MAX_OUTPUT, raw))
+
+
+def _output_budget_checked(input_tokens: int) -> tuple:
+    """Output budget with validity flag.
+
+    Returns (budget, is_valid) where:
+    - budget: the clamped output budget (always >= 0)
+    - is_valid: False if the raw (pre-floor) value would be negative,
+      meaning the input alone exceeds the usable context window.
+
+    This lets callers distinguish "clamped to 0 because input is too large"
+    from "genuinely 0 because MAX_OUTPUT is 0".
+    """
+    effective_input = int(input_tokens * (1.0 + CTXGATE_INPUT_ESTIMATE_HEADROOM))
+    raw = MAX_CONTEXT - effective_input - SAFETY_MARGIN - 1
+    is_valid = raw >= 0
+    budget = max(0, min(MAX_OUTPUT, raw))
+    return budget, is_valid

@@ -20,7 +20,7 @@ VLLM_MODEL = os.environ.get("CTXGATE_VLLM_MODEL", "Qwen3.8-27B")
 # Primary source: Goose custom provider config (single source of truth).
 # Fallback: env vars (CTXGATE_MAX_CONTEXT, CTXGATE_MAX_OUTPUT) → hardcoded defaults.
 # All other budget values are derived to maintain the invariant:
-#   MAX_INPUT + SAFETY_MARGIN + MIN_OUTPUT <= MAX_CONTEXT
+#   MAX_INPUT + SAFETY_MARGIN + MAX_OUTPUT <= MAX_CONTEXT
 
 _GOOSE_CONFIG_PATH = os.path.expanduser("~/.config/goose/custom_providers/custom_qwen.json")
 
@@ -46,9 +46,9 @@ MAX_CONTEXT = _env_int("CTXGATE_MAX_CONTEXT", _goose_ctx or 84000)
 MAX_OUTPUT = _env_int("CTXGATE_MAX_OUTPUT", _goose_out or int(MAX_CONTEXT * 0.20))
 
 # Derived budget values (overridable via env for power users, but defaults are computed)
-MIN_OUTPUT = _env_int("CTXGATE_MIN_OUTPUT", int(MAX_OUTPUT / 1.8))
+THINKING_DISABLE_THRESHOLD = MAX_OUTPUT  # when output budget drops below this, disable thinking
 SAFETY_MARGIN = _env_int("CTXGATE_SAFETY_MARGIN", int(MAX_CONTEXT * 0.05))
-MAX_INPUT = _env_int("CTXGATE_MAX_INPUT", MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT)
+MAX_INPUT = _env_int("CTXGATE_MAX_INPUT", MAX_CONTEXT - SAFETY_MARGIN - MAX_OUTPUT)
 
 # --- Rolling window (sticky cut) config ---
 TRIM_TARGET_TOKENS = _env_int("CTXGATE_TRIM_TARGET_TOKENS", 0)
@@ -68,8 +68,8 @@ CTXGATE_INJECT_EPOCH_FREEZE_ON = os.environ.get("CTXGATE_INJECT_EPOCH_FREEZE", "
 CTXGATE_INJECT_MAX_TOKENS_CFG = _env_int("CTXGATE_INJECT_MAX_TOKENS", 3000)
 CTXGATE_INJECT_MAX_TOKENS_RECAP_CFG = _env_int("CTXGATE_INJECT_MAX_TOKENS_RECAP", 5000)
 # High/low watermark for rolling window re-cut
-CTXGATE_WINDOW_TRIGGER_FRAC = _env_float("CTXGATE_WINDOW_TRIGGER_FRAC", 0.75)
-CTXGATE_WINDOW_TARGET_FRAC = _env_float("CTXGATE_WINDOW_TARGET_FRAC", 0.6)
+CTXGATE_WINDOW_TRIGGER_FRAC = _env_float("CTXGATE_WINDOW_TRIGGER_FRAC", 0.65)
+CTXGATE_WINDOW_TARGET_FRAC = _env_float("CTXGATE_WINDOW_TARGET_FRAC", 0.55)
 CUT_QUANTUM = _env_int("CTXGATE_CUT_QUANTUM", 512)
 
 WALL_CLOCK_MAX = _env_int("CTXGATE_WALL_CLOCK_MAX", 1800)
@@ -209,4 +209,5 @@ M_FLOOR_COLD = 0.50    # cold-start margin floor (first 2 obs)
 M_CAP = 0.25           # max margin
 ESTIMATOR_MODE = os.environ.get("CTXGATE_TOKEN_ESTIMATOR", "calibrated")
 CTXGATE_INPUT_ESTIMATE_HEADROOM = _env_float("CTXGATE_INPUT_ESTIMATE_HEADROOM", 0.05)
+CTXGATE_PROACTIVE_TRIM_FRAC = _env_float("CTXGATE_PROACTIVE_TRIM_FRAC", 0.80)
 

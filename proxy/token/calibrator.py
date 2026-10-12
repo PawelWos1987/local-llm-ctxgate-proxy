@@ -17,6 +17,7 @@ from proxy.config.constants import (
     M_FLOOR,
     M_FLOOR_COLD,
     M_CAP,
+    MAX_CONTEXT,
 )
 
 
@@ -31,6 +32,10 @@ class RealTokenTracker:
     of the conversation prefix. Subsequent requests only need to estimate
     the DELTA (new messages), which is a much smaller and more predictable
     quantity.
+
+    The tracker also stores the message count at the time of the last
+    observation, enabling precise delta calculation even in agentic loops
+    where there is only a single user message.
     """
 
     def __init__(self):
@@ -44,11 +49,17 @@ class RealTokenTracker:
         self.max_over_pct = 0.0
         self.ratio = 1.0
 
-    def observe(self, session_key: str, predicted: int, real: int) -> None:
+    def observe(self, session_key: str, predicted: int, real: int, msg_count: int = 0) -> None:
         """Store real token data and update confidence.
 
         Called after receiving real prompt_tokens from vLLM response.
         The 'real' value becomes the new baseline for this session.
+
+        Args:
+            session_key: Session identifier
+            predicted: The estimated token count we sent to vLLM
+            real: The actual prompt_tokens reported by vLLM
+            msg_count: Number of messages in the request (for delta tracking)
 
         If predicted <= 0, we still store the real baseline but do not
         increment the observation count (no valid prediction to calibrate).
@@ -56,13 +67,29 @@ class RealTokenTracker:
         if real <= 0:
             return
 
+        # Guard: reject poisoned baselines. If vLLM reports prompt_tokens >= MAX_CONTEXT,
+        # the request was oversized and this value is NOT a valid baseline for future
+        # estimation. Storing it would cause the next request to estimate >= MAX_CONTEXT
+        # and trigger an immediate reset, killing the session.
+        if real >= MAX_CONTEXT:
+            import logging
+            logging.getLogger('ctxgate-proxy').warning(
+                'Calibrator: rejecting poisoned baseline session=%s real=%d >= MAX_CONTEXT=%d',
+                session_key, real, MAX_CONTEXT,
+            )
+            return
+
         # Store real data per session (always, when real > 0)
         s = self._sessions.get(session_key)
         if s is None:
-            s = {"last_real": 0, "n": 0, "m_bump": 0.0, "errs": deque(maxlen=50)}
+            s = {"last_real": 0, "n": 0, "m_bump": 0.0, "errs": deque(maxlen=50), "msg_count": 0}
             self._sessions[session_key] = s
 
         s["last_real"] = real
+
+        # Store message count for precise delta calculation
+        if msg_count > 0:
+            s["msg_count"] = msg_count
 
         # Only count as an observation if we have a valid prediction
         if predicted <= 0:
@@ -131,7 +158,7 @@ class RealTokenTracker:
         """On a vLLM 400, bump the session margin."""
         s = self._sessions.get(session_key)
         if s is None:
-            s = {"last_real": 0, "n": 0, "m_bump": 0.0, "errs": deque(maxlen=50)}
+            s = {"last_real": 0, "n": 0, "m_bump": 0.0, "errs": deque(maxlen=50), "msg_count": 0}
             self._sessions[session_key] = s
         s["m_bump"] = min(s.get("m_bump", 0.0) + amount, M_CAP)
 
@@ -146,9 +173,23 @@ class RealTokenTracker:
             return 0
         return s.get("last_real", 0)
 
+    def get_msg_count(self, session_key: str) -> int:
+        """Get the message count at the time of the last observation.
+
+        Used by _estimate_delta() to precisely identify which messages
+        are new since the last vLLM response. This is critical for
+        agentic loops where there is only one user message but many
+        assistant/tool messages accumulate.
+        """
+        s = self._sessions.get(session_key)
+        if s is None:
+            return 0
+        return s.get("msg_count", 0)
+
 
 # Backward-compatible alias
 _TokenCalibrator = RealTokenTracker
 
 # Module-level singleton (name preserved for all callers)
 calibrator = RealTokenTracker()
+

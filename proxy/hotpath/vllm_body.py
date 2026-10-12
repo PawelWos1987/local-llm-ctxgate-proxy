@@ -13,8 +13,14 @@ log = logging.getLogger("ctxgate-proxy")
 def _build_vllm_body(
     built: list, body: dict, max_tokens: int, stream: bool,
     client_cap: int | None, session_key: str,
+    disable_thinking: bool = False,
 ) -> dict:
-    """Construct the vLLM request body from the built context and client params."""
+    """Construct the vLLM request body from the built context and client params.
+
+    When disable_thinking is True, thinking_token_budget is forced to 0 so that
+    all output tokens go to content (used as a corrective action when the
+    output budget is too small to sustain both thinking and content).
+    """
     vllm_body = {
         "model": VLLM_MODEL,
         "messages": built,
@@ -35,7 +41,9 @@ def _build_vllm_body(
         vllm_body["presence_penalty"] = float(PRESENCE_PENALTY)
     if REPETITION_DETECTION:
         vllm_body["repetition_detection"] = {"max_pattern_size": 50, "min_pattern_size": 5, "min_count": 6}
-    if THINKING_TOKEN_BUDGET:
+    if disable_thinking:
+        vllm_body["thinking_token_budget"] = 0
+    elif THINKING_TOKEN_BUDGET:
         vllm_body["thinking_token_budget"] = int(THINKING_TOKEN_BUDGET)
     # Forward optional vLLM passthrough parameters when the client
     # explicitly sent them AND we are on the capped fallback path.

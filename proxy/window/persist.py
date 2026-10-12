@@ -41,7 +41,7 @@ def _window_cache_get(key: str) -> Optional[dict]:
     """Retrieve a cached window-state dict, or None on miss/expiry.
 
     On hit: moves the entry to the most-recently-used position and
-    returns a deep copy to prevent aliasing/mutation bugs.
+    returns a shallow copy to prevent top-level key aliasing.
     On expiry: removes the entry and returns None (caller will re-query DB).
     """
     entry = _window_cache.get(key)
@@ -54,18 +54,18 @@ def _window_cache_get(key: str) -> Optional[dict]:
         return None
     # LRU: move to most-recently-used
     _window_cache.move_to_end(key)
-    return copy.deepcopy(value)
+    return copy.copy(value)
 
 
 def _window_cache_put(key: str, value: dict) -> None:
     """Store a window-state dict in the cache.
 
     Evicts the least-recently-used entry if the cache exceeds max size.
-    Stores a deep copy to prevent external mutation of the cached value.
+    Stores a shallow copy to prevent top-level key aliasing.
     """
     if key in _window_cache:
         _window_cache.move_to_end(key)
-    _window_cache[key] = (copy.deepcopy(value), time.monotonic())
+    _window_cache[key] = (copy.copy(value), time.monotonic())
     # Evict LRU entries beyond max size
     while len(_window_cache) > _WINDOW_CACHE_MAX_SIZE:
         _window_cache.popitem(last=False)
@@ -238,7 +238,7 @@ def _state_to_json(ws: dict) -> str:
 async def _window_load(session_key: str) -> Optional[dict]:
     """Load window state: cache-first, DB fallback.
 
-    P1: Checks the in-process LRU cache first. On hit, returns a deep copy.
+    P1: Checks the in-process LRU cache first. On hit, returns a shallow copy.
     On miss, loads from the DB and populates the cache.
 
     Feature-detects the table; returns None if the table doesn't exist

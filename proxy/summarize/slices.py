@@ -77,12 +77,12 @@ VLLM_MODEL = os.environ.get("CTXGATE_VLLM_MODEL", "Qwen3.8-27B")
 # Primary source: Goose custom provider config (single source of truth).
 # Fallback: env vars (CTXGATE_MAX_CONTEXT, CTXGATE_MAX_OUTPUT) → hardcoded defaults.
 # All other budget values are derived to maintain the invariant:
-#   MAX_INPUT + SAFETY_MARGIN + MIN_OUTPUT <= MAX_CONTEXT
+#   MAX_INPUT + SAFETY_MARGIN + MAX_OUTPUT <= MAX_CONTEXT
 #
 # Derived:
-#   MIN_OUTPUT    = MAX_OUTPUT // 3
+#   MAX_OUTPUT    = max output budget
 #   SAFETY_MARGIN = 5% of MAX_CONTEXT
-#   MAX_INPUT     = MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT
+#   MAX_INPUT     = MAX_CONTEXT - SAFETY_MARGIN - MAX_OUTPUT
 
 _GOOSE_CONFIG_PATH = os.path.expanduser("~/.config/goose/custom_providers/custom_qwen.json")
 

@@ -107,6 +107,7 @@ async def _call_4b(messages, max_tokens=2000, json_mode=True, priority=LM_PRI_HI
     if _lm_queue is None or _lm_client is None:
         log.warning("Mistral queue not ready - _call_4b skipped")
         return {}
+    global _lm_seq_counter
     _lm_seq_counter += 1
     future = asyncio.get_event_loop().create_future()
     task = {

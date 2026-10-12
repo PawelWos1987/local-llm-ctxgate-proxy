@@ -3,7 +3,7 @@ import asyncio
 import logging
 import time
 
-from proxy.config import STABLE_ELIDE, MAX_INPUT, MAX_CONTEXT, SAFETY_MARGIN, MIN_OUTPUT
+from proxy.config import STABLE_ELIDE, MAX_INPUT, MAX_CONTEXT, SAFETY_MARGIN, MAX_OUTPUT
 from proxy.token.calibrator import calibrator
 from proxy.token.counter import _rho_var
 from proxy.token import count_messages_tokens
@@ -27,6 +27,54 @@ def _window_lock(session_key: str) -> asyncio.Lock:
         lk = asyncio.Lock()
         _app._window_locks[session_key] = lk
     return lk
+
+
+def _determine_prefix_cache(session_key: str, messages: list) -> str:
+    """Determine vLLM prefix cache state by comparing message hashes
+    against the previous request for this session.
+
+    Returns:
+        "HIT"  - leading messages are byte-identical to previous request (vLLM can reuse KV cache)
+        "MISS" - messages differ from previous request (vLLM must recompute)
+        "n/a"  - first request for this session (no previous state to compare)
+    """
+    import hashlib
+    import json as _json
+
+    if not session_key:
+        return "n/a"
+
+    from proxy.app import session_prefix_hashes
+
+    def _mh(m: dict) -> str:
+        c = m.get("content", "")
+        if isinstance(c, list):
+            c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+        tc = m.get("tool_calls")
+        tc_s = _json.dumps(tc, sort_keys=True) if tc else ""
+        return hashlib.sha1((str(m.get("role", "")) + "|" + str(c) + "|" + tc_s).encode()).hexdigest()
+
+    cur = [_mh(m) for m in messages]
+    prev = session_prefix_hashes.get(session_key)
+
+    if prev is None:
+        # First request for this session
+        session_prefix_hashes[session_key] = cur
+        return "n/a"
+
+    # Compare leading messages
+    stable = 0
+    for i in range(min(len(prev), len(cur))):
+        if prev[i] == cur[i]:
+            stable += 1
+        else:
+            break
+
+    # Store current hashes for next comparison
+    session_prefix_hashes[session_key] = cur
+
+    # If at least one leading message is stable, vLLM can reuse its KV cache prefix
+    return "HIT" if stable > 0 else "MISS"
 
 
 def _prep_messages(raw: list) -> list:
@@ -133,7 +181,8 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
                 base = len(seed_raw)
                 _stable_elide_inplace(kept, base, base + (ws["elide_idx"] - eff_cut))
             kept_tok = count_messages_tokens(kept)
-            ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT) - _note_n
+            _app.last_prefix_cache = _determine_prefix_cache(sk, kept)
+            ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MAX_OUTPUT) - _note_n
             trigger = _eviction_trigger()
             if kept_tok > ceiling:
                 # Hard ceiling exceeded: must re-cut (capacity risk).
@@ -143,34 +192,51 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
                 log.info('sticky window over trigger %d > %d: hysteresis re-cut to target %d',
                          kept_tok, trigger, _trim_target())
             elif kept_tok <= MAX_INPUT - _note_n:
-                _app.metrics["trim_sticky_reuse"] += 1
-                log.info("Context sticky-reuse: session=%s cut=%d kept_tokens=%d skipped=%d", sk, ws["cut"], kept_tok, ws["cut"])
-                # Verify context invariants - HARD GATE on Goose path
-                _viols = verify_context_invariants(kept, raw, ceiling, kept_tok)
-                if _viols:
-                    _fatal_viols = []
-                    for _v in _viols:
-                        if _v.startswith("newest_user") or _v.startswith("pinned"):
-                            _app.metrics["pinned_user_preservation_failures"] += 1
-                            _fatal_viols.append(_v)
-                        elif _v.startswith("orphan_tool") or _v.startswith("missing_tool_result"):
-                            _app.metrics["recent_tool_preservation_failures"] += 1
-                            _fatal_viols.append(_v)
-                        elif _v.startswith("tool_body"):
-                            _app.metrics["recent_tool_preservation_failures"] += 1
-                    if _fatal_viols:
-                        log.error("Context invariant HARD GATE (fast path): %s", _fatal_viols[:3])
-                        raise ContextCapacityError(
-                            f"context invariant violation in fast path: {_fatal_viols[0]}",
-                            kept_tok, ceiling)
-                if task_uuid and ws["summarized_through"] < ws.get("dropped_total", ws["cut"]) and not ws.get("in_flight", False):
-                    la = _app._summary_last_attempt.get(task_uuid)
-                    if la is None or (time.time() - la[0]) > 120:
-                        ws["pending_cut"] = ws["cut"]
-                        ws["in_flight"] = True
-                        _spawn(_summarize_trimmed_messages(task_uuid, sk, rest_raw, pending_cut=ws["cut"]))
-                kept = _inject_ledger_into_context(kept, task_uuid, sk, "")
-                return kept
+                # Proactive real-baseline check: the character-based kept_tok may
+                # underestimate. If the last REAL prompt_tokens from vLLM exceeds
+                # the trigger (high-watermark) or ceiling, the full payload (which
+                # includes tools, template, injection overhead) is approaching or
+                # exceeding budget. Must re-cut NOW before the handler's admission
+                # check fires and forces a reset.
+                _last_real = calibrator.get_last_real(sk)
+                if _last_real > trigger:
+                    log.info(
+                        "Sticky window real-baseline over trigger: kept_tok(char)=%d last_real=%d trigger=%d ceiling=%d - forcing re-cut",
+                        kept_tok, _last_real, trigger, ceiling,
+                    )
+                    _app.metrics["real_baseline_recut"] = _app.metrics.get("real_baseline_recut", 0) + 1
+                    # Fall through to slow path (re-cut)
+                else:
+                    _app.metrics["trim_sticky_reuse"] += 1
+                    log.info("Context sticky-reuse: session=%s cut=%d kept_tokens=%d skipped=%d", sk, ws["cut"], kept_tok, ws["cut"])
+                    # Verify context invariants - HARD GATE on Goose path
+                    _viols = verify_context_invariants(kept, raw, ceiling, kept_tok)
+                    if _viols:
+                        _fatal_viols = []
+                        for _v in _viols:
+                            if _v.startswith("newest_user") or _v.startswith("pinned"):
+                                _app.metrics["pinned_user_preservation_failures"] += 1
+                                _fatal_viols.append(_v)
+                            elif _v.startswith("orphan_tool") or _v.startswith("missing_tool_result"):
+                                _app.metrics["recent_tool_preservation_failures"] += 1
+                                _fatal_viols.append(_v)
+                            elif _v.startswith("tool_body"):
+                                _app.metrics["recent_tool_preservation_failures"] += 1
+                        if _fatal_viols:
+                            log.error("Context invariant HARD GATE (fast path): %s", _fatal_viols[:3])
+                            raise ContextCapacityError(
+                                f"context invariant violation in fast path: {_fatal_viols[0]}",
+                                kept_tok, ceiling)
+                    if task_uuid and ws["summarized_through"] < ws.get("dropped_total", ws["cut"]) and not ws.get("in_flight", False):
+                        la = _app._summary_last_attempt.get(task_uuid)
+                        if la is None or (time.time() - la[0]) > 120:
+                            ws["pending_cut"] = ws["cut"]
+                            ws["in_flight"] = True
+                            _spawn(_summarize_trimmed_messages(task_uuid, sk, rest_raw, pending_cut=ws["cut"]))
+                    kept = _inject_ledger_into_context(kept, task_uuid, sk, "")
+                    _app.last_context_path = "sticky-reuse"
+                    _app.last_msg_counts = {"total": len(raw), "stable": len(seed_raw), "kept": len(kept), "new": max(0, len(rest_raw) - eff_cut), "dropped": eff_cut}
+                    return kept
         # SLOW PATH: no valid state (or kept over limit) -> full count + re-cut.
         messages = _prep_messages(raw)
         if messages and messages[0].get("role") == "system":
@@ -180,9 +246,28 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
             seed = []
             rest = list(messages)
         total = count_messages_tokens(messages)
+        _app.last_prefix_cache = _determine_prefix_cache(sk, messages)
         log.info("Context: %d messages, %d tokens (limit %d)", len(messages), total, MAX_INPUT)
         if total <= MAX_INPUT - _note_n:
-            return messages
+            # Real-baseline check: the character-based total may underestimate
+            # real tokens (Qwen3.8-27B ratio ~1.5-2x). If the last REAL
+            # prompt_tokens from vLLM exceeds the eviction trigger, the actual
+            # payload is approaching/exceeding budget. Force re-cut to break
+            # the circular dependency (window state never created -> fast path
+            # never runs -> real-baseline check never fires).
+            _last_real = calibrator.get_last_real(sk)
+            _trigger = _eviction_trigger()
+            if _last_real > _trigger:
+                log.info(
+                    "Slow path real-baseline over trigger: total(char)=%d last_real=%d trigger=%d - forcing re-cut",
+                    total, _last_real, _trigger,
+                )
+                _app.metrics["real_baseline_slowpath"] = _app.metrics.get("real_baseline_slowpath", 0) + 1
+                # Fall through to re-cut below (do NOT return early)
+            else:
+                _app.last_context_path = "none"
+                _app.last_msg_counts = {"total": len(raw), "stable": len(seed), "kept": len(messages), "new": max(0, len(raw) - len(seed)), "dropped": 0}
+                return messages
         target = _trim_target()
         # Pre-recut elision: shrink tool bodies up to the newest-4 boundary so
         # _recut_to budgets on stable (post-elision) sizes, not full originals.
@@ -220,16 +305,27 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
             base2 = len(seed)
             _stable_elide_inplace(kept, base2, base2 + (elide_idx - cut))
         kept_tok = count_messages_tokens(kept)
-        ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MIN_OUTPUT) - _note_n
+        ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MAX_OUTPUT) - _note_n
         if kept_tok > ceiling:
             try:
                 kept = _emergency_shrink(kept, ceiling)
+                # Invalidate the calibrator baseline: the message content has
+                # been modified (elided/truncated), so the stored last_real
+                # (from the pre-shrink vLLM response) is stale. Force the next
+                # estimation to use the cold path (actual content size).
+                from proxy.token.calibrator import calibrator as _cal
+                _s = _cal._sessions.get(sk)
+                if _s is not None:
+                    _s["last_real"] = 0
+                    _s["msg_count"] = 0
             except ContextCapacityError as cce:
                 log.error("Context capacity exceeded in build_context: %s", cce)
                 raise cce
             kept_tok = count_messages_tokens(kept)
         if kept_tok > ceiling:
             log.error("EMERGENCY SHRINK failed to meet ceiling: kept_tok=%d ceiling=%d (pathological single huge message)", kept_tok, ceiling)
+        _app.last_context_path = "emergency-shrink" if kept_tok > ceiling else ("full-recut" if ws is None else "hysteresis-recut")
+        _app.last_msg_counts = {"total": len(raw), "stable": len(seed), "kept": len(kept), "new": max(0, len(raw) - len(kept)), "dropped": cut}
         # Verify context invariants - HARD GATE on Goose path
         _viols = verify_context_invariants(kept, raw, ceiling, kept_tok)
         if _viols:
