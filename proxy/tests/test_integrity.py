@@ -108,36 +108,20 @@ def test_same_prefix_different_tail_different_hash():
 # --- Test 3: _note_tok works in isolated namespace ---
 
 def test_note_tok_in_isolated_namespace():
-    """_note_tok must work when exec'd in a namespace without RHO_COLD.
-    It should use count_tokens() which respects the estimator mode."""
-    import ast
+    """_note_tok must work without RHO_COLD in scope.
+    It uses count_tokens() which respects the estimator mode."""
+    # _note_tok is now in proxy/utils/helpers.py
+    import inspect
+    from proxy.utils.helpers import _note_tok
     
-    src = open(os.path.join(os.path.dirname(app.__file__), "app.py"), encoding="utf-8").read()
-    tree = ast.parse(src)
+    # Verify the source doesn't reference RHO_COLD
+    src = inspect.getsource(_note_tok)
+    assert "RHO_COLD" not in src, (
+        f"_note_tok must not reference RHO_COLD directly: {src}"
+    )
     
-    # Extract just _note_tok and its dependencies
-    funcs_needed = {"_note_tok", "_norm_content"}
-    consts_needed = {"COMPACTION_NOTE", "_NOTE_TOK_CACHE"}
-    
-    code = ""
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            getattr(t, "id", "") in consts_needed for t in node.targets
-        ):
-            code += ast.get_source_segment(src, node) + "\n"
-        if isinstance(node, ast.FunctionDef) and node.name in funcs_needed:
-            code += ast.get_source_segment(src, node) + "\n"
-    
-    # Execute in a namespace WITHOUT RHO_COLD
-    ns = {
-        "os": os,
-        "hashlib": hashlib,
-        "count_tokens": lambda t: max(1, len(t) // 4),  # simple estimator
-    }
-    exec(code, ns)
-    
-    # _note_tok should work without RHO_COLD in the namespace
-    result = ns["_note_tok"]()
+    # Functional test: _note_tok should return a non-negative int
+    result = _note_tok()
     assert result >= 0, f"_note_tok returned negative: {result}"
     assert isinstance(result, int), f"_note_tok should return int, got {type(result)}"
 

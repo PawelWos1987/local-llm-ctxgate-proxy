@@ -10,10 +10,11 @@ Mirrors the structure of probes/rw/live/test_rolling_window.py.
 """
 import asyncio, json, os, sys, traceback
 
+_TEST_MAX_CONTEXT = "84000"
+_TEST_MAX_OUTPUT = "18000"
 os.environ["CTXGATE_MAX_INPUT"] = "64000"
-os.environ["CTXGATE_MAX_CONTEXT"] = "84000"
-os.environ["CTXGATE_MAX_OUTPUT"] = "18000"
-os.environ["CTXGATE_SAFETY_MARGIN"] = "2000"
+os.environ["CTXGATE_MAX_CONTEXT"] = _TEST_MAX_CONTEXT
+os.environ["CTXGATE_MAX_OUTPUT"] = _TEST_MAX_OUTPUT
 os.environ["CTXGATE_MIN_OUTPUT"] = "8192"
 os.environ["CTXGATE_TRIM_TARGET_FRACTION"] = "0.70"
 os.environ["CTXGATE_TRIM_TARGET_FLOOR"] = "20000"

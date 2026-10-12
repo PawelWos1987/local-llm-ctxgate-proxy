@@ -78,3 +78,18 @@ schema/012_session_windows.sql
 # Goose
 .goosehints
 scratch/
+
+# IDE (Eclipse/PyDev)
+.project
+.pydevproject
+
+# Stray / accidental files
+0,
+
+# Rotated logs
+*.log.1
+
+# Local sandbox dev helpers
+sandbox_*.pid
+sandbox_start.py
+sandbox_start.sh

@@ -316,3 +316,59 @@ def test_window_epoch_empty():
 def test_safe_cut_empty_groups():
     """_safe_cut with no groups returns 0."""
     assert _safe_cut([], 1000) == 0
+
+
+def test_parse_vllm_actual_tokens():
+    """_parse_vllm_actual_tokens extracts real token counts from vLLM errors."""
+    from proxy.window.cut import _parse_vllm_actual_tokens
+
+    # Standard vLLM error format
+    _ctx = 84000
+    err = (f"This model's maximum context length is {_ctx} tokens. "
+           f"However, you requested 18000 output tokens and your prompt "
+           f"contains at least 66001 input tokens, for a total of at least {_ctx + 1}")
+    actual_in, actual_max = _parse_vllm_actual_tokens(err)
+    assert actual_in == 66001
+    assert actual_max == 18000
+
+    # Lowercase version (as used in stream code where _et = resp.text.lower())
+    err_lower = err.lower()
+    actual_in2, actual_max2 = _parse_vllm_actual_tokens(err_lower)
+    assert actual_in2 == 66001
+    assert actual_max2 == 18000
+
+    # No match
+    assert _parse_vllm_actual_tokens("some other error") == (None, None)
+
+    # Partial match (just input tokens)
+    err3 = "your prompt contains at least 50000 input tokens"
+    actual_in3, _ = _parse_vllm_actual_tokens(err3)
+    assert actual_in3 == 50000
+
+
+def test_hard_cut_to():
+    """_hard_cut_to removes exact tokens using vLLM's ground truth."""
+    from proxy.window.cut import _hard_cut_to
+
+    # Simulate: 5 messages, vLLM says 5000 tokens, target is 3000
+    # So we need to remove 2000 tokens from oldest
+    messages = [
+        {"role": "system", "content": "You are helpful."},  # protected
+        {"role": "user", "content": "A" * 4000},           # ~1000 tokens
+        {"role": "assistant", "content": "B" * 4000},      # ~1000 tokens
+        {"role": "user", "content": "C" * 4000},          # ~1000 tokens
+        {"role": "assistant", "content": "D" * 4000},     # ~1000 tokens
+        {"role": "user", "content": "E" * 4000},         # ~1000 tokens (newest user - protected)
+    ]
+
+    # vLLM says 5000 tokens total, target 3000 -> remove 2000
+    removed = _hard_cut_to(messages, 5000, 3000)
+    assert removed >= 2000
+    # System and newest user must survive
+    assert messages[0]["role"] == "system"
+    assert messages[-1]["role"] == "user"
+    assert messages[-1]["content"] == "E" * 4000
+
+    # No-op when already under target
+    messages2 = [{"role": "user", "content": "hi"}]
+    assert _hard_cut_to(messages2, 100, 500) == 0

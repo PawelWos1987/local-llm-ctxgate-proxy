@@ -1,0 +1,1 @@
+ENOENT: no such file or directory, open '/home/pawelw/ctxproxy/proxy/window/context.py'

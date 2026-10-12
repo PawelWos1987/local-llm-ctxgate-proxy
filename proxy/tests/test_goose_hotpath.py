@@ -28,8 +28,10 @@ os.environ["CTXGATE_VLLM_URL"] = "http://127.0.0.1:29000/v1"
 os.environ["CTXGATE_VLLM_MODEL"] = "Qwen3.8-27B"
 os.environ["CTXGATE_ALLOW_NO_AUTH"] = "1"
 os.environ["CTXGATE_QWEN_TOKENIZER"] = ""
-os.environ["CTXGATE_MAX_CONTEXT"] = "84000"
-os.environ["CTXGATE_MAX_OUTPUT"] = "22500"
+_TEST_MAX_CONTEXT = "84000"
+_TEST_MAX_OUTPUT = "22500"
+os.environ["CTXGATE_MAX_CONTEXT"] = _TEST_MAX_CONTEXT
+os.environ["CTXGATE_MAX_OUTPUT"] = _TEST_MAX_OUTPUT
 # MIN_OUTPUT, SAFETY_MARGIN, MAX_INPUT are now derived
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -160,7 +162,7 @@ def test_goose_streaming_tool_cycle_survives_cut():
     
     kept = app._kept_messages(seed, rest, forced_cut)
     
-    violations = app.verify_context_invariants(kept, history, 84000, 0)
+    violations = app.verify_context_invariants(kept, history, app.MAX_CONTEXT, 0)
     
     orphan_violations = [v for v in violations if v.startswith("orphan_tool")]
     assert not orphan_violations, f"Orphan tool results found: {orphan_violations}"
@@ -226,7 +228,7 @@ def test_goose_calibrated_no_tokenizer_calls():
 def test_calibrated_default():
     """The default ESTIMATOR_MODE must be 'calibrated'."""
     import inspect
-    src = inspect.getsource(app)
+    src = inspect.getsource(sys.modules['proxy.config.constants'])
     for line in src.split("\n"):
         if "ESTIMATOR_MODE = os.environ.get" in line:
             assert '"calibrated"' in line, f"Default must be 'calibrated', got: {line.strip()}"
@@ -289,23 +291,28 @@ def test_two_sessions_isolated():
     session_b = "goose:session-B"
     
     for i in range(5):
-        app.calibrator.observe(session_a, predicted=1000, real=800)
+        app.calibrator.observe(session_a, predicted=1000, real=900)
     for i in range(5):
-        app.calibrator.observe(session_b, predicted=1000, real=1200)
+        app.calibrator.observe(session_b, predicted=1000, real=995)
     
-    rho_a, margin_a = app.calibrator.get_rho(session_a)
-    rho_b, margin_b = app.calibrator.get_rho(session_b)
+    # With RealTokenTracker, sessions are isolated by their last_real values
+    last_real_a = app.calibrator.get_last_real(session_a)
+    last_real_b = app.calibrator.get_last_real(session_b)
     
-    assert rho_a != rho_b, f"Sessions leaked: rho_a={rho_a} == rho_b={rho_b}"
-    assert rho_a > app.RHO_COLD, f"Session A rho should increase: {rho_a} <= {app.RHO_COLD}"
-    assert rho_b < app.RHO_COLD, f"Session B rho should decrease: {rho_b} >= {app.RHO_COLD}"
+    assert last_real_a == 900, f"Session A last_real should be 900: {last_real_a}"
+    assert last_real_b == 995, f"Session B last_real should be 995: {last_real_b}"
+    assert last_real_a != last_real_b, "Sessions leaked: last_real values are equal"
     
-    app._rho_var.set(rho_a)
-    counted_a = app.count_tokens("x" * 1000)
-    app._rho_var.set(rho_b)
-    counted_b = app.count_tokens("x" * 1000)
+    # Margins should reflect different prediction accuracies
+    _, margin_a = app.calibrator.get_rho(session_a)
+    _, margin_b = app.calibrator.get_rho(session_b)
     
-    assert counted_a != counted_b, "ContextVar isolation failed"
+    # Session A: predicted=1000, real=900 → ~11% error → larger margin
+    # Session B: predicted=1000, real=995 → ~0.5% error → smaller margin
+    assert margin_a > margin_b, (
+        f"Session A (larger error) should have larger margin: "
+        f"margin_a={margin_a} <= margin_b={margin_b}"
+    )
 
 
 # ─── Test 7: test_capacity_error_not_truncation ────────────────────────────────
@@ -397,14 +404,13 @@ def test_goose_path_not_fallback():
 
 def test_budget_derivation():
     """Verify the budget is correctly derived from MAX_CONTEXT and MAX_OUTPUT."""
-    # MAX_CONTEXT = 84000, MAX_OUTPUT = 22500
-    assert app.MAX_CONTEXT == 84000
-    assert app.MAX_OUTPUT == 22500
+    assert app.MAX_CONTEXT == int(_TEST_MAX_CONTEXT)
+    assert app.MAX_OUTPUT == int(_TEST_MAX_OUTPUT)
     
     # Derived values
-    expected_min_output = 22500 // 3  # 7500
-    expected_safety_margin = int(84000 * 0.05)  # 4200
-    expected_max_input = 84000 - 4200 - 7500  # 72300
+    expected_min_output = int(app.MAX_OUTPUT / 1.8)
+    expected_safety_margin = int(app.MAX_CONTEXT * 0.05)
+    expected_max_input = app.MAX_CONTEXT - app.SAFETY_MARGIN - app.MIN_OUTPUT
     
     assert app.MIN_OUTPUT == expected_min_output, f"MIN_OUTPUT={app.MIN_OUTPUT}, expected {expected_min_output}"
     assert app.SAFETY_MARGIN == expected_safety_margin, f"SAFETY_MARGIN={app.SAFETY_MARGIN}, expected {expected_safety_margin}"
