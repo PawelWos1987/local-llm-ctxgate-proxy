@@ -61,7 +61,7 @@ def _safe_cut(groups: list, budget_tokens: int) -> int:
         quantized_budget = budget_tokens
     group_tokens = []
     for g in groups:
-        gt = sum(count_message_tokens(m, estimate=True) for m in g)
+        gt = sum(count_message_tokens(m) for m in g)
         group_tokens.append(gt)
     cum = 0
     cut_group_idx = len(groups)
@@ -95,7 +95,7 @@ def _recut_to(messages: list, max_tokens: int) -> int:
     
     stub_tok = _note_tok()
     seed_tok = count_messages_tokens(seed) if seed else 0
-    total_tok = count_messages_tokens(messages, estimate=True)
+    total_tok = count_messages_tokens(messages)
     lu = _newest_user_idx(rest)
     budget = max(500, max_tokens - seed_tok - stub_tok - 200)
     
@@ -122,7 +122,7 @@ def _recut_to(messages: list, max_tokens: int) -> int:
         tail = []
         t = 0
         for m in reversed(rest):
-            mt = count_message_tokens(m, estimate=True)
+            mt = count_message_tokens(m)
             if t + mt > budget and len(tail) > 5:
                 break
             tail.append(m)
@@ -132,9 +132,26 @@ def _recut_to(messages: list, max_tokens: int) -> int:
             tail.pop(0)
         cut = max(0, len(rest) - len(tail))
     
+    # Over-shoot guard: estimate undercounted -> kept is still over budget
+    kept = _kept_messages(seed, rest, cut)
+    kept_tok = count_messages_tokens(kept)
+    if kept_tok > max_tokens and cut_group_idx < len(groups):
+        log.warning("RECURT OVER-SHOOT: kept_tok=%d target=%d cut=%d groups=%d - cutting deeper",
+                    kept_tok, max_tokens, cut, len(groups))
+        metrics["recut_overshoot_guard"] += 1
+        while cut_group_idx < len(groups):
+            cut_group_idx += 1
+            cut = sum(len(groups[i]) for i in range(cut_group_idx))
+            kept = _kept_messages(seed, rest, cut)
+            kept_tok = count_messages_tokens(kept)
+            if kept_tok <= max_tokens:
+                break
+
+    # Guard: never cut past the newest user message (live prompt / protected region)
     if lu is not None and cut > lu:
-        log.warning("RECUT: newest user msg at rest[%d] is before cut=%d - _kept_messages will extend cut to include it (live prompt preserved in full)", lu, cut)
-        metrics["recut_user_pinned"] += 1
+        log.warning("RECUT GUARD: clamping cut from %d to %d (newest user msg at rest[%d] protected)", cut, lu, lu)
+        metrics["recut_user_pinned"] = metrics.get("recut_user_pinned", 0) + 1
+        cut = lu
 
     # Apply the cut in place
     if cut > 0:
@@ -244,7 +261,7 @@ def _hard_cut_to(messages: list, actual_tokens: int, target_tokens: int) -> int:
     for i in removable:
         if removed >= tokens_to_remove:
             break
-        mt = count_message_tokens(messages[i], estimate=True)
+        mt = count_message_tokens(messages[i])
         to_remove_set.add(i)
         removed += mt
 
@@ -252,7 +269,7 @@ def _hard_cut_to(messages: list, actual_tokens: int, target_tokens: int) -> int:
     _repair_tool_dependencies(messages, to_remove_set)
 
     # Recalculate removed tokens after dependency repair
-    removed = sum(count_message_tokens(messages[i], estimate=True) for i in to_remove_set)
+    removed = sum(count_message_tokens(messages[i]) for i in to_remove_set)
 
     # Build new list excluding removed messages
     kept = [m for i, m in enumerate(messages) if i not in to_remove_set]
@@ -290,7 +307,7 @@ def _kept_messages(seed: list, rest: list, cut: int) -> list:
         live_idx_in_result = len(seed)  # rest[cut:] starts at rest[lu] since cut==lu
         if live_idx_in_result < len(result):
             live_msg = result[live_idx_in_result]
-            live_tok = count_message_tokens(live_msg, estimate=True)
+            live_tok = count_message_tokens(live_msg)
             seed_tok = count_messages_tokens(seed) if seed else 0
             from proxy.window.budget import _safe_admitted_budget
             budget = _safe_admitted_budget()

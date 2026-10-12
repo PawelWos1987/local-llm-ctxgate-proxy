@@ -1,6 +1,7 @@
 """Mistral API rate limiter: RPS, TPM, and concurrency control."""
 import asyncio
 import logging
+import os
 import time
 
 from proxy.resilience.rate_limit import _TokenBucket
@@ -22,7 +23,7 @@ class MistralRateLimiter:
     TPM_LIMIT = 500_000
     TPM_RATE = TPM_LIMIT / 60.0
     TPM_BURST = 500_000
-    MAX_CONCURRENT = 10
+    MAX_CONCURRENT = int(os.environ.get("CTXGATE_LM_MAX_CONCURRENT", "10"))
 
     def __init__(self):
         self._rps = _TokenBucket(self.RPS_LIMIT, self.RPS_BURST)
@@ -62,19 +63,6 @@ class MistralRateLimiter:
             "total_acquired": self._total_acquired,
             "avg_wait_s": round(self._total_waited / max(1, self._total_acquired), 3),
         }
-
-# Single global instance
-_lm_rate_limiter = MistralRateLimiter()
-
-log = logging.getLogger("ctxgate-proxy")
-
-
-
-import signal as _signal
-import os as _os
-
-import socket as _socket
-
 
 # Single global instance
 _lm_rate_limiter = MistralRateLimiter()
