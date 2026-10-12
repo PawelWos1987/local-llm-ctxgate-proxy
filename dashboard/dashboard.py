@@ -24,6 +24,7 @@ import re
 import signal
 import threading
 import time
+import statistics
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -354,6 +355,155 @@ async def check_worker_file(path: str) -> dict:
         return {"status": "down", "error": "lock file not found"}
     except Exception as e:
         return {"status": "down", "error": str(e)[:100]}
+
+
+
+# --- Worker 4B: rolling window + formatting helpers --------------------------
+
+class WorkerWindow:
+    """Rolling-window tracker for worker LLM metrics.
+
+    Each poll cycle we read the cumulative counters from .worker_status.json
+    and compute deltas.  We keep a ring buffer of per-poll snapshots so we can
+    compute 60 s / 5 min / 1 h aggregates without the worker tracking them.
+    """
+    def __init__(self, max_samples: int = 3600):
+        self._samples = []
+        self._max = max_samples
+        self._last_in_total = 0
+        self._last_out_total = 0
+        self._last_done = 0
+
+    def update(self, now: float, status: dict) -> None:
+        tin = status.get("lm_tokens_in_total", 0)
+        tout = status.get("lm_tokens_out_total", 0)
+        done = status.get("jobs_done", 0)
+        d_in = max(0, tin - self._last_in_total)
+        d_out = max(0, tout - self._last_out_total)
+        d_reqs = max(0, done - self._last_done)
+        self._last_in_total = tin
+        self._last_out_total = tout
+        self._last_done = done
+        lat = status.get("lm_latency_ms", 0)
+        self._samples.append((now, d_reqs, d_in, d_out, lat))
+        if len(self._samples) > self._max:
+            self._samples = self._samples[-self._max:]
+
+    def _window(self, seconds: float, now: float):
+        cutoff = now - seconds
+        return [s for s in self._samples if s[0] >= cutoff]
+
+    def snapshot(self, now: float) -> dict:
+        w60 = self._window(60, now)
+        w300 = self._window(300, now)
+        def _sum(samples, idx):
+            return sum(s[idx] for s in samples)
+        reqs_60 = _sum(w60, 1)
+        toks_in_60 = _sum(w60, 2)
+        toks_out_60 = _sum(w60, 3)
+        toks_60 = toks_in_60 + toks_out_60
+        reqs_300 = _sum(w300, 1)
+        toks_300 = _sum(w300, 2) + _sum(w300, 3)
+        lats_60 = [s[4] for s in w60 if s[4] > 0]
+        lats_300 = [s[4] for s in w300 if s[4] > 0]
+        def _pct(data, p):
+            if not data:
+                return 0
+            data = sorted(data)
+            k = (len(data) - 1) * p / 100
+            f = int(k)
+            c = min(f + 1, len(data) - 1)
+            return data[f] + (data[c] - data[f]) * (k - f)
+        return {
+            "reqs_60s": reqs_60,
+            "toks_in_60s": toks_in_60,
+            "toks_out_60s": toks_out_60,
+            "toks_60s": toks_60,
+            "reqs_5m": reqs_300,
+            "toks_5m": toks_300,
+            "lat_avg_60s": round(sum(lats_60) / len(lats_60), 1) if lats_60 else 0,
+            "lat_p50_60s": round(_pct(lats_60, 50), 1),
+            "lat_p95_60s": round(_pct(lats_60, 95), 1),
+            "lat_p99_60s": round(_pct(lats_60, 99), 1),
+            "lat_avg_5m": round(sum(lats_300) / len(lats_300), 1) if lats_300 else 0,
+            "lat_p95_5m": round(_pct(lats_300, 95), 1),
+            "tok_in_avg_60s": round(toks_in_60 / reqs_60) if reqs_60 else 0,
+            "tok_out_avg_60s": round(toks_out_60 / reqs_60) if reqs_60 else 0,
+            "tok_in_p50_60s": round(_pct([s[2] for s in w60 if s[2] > 0], 50)),
+            "tok_in_p95_60s": round(_pct([s[2] for s in w60 if s[2] > 0], 95)),
+            "tok_out_p50_60s": round(_pct([s[3] for s in w60 if s[3] > 0], 50)),
+            "tok_out_p95_60s": round(_pct([s[3] for s in w60 if s[3] > 0], 95)),
+        }
+
+
+_worker_window = WorkerWindow()
+
+
+def _worker_limits() -> dict:
+    rpm_limit = int(os.environ.get("CTXGATE_WORKER_RPM", "0"))
+    if rpm_limit <= 0:
+        rpm_limit = 60
+    ctx_limit = int(os.environ.get("CTXGATE_WORKER_CTX_LIMIT", "8192"))
+    tok_limit = rpm_limit * 4096
+    return {
+        "rpm_limit": rpm_limit,
+        "ctx_limit": ctx_limit,
+        "tok_limit": tok_limit,
+    }
+
+
+def _derive_worker_status(
+    util_pct: float,
+    pending: int,
+    lat_p95: float,
+    ctx_pressure: float,
+    status: str,
+) -> str:
+    if status == "down":
+        return "DOWN"
+    if status == "degraded":
+        return "DEGRADED"
+    if pending > 50 and util_pct < 10:
+        return "STARVED"
+    if util_pct >= 95:
+        return "THROTTLED"
+    if lat_p95 > 10000 or ctx_pressure >= 0.90:
+        return "DEGRADED"
+    if util_pct >= 80 or ctx_pressure >= 0.80:
+        return "WARN"
+    return "HEALTHY"
+
+
+def fmt_num(n) -> str:
+    if n is None:
+        return "--"
+    n = float(n)
+    if abs(n) >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if abs(n) >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    if n == int(n):
+        return str(int(n))
+    return f"{n:.1f}"
+
+
+def fmt_ms(ms) -> str:
+    if ms is None or ms == 0:
+        return "--"
+    if ms >= 10000:
+        return f"{ms / 1000:.1f}s"
+    if ms >= 1000:
+        return f"{ms / 1000:.2f}s"
+    return f"{ms:.0f}ms"
+
+
+def util_bar(pct: float, width: int = 10) -> str:
+    if pct is None or pct < 0:
+        pct = 0
+    if pct > 100:
+        pct = 100
+    filled = int(round(pct / 100 * width))
+    return "█" * filled + "░" * (width - filled)
 
 
 async def check_process(unit: str) -> dict:
@@ -1215,6 +1365,10 @@ async def poll_health():
             elif cfg["type"] == "process":
                 services[name] = await check_process(cfg["unit"])
 
+        wk_data = services.get("worker", {})
+        if wk_data.get("status") in ("up", "degraded"):
+            _worker_window.update(time.time(), wk_data)
+
         db_metrics = await get_db_metrics()
         system = sample_system()
         vllm_metrics = await check_vllm_metrics(_vllm_metrics_url())
@@ -1225,6 +1379,8 @@ async def poll_health():
         health_state = {
             "services": services,
             "db_metrics": db_metrics,
+            "worker_window": _worker_window.snapshot(time.time()),
+            "worker_limits": _worker_limits(),
             "system": system,
             "vllm_metrics": vllm_metrics,
             "gpu": gpu,
@@ -1336,7 +1492,21 @@ def _deliverable_html(rows) -> str:
             "h1{font-size:20px}table{border-collapse:collapse;width:100%;font-size:13px}"
             "th,td{border:1px solid #2a2f3a;padding:6px 8px;text-align:left;vertical-align:top}"
             "th{background:#1a1f2b;position:sticky;top:0}tr:nth-child(even){background:#141821}"
-            "a{color:#5ab0ff}td:first-child{font-family:monospace;color:#888}</style></head>"
+            "a{color:#5ab0ff}td:first-child{font-family:monospace;color:#888}
+/* Worker 4B: enhanced section */
+.wk-badge{margin-left:auto;font-size:.75em;font-weight:bold;padding:2px 8px;border-radius:3px;letter-spacing:.5px}
+.wk-badge.healthy{background:#0a2a1a;color:var(--green);border:1px solid #1a5a3a}
+.wk-badge.warn{background:#2a1a0a;color:var(--yellow);border:1px solid #5a4a1a}
+.wk-badge.throttled{background:#2a0a0a;color:var(--red);border:1px solid #5a1a1a}
+.wk-badge.starved{background:#1a0a2a;color:#c084fc;border:1px solid #5a3a7a}
+.wk-badge.degraded{background:#2a1a0a;color:var(--yellow);border:1px solid #5a4a1a}
+.wk-badge.down{background:#2a0a0a;color:var(--red);border:1px solid #5a1a1a}
+.wk-bar-track{height:5px;background:#05080d;border:1px solid var(--border);border-radius:3px;overflow:hidden;margin:1px 0 3px 0}
+.wk-bar-fill{height:100%;border-radius:3px;transition:width .5s ease,background .5s ease;background:var(--green)}
+.wk-bar-fill.warn{background:var(--yellow)}
+.wk-bar-fill.danger{background:var(--red)}
+.fill-ctx{background:linear-gradient(90deg,var(--cyan),var(--blue))}
+</style></head>"
             "<body><h1>Agent Deliverables</h1>"
             "<table><thead><tr><th>id</th><th>name</th><th>session</th>"
             "<th>working_dir</th><th>provider</th><th>summary</th>"
@@ -1759,6 +1929,20 @@ body{font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background
 .src-custom{color:var(--green)}
 .unit-label{font-size:.72em;color:var(--dim);font-style:italic}
 .unit-label.dim{opacity:.4}
+
+/* Worker 4B: enhanced section */
+.wk-badge{margin-left:auto;font-size:.75em;font-weight:bold;padding:2px 8px;border-radius:3px;letter-spacing:.5px}
+.wk-badge.healthy{background:#0a2a1a;color:var(--green);border:1px solid #1a5a3a}
+.wk-badge.warn{background:#2a1a0a;color:var(--yellow);border:1px solid #5a4a1a}
+.wk-badge.throttled{background:#2a0a0a;color:var(--red);border:1px solid #5a1a1a}
+.wk-badge.starved{background:#1a0a2a;color:#c084fc;border:1px solid #5a3a7a}
+.wk-badge.degraded{background:#2a1a0a;color:var(--yellow);border:1px solid #5a4a1a}
+.wk-badge.down{background:#2a0a0a;color:var(--red);border:1px solid #5a1a1a}
+.wk-bar-track{height:5px;background:#05080d;border:1px solid var(--border);border-radius:3px;overflow:hidden;margin:1px 0 3px 0}
+.wk-bar-fill{height:100%;border-radius:3px;transition:width .5s ease,background .5s ease;background:var(--green)}
+.wk-bar-fill.warn{background:var(--yellow)}
+.wk-bar-fill.danger{background:var(--red)}
+.fill-ctx{background:linear-gradient(90deg,var(--cyan),var(--blue))}
 </style>
 </head>
 <body>
@@ -1818,24 +2002,27 @@ body{font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background
   </div>
 
   <div class="box" id="box-worker">
-    <div class="title" data-tip="WORKER 4B|The memory-extraction daemon (qwen3-4b-instruct). It consumes context-gate events and distils them into durable memories & knowledge stored in PostgreSQL. It writes a lock file with its PID and a heartbeat every few seconds."><span class="led"></span>WORKER 4B</div>
+    <div class="title" data-tip="WORKER 4B|Memory-extraction daemon. Consumes context-gate events, distils them into durable memories in PostgreSQL. Rolling 60s/5m windows computed dashboard-side."><span class="led"></span>WORKER 4B<span class="wk-badge" id="wk-badge">--</span></div>
     <div class="metrics">
-      <div class="metric-row" data-tip="Worker Status|up = heartbeat younger than 30s. degraded = 30-120s (may be stuck). down = no lock file or heartbeat older than 120s (frozen/dead)."><span class="k">Status</span><span class="v" id="wk-status">--</span></div>
-      <div class="metric-row" data-tip="Worker PID|The operating-system process ID of the running worker, read from its lock file."><span class="k">PID</span><span class="v" id="wk-pid">--</span></div>
-      <div class="metric-row" data-tip="Worker Heartbeat|Seconds since the worker last wrote its heartbeat. A healthy worker stays under 30s. If this climbs, the worker is blocked or dead."><span class="k">Heartbeat</span><span class="v big" id="wk-hb">--</span></div>
-      <div class="metric-row" data-tip="Jobs Processing|Number of memory jobs currently being processed by worker consumers. Non-zero = workers are actively extracting memories. With 10 consumers you can see up to 10 in parallel."><span class="k">Processing</span><span class="v big" id="wk-proc" style="color:var(--blue)">0</span></div>
-      <div class="metric-row" data-tip="Jobs Pending|Memory jobs queued and waiting for a free consumer. High number = consumers are saturated or stuck."><span class="k">Pending</span><span class="v" id="wk-pend">0</span></div>
-      <div class="metric-row" data-tip="Done Today|Memory jobs completed since local midnight. The throughput signal."><span class="k">Done (today)</span><span class="v" id="wk-done">0</span></div>
-      <div class="metric-row" data-tip="LLM Latency|Wall-clock time of the most recent Mistral API call (connect + inference + response)."><span class="k">LLM Latency</span><span class="v" id="wk-lm-lat">--</span></div>
-      <div class="metric-row" data-tip="LLM Context|Average prompt token count per request (left) and max (right)."><span class="k">LLM Context</span><span class="v" id="wk-lm-ctx">--</span></div>
-      <div class="metric-row" data-tip="LLM Throughput|Requests per minute and total tokens generated."><span class="k">LLM Throughput</span><span class="v" id="wk-lm-req">--</span></div>
+      <div class="metric-row" data-tip="Status|HEALTHY / WARN / THROTTLED / STARVED / DEGRADED / DOWN. Derived from utilization, queue depth, latency, context pressure."><span class="k">Status</span><span class="v" id="wk-status">--</span></div>
+      <div class="metric-row" data-tip="PID / Heartbeat|OS process ID and seconds since last heartbeat."><span class="k">PID / HB</span><span class="v" id="wk-pid">--</span></div>
+      <div class="metric-row" data-tip="Queue|Processing / Pending / Done today / Failed today."><span class="k">Queue</span><span class="v" id="wk-queue">--</span></div>
+      <div class="metric-row" data-tip="Req/min (60s)|Actual requests in the last 60s vs the configured RPM limit."><span class="k">Req/min</span><span class="v" id="wk-rpm">--</span></div>
+      <div class="wk-bar-track"><div class="wk-bar-fill" id="wk-rpm-bar" style="width:0%"></div></div>
+      <div class="metric-row" data-tip="Tok/min (60s)|Total tokens (in+out) in the last 60s vs the token limit."><span class="k">Tok/min</span><span class="v" id="wk-tok">--</span></div>
+      <div class="wk-bar-track"><div class="wk-bar-fill" id="wk-tok-bar" style="width:0%"></div></div>
+      <div class="metric-row" data-tip="Context|Avg / Max / Limit tokens. Warns at >=80% of context window."><span class="k">Context</span><span class="v" id="wk-ctx">--</span></div>
+      <div class="wk-bar-track"><div class="wk-bar-fill fill-ctx" id="wk-ctx-bar" style="width:0%"></div></div>
+      <div class="metric-row" data-tip="Latency (60s)|avg / p50 / p95 / p99 in the last 60 seconds."><span class="k">Latency</span><span class="v" id="wk-lat">--</span></div>
+      <div class="metric-row" data-tip="In/Out (60s)|Avg and p95 input & output tokens per request."><span class="k">In/Out</span><span class="v" id="wk-io">--</span></div>
+      <div class="metric-row" data-tip="ETA drain|Estimated time to clear the pending queue at the current 60s rate."><span class="k">ETA drain</span><span class="v" id="wk-eta">--</span></div>
     </div>
     <div class="controls">
       <button class="s" onclick="ctrl(event,'worker','start')">START</button>
       <button class="p" onclick="ctrl(event,'worker','stop')">STOP</button>
       <button class="r" onclick="ctrl(event,'worker','restart')">RESTART</button>
     </div>
-    <div class="note">Memory-extraction daemon (heartbeats to a lock file).</div>
+    <div class="note">qwen3-4b · rolling 60s/5m · limits from env</div>
   </div>
 
   <div class="box" id="box-sync">
@@ -2073,17 +2260,69 @@ if(vm.prefix_hit_rate!=null){sv('vl-pfx',(vm.prefix_hit_rate*100).toFixed(1)+'%'
 else{sv('vl-pfx','--');$('b-pfx').style.width='0%';}
 
 var wk=s.worker||{};
+var ww=s.worker_window||{};
+var wl=s.worker_limits||{};
 setBox('worker',wk.status||'down');
-sv('wk-status',wk.status?wk.status.toUpperCase():'DOWN');
-sv('wk-pid',wk.pid?wk.pid:'--');
-sv('wk-hb',wk.heartbeat_age_s!=null?wk.heartbeat_age_s+'s':'--');
-sv('wk-proc',db.jobs_processing!=null?db.jobs_processing:0);
-sv('wk-pend',db.jobs_pending!=null?db.jobs_pending:0);
-sv('wk-done',db.jobs_done_today!=null?db.jobs_done_today:0);
-sv('wk-lm-lat',wk.lm_latency_ms!=null?wk.lm_latency_ms+'ms':'--');
-sv('wk-lm-ctx',wk.lm_ctx_avg!=null?wk.lm_ctx_avg+' / '+(wk.lm_ctx_max||0)+' tok':'--');
-var tokOut2=wk.lm_tokens_out||0;
-sv('wk-lm-req',wk.lm_rpm!=null?wk.lm_rpm+' req/min  '+(tokOut2>=1000?(tokOut2/1000).toFixed(1)+'k':tokOut2)+' tok':'--');
+var rpmLim=wl.rpm_limit||60;
+var tokLim=wl.tok_limit||245760;
+var ctxLim=wl.ctx_limit||8192;
+var reqs60=ww.reqs_60s||0;
+var toks60=ww.toks_60s||0;
+var rpmUtil=Math.min(100,Math.round((reqs60/rpmLim)*100));
+var tokUtil=Math.min(100,Math.round((toks60/tokLim)*100));
+var ctxAvg=wk.lm_ctx_avg||0;
+var ctxMax=wk.lm_ctx_max||0;
+var ctxPressure=Math.min(100,Math.round((ctxMax/ctxLim)*100));
+var latAvg=ww.lat_avg_60s||0;
+var latP50=ww.lat_p50_60s||0;
+var latP95=ww.lat_p95_60s||0;
+var latP99=ww.lat_p99_60s||0;
+var proc=db.jobs_processing||0;
+var pend=db.jobs_pending||0;
+var done=db.jobs_done_today||0;
+var fail=db.jobs_failed_today||0;
+var eta=0;
+if(reqs60>0&&pend>0){eta=Math.ceil(pend/(reqs60/60));}
+else if(pend>0){eta=-1;}
+var wStatus='DOWN';
+if(wk.status==='up'||wk.status==='degraded'){
+  if(pend>50&&rpmUtil<10)wStatus='STARVED';
+  else if(rpmUtil>=95)wStatus='THROTTLED';
+  else if(latP95>10000||ctxPressure>=90)wStatus='DEGRADED';
+  else if(rpmUtil>=80||ctxPressure>=80)wStatus='WARN';
+  else wStatus='HEALTHY';
+}
+var badge=$('wk-badge');
+if(badge){
+  badge.textContent=wStatus;
+  badge.className='wk-badge '+(wStatus==='HEALTHY'?'healthy':wStatus==='WARN'?'warn':wStatus==='THROTTLED'?'throttled':wStatus==='STARVED'?'starved':wStatus==='DEGRADED'?'degraded':'down');
+}
+sv('wk-status',wStatus);
+sv('wk-pid',(wk.pid||'--')+(wk.heartbeat_age_s!=null?' · '+wk.heartbeat_age_s+'s':''));
+sv('wk-queue',proc+' / '+pend+' / '+done+(fail>0?' / '+fail+'✗':''));
+sv('wk-rpm',reqs60+' / '+rpmLim+' · '+rpmUtil+'%');
+var rpmBar=$('wk-rpm-bar');
+if(rpmBar){rpmBar.style.width=rpmUtil+'%';rpmBar.className='wk-bar-fill'+(rpmUtil>=95?' danger':rpmUtil>=80?' warn':'');}
+var tokStr=toks60>=1000000?(toks60/1000000).toFixed(1)+'M':toks60>=1000?(toks60/1000).toFixed(1)+'k':String(toks60);
+var tokLimStr=tokLim>=1000000?(tokLim/1000000).toFixed(0)+'M':tokLim>=1000?(tokLim/1000).toFixed(0)+'k':String(tokLim);
+sv('wk-tok',tokStr+' / '+tokLimStr+' · '+tokUtil+'%');
+var tokBar=$('wk-tok-bar');
+if(tokBar){tokBar.style.width=tokUtil+'%';tokBar.className='wk-bar-fill'+(tokUtil>=95?' danger':tokUtil>=80?' warn':'');}
+var ctxStr=ctxAvg>=1000?(ctxAvg/1000).toFixed(1)+'k':String(ctxAvg);
+var ctxMaxStr=ctxMax>=1000?(ctxMax/1000).toFixed(1)+'k':String(ctxMax);
+var ctxLimStr=ctxLim>=1000?(ctxLim/1000).toFixed(0)+'k':String(ctxLim);
+sv('wk-ctx',ctxStr+' / '+ctxMaxStr+' / '+ctxLimStr+' tok · '+ctxPressure+'%');
+var ctxBar=$('wk-ctx-bar');
+if(ctxBar){ctxBar.style.width=ctxPressure+'%';ctxBar.className='wk-bar-fill fill-ctx'+(ctxPressure>=90?' danger':ctxPressure>=80?' warn':'');}
+function fms(ms){if(!ms)return'--';if(ms>=10000)return(ms/1000).toFixed(1)+'s';if(ms>=1000)return(ms/1000).toFixed(2)+'s';return ms.toFixed(0)+'ms';}
+sv('wk-lat',fms(latAvg)+' / '+fms(latP50)+' / '+fms(latP95)+' / '+fms(latP99));
+var inAvg=ww.tok_in_avg_60s||0;
+var outAvg=ww.tok_out_avg_60s||0;
+var inP95=ww.tok_in_p95_60s||0;
+var outP95=ww.tok_out_p95_60s||0;
+function fn(n){if(!n)return'0';return n>=1000?(n/1000).toFixed(1)+'k':String(n);}
+sv('wk-io','in '+fn(inAvg)+'(p95 '+fn(inP95)+') · out '+fn(outAvg)+'(p95 '+fn(outP95)+')');
+sv('wk-eta',eta>0?(eta>=60?Math.floor(eta/60)+'m '+(eta%60)+'s':eta+'s'):eta<0?'∞ (no rate)':'0s');
 
 // --- Session syncer ---
 var sy=s.session_sync||{};
