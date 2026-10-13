@@ -8,7 +8,6 @@ import httpx
 
 from proxy.config.constants import MISTRAL_MODEL, MISTRAL_URL, LM_PRI_HIGH, LM_PRI_LOW
 from proxy.resilience.breaker import _check_lm_breaker, _lm_breaker
-from proxy.token.counter import count_tokens
 from proxy.lm.rate_limiter import _lm_rate_limiter
 import re
 
@@ -32,10 +31,10 @@ async def _lm_do_call(task: dict):
         m.get("content", "") if isinstance(m.get("content", ""), str) else str(m.get("content", ""))
         for m in messages
     )
-    estimated_tokens = count_tokens(prompt_text) + task["max_tokens"]
+    estimated_chars = len(prompt_text) + task["max_tokens"] * 4  # char-budget (not tokens)
 
     _check_lm_breaker()  # raises if open
-    await _lm_rate_limiter.acquire(estimated_tokens)
+    await _lm_rate_limiter.acquire(estimated_chars)
 
     t0 = time.monotonic()
     body = {
@@ -69,7 +68,7 @@ async def _lm_do_call(task: dict):
             metrics["lm_tokens_by_kind"][_kind]["completion"] += _usage.get("completion_tokens", 0)
         except Exception:
             pass
-    _lm_rate_limiter.release(actual_tokens, estimated_tokens)
+    _lm_rate_limiter.release(actual_tokens, estimated_chars)
 
     dt = time.monotonic() - t0
     if resp.status_code == 429:

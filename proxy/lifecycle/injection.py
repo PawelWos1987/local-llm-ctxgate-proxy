@@ -70,17 +70,17 @@ def _record_injection(session_id: str, tm: str, kn: str) -> None:
     """Record memory/knowledge injection utilization. Lightweight, no DB round-trips."""
     global injection_metrics
     try:
-        from proxy.app import injection_metrics, _spawn, count_tokens
+        from proxy.app import injection_metrics, _spawn
         injection_metrics["total_requests"] += 1
         events = []
         if tm:
-            t = count_tokens(tm)
+            t = len(tm)
             injection_metrics["task_memory_injections"] += 1
             injection_metrics["task_memory_tokens"] += t
             injection_metrics["last_injected_task_memory"] = tm[:2000]
             events.append({"ts": time.time(), "session": session_id, "type": "task_memory", "tokens": t})
         if kn:
-            t = count_tokens(kn)
+            t = len(kn)
             injection_metrics["knowledge_injections"] += 1
             injection_metrics["knowledge_tokens"] += t
             injection_metrics["last_injected_knowledge"] = kn[:2000]
@@ -94,7 +94,7 @@ def _record_injection(session_id: str, tm: str, kn: str) -> None:
                     break
         if wm_line:
             injection_metrics["working_memory_injections"] += 1
-            injection_metrics["working_memory_tokens"] += count_tokens(wm_line)
+            injection_metrics["working_memory_tokens"] += len(wm_line)
         s = injection_metrics["sessions"].setdefault(session_id, {"task_mem": 0, "knowledge": 0, "wm": 0, "requests": 0})
         s["requests"] += 1
         if tm:

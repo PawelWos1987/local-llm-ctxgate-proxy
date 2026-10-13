@@ -2,7 +2,7 @@
 import logging
 
 from proxy.config.constants import MAX_INPUT, MAX_CONTEXT, SAFETY_MARGIN, MAX_OUTPUT, ESTIMATOR_MODE
-from proxy.token.counter import count_messages_tokens, count_tools_tokens
+from proxy.token.counter import _count_chars, _proportional_estimate
 from proxy.token.calibrator import calibrator
 
 log = logging.getLogger("ctxgate-proxy")
@@ -10,7 +10,7 @@ log = logging.getLogger("ctxgate-proxy")
 # TODO(I4): replace with AppContext
 
 
-def _estimate_delta(messages: list) -> int:
+def _estimate_delta(messages: list, inbound_total_tokens: int | None = None) -> int:
     """Estimate tokens for NEW content only (since last real baseline).
 
     The last_real baseline includes all messages from the previous request.
@@ -22,6 +22,9 @@ def _estimate_delta(messages: list) -> int:
       previous response). Everything after it is new content.
     - If there's only one user message, we can't determine what's new,
       so return 0 (the baseline already covers it).
+
+    When inbound_total_tokens is provided (from goose), uses the proportion
+    formula to estimate the delta portion.
     """
     if not messages:
         return 0
@@ -38,7 +41,16 @@ def _estimate_delta(messages: list) -> int:
     # (that was the last message in the previous request)
     start_idx = user_indices[-2] + 1
     new_msgs = messages[start_idx:]
-    return count_messages_tokens(new_msgs)
+    
+    if inbound_total_tokens is not None:
+        # Proportion formula: estimate delta tokens from known total
+        all_chars = sum(_count_chars(m.get("content", "")) for m in messages)
+        new_chars = sum(_count_chars(m.get("content", "")) for m in new_msgs)
+        return _proportional_estimate(inbound_total_tokens, all_chars, new_chars)
+    
+    # No source of truth available: cannot reliably estimate delta tokens.
+    # Return 0 - the caller will rely on the next real measurement.
+    return 0
 
 
 def _output_budget(input_tokens: int) -> int:

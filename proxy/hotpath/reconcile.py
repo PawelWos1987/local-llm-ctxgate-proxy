@@ -19,7 +19,6 @@ from proxy.config.constants import (
     CTXGATE_INJECT_MAX_TOKENS_CFG,
 )
 from proxy.window.state import _new_window_state
-from proxy.token.counter import count_messages_tokens
 
 log = logging.getLogger("ctxgate-proxy")
 
@@ -91,14 +90,16 @@ def resume_reconcile(
 
     # Compute current component sizes
     _injection_budget = CTXGATE_INJECT_MAX_TOKENS_CFG
-    _tool_tokens = 0
+    _tool_chars = 0
     if tools:
-        from proxy.token.counter import count_tools_tokens
-        _tool_tokens = count_tools_tokens(tools)
+        _tool_chars = sum(len(str(t)) for t in (tools or []))
 
-    _system_tokens = 0
+    _system_chars = 0
     if messages and messages[0].get("role") == "system":
-        _system_tokens = count_messages_tokens([messages[0]])
+        _sys_c = messages[0].get("content", "")
+        if isinstance(_sys_c, list):
+            _sys_c = " ".join(p.get("text", "") for p in _sys_c if isinstance(p, dict))
+        _system_chars = len(_sys_c) if _sys_c else 0
 
     # Window tokens from stored state (approximate: use the stored token count
     # if available, otherwise estimate from the messages list)
@@ -106,10 +107,10 @@ def resume_reconcile(
     if _window_tokens == 0 and messages:
         # Estimate: count all non-system messages
         non_sys = [m for m in messages if m.get("role") != "system"]
-        _window_tokens = count_messages_tokens(non_sys)
+        _window_tokens = 0  # No reliable source; pre-vLLM guard catches over-limit
 
     _projected = _projected_context_tokens(
-        _window_tokens, _injection_budget, _tool_tokens, _system_tokens
+        _window_tokens, _injection_budget, _tool_chars, _system_chars
     )
     _budget = _effective_budget()
 
@@ -189,7 +190,7 @@ def resume_reconcile(
 
     # Step 4: Minimum viable state (seed + 1 user message)
     # This is the last resort: keep only the system prompt + 1 user message.
-    _min_viable = _system_tokens + 500 + _injection_budget + _tool_tokens
+    _min_viable = _system_chars + 500 + _injection_budget + _tool_chars
     if _min_viable <= _budget:
         window_state["cut"] = window_state.get("total_msgs", len(messages)) - 1
         window_state["thinking_disabled"] = True

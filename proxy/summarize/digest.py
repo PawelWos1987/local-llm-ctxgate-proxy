@@ -55,7 +55,7 @@ async def _build_session_digest(task_uuid, session_key: str = "", tenant_id: str
             log.debug("Digest dedupe check failed (non-fatal): %s", e)
         await pool.execute(
             "INSERT INTO proxy.session_summaries (task_id, session_key, summary, trimmed_msg_count, trimmed_tokens) VALUES ($1,$2,$3,$4,$5)",
-            task_uuid, session_key, digest, 0, len(digest) // 4
+            task_uuid, session_key, digest, 0, len(digest)
         )
         log.info("Session digest built: %d chars, %d ledger rows, %d phases", len(digest), len(ledger_rows), len(phase_rows))
         return digest

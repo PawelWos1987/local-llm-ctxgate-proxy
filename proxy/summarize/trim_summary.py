@@ -26,7 +26,7 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
     from proxy.lm.call import _call_4b
     from proxy.summarize.digest import _build_session_digest
     from proxy.summarize.slices import _enqueue_context_slices
-    from proxy.token.counter import count_tokens, _rho_var
+    from proxy.token.counter import _rho_var
     from proxy.window.persist import _window_persist
     import time
     _rho_var.set(RHO_COLD)  # background task: don't inherit request context
@@ -175,10 +175,10 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
                 await pool.execute(
                     "INSERT INTO proxy.phase_summaries (task_id, session_key, phase_number, summary, trimmed_msg_count, trimmed_tokens) "
                     "VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (task_id, phase_number) DO UPDATE SET summary=$4, trimmed_msg_count=$5, trimmed_tokens=$6",
-                    task_uuid, session_key, new_phase, phase_summary[:3000], len(slice_msgs), count_tokens(chunk),
+                    task_uuid, session_key, new_phase, phase_summary[:3000], len(slice_msgs), len(chunk),
                 )
                 metrics["summary_slices_ok"] += 1
-                log.info("Phase %d summary stored: %d msgs, %d tokens, %d chars", new_phase, len(slice_msgs), count_tokens(chunk), len(phase_summary))
+                log.info("Phase %d summary stored: %d msgs, %d tokens, %d chars", new_phase, len(slice_msgs), len(chunk), len(phase_summary))
                 return phase_summary
 
             # Phase 3: Run deterministic extractor on the full-fidelity slice

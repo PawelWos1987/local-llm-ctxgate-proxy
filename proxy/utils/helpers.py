@@ -23,7 +23,6 @@ def _fit_to_budget(sections: list, budget_tokens: int) -> str:
     sections: list of (priority, text) tuples, priority 0 = newest (keep), higher = older (drop first).
     Returns the joined string that fits within budget_tokens.
     """
-    from proxy.app import count_tokens
     from proxy.token.counter import _rho_var
 
     if not sections:
@@ -32,7 +31,7 @@ def _fit_to_budget(sections: list, budget_tokens: int) -> str:
     parts = []
     total = 0
     for prio, text in sorted_secs:
-        t = count_tokens(text)
+        t = len(text)
         if total + t > budget_tokens:
             if parts:
                 break
@@ -41,7 +40,7 @@ def _fit_to_budget(sections: list, budget_tokens: int) -> str:
                 if len(text) > max_chars:
                     text = text[:max_chars] + "\n[...truncated to fit budget...]"
                 parts.append(text)
-                total = count_tokens(text)
+                total = len(text)
                 break
         parts.append(text)
         total += t
@@ -85,11 +84,11 @@ def _compute_epoch_key(session_key: str, ws: dict, newest_user_anchor: str, reca
 
 
 def _note_tok() -> int:
-    """Token cost of the note (lazy + cached; never call count_tokens at import time)."""
-    from proxy.app import _NOTE_TOK_CACHE, COMPACTION_NOTE, count_tokens
+    """Char cost of the note (lazy + cached; never compute at import time)."""
+    from proxy.app import _NOTE_TOK_CACHE, COMPACTION_NOTE
     import proxy.app as _app
     if _app._NOTE_TOK_CACHE is None:
-        _app._NOTE_TOK_CACHE = max(1, count_tokens(chr(10) * 2 + COMPACTION_NOTE)) if COMPACTION_NOTE else 0
+        _app._NOTE_TOK_CACHE = max(1, len(chr(10) * 2 + COMPACTION_NOTE)) if COMPACTION_NOTE else 0
     return _app._NOTE_TOK_CACHE
 
 

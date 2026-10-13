@@ -482,13 +482,40 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
 
                 # --- Continuation state machine ---
                 if finish_reason == "length" and continuation_count < MAX_CONTINUATIONS:
-                    # Incomplete tool call -> NO continuation
+                    # Incomplete tool call -> try continuation
                     if tc_incomplete:
-                        log.warning("Incomplete tool call set - NO continuation (truncated)")
-                        exit_reason = "tool_call_truncated"
-                        metrics["tool_call_truncated"] += 1
-                        finish_reason = "length"
-                        break
+                        remaining = CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens
+                        if remaining < CTXGATE_MIN_CONTINUATION_OUTPUT:
+                            log.warning("Incomplete tool call set - budget exhausted (%d/%d), cannot continue", total_output_tokens, CTXGATE_MAX_TOTAL_OUTPUT)
+                            exit_reason = "tool_call_truncated"
+                            metrics["tool_call_truncated"] += 1
+                            finish_reason = "length"
+                            break
+                        continuation_count += 1
+                        metrics["output_continuations_total"] += 1
+                        log.info("Incomplete tool call set - continuing (%d/%d, remaining=%d)", continuation_count, MAX_CONTINUATIONS, remaining)
+                        cont_messages = list(vllm_body.get("messages", []))
+                        _assist_msg = {"role": "assistant", "content": full_content or ""}
+                        cont_messages.append(_assist_msg)
+                        cont_messages.append({"role": "user", "content": "Your previous response was truncated before completing the tool call arguments. Please re-issue the complete tool call(s) from scratch. Do not repeat any explanatory text."})
+                        cont_tokens = exact_count_messages(cont_messages, VLLM_MODEL)
+                        _cont_budget = _output_budget(cont_tokens)
+                        max_tokens = min(_cont_budget, MAX_OUTPUT, remaining)
+                        if cont_tokens > MAX_INPUT or max_tokens < CTXGATE_MIN_CONTINUATION_OUTPUT:
+                            log.warning("Tool-call cont: would exceed input budget (%d > %d) or starve output (%d < %d) - stopping", cont_tokens, MAX_INPUT, max_tokens, CTXGATE_MIN_CONTINUATION_OUTPUT)
+                            exit_reason = "tool_call_truncated"
+                            metrics["tool_call_truncated"] += 1
+                            finish_reason = "length"
+                            break
+                        current_body = dict(vllm_body)
+                        current_body["messages"] = cont_messages
+                        current_body["max_tokens"] = max_tokens
+                        metrics["output_max_tokens_seen"] = max(metrics["output_max_tokens_seen"], max_tokens)
+                        tc_accum = ToolCallAccumulator()
+                        tc_buffer.clear()
+                        seam_active = False
+                        seam_hold = ""
+                        continue
                     # Complete tool call set -> terminate, no continuation
                     if tc_complete:
                         log.info("Complete tool-call set - terminating turn (no continuation)")

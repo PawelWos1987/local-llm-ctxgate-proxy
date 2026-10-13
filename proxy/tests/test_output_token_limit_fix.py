@@ -144,7 +144,7 @@ class TestOutputTokenLimitFix:
             }
         
         # Mock the token estimator to return our simulated high value
-        with patch("proxy.hotpath.handler.count_messages_tokens", 
+        with patch("proxy.hotpath.handler.exact_count_messages", 
                    return_value=simulated_input_tokens), \
              patch("proxy.hotpath.handler._forward_to_vllm", side_effect=fake_forward):
             transport = ASGITransport(app=app)

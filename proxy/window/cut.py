@@ -9,7 +9,8 @@ from proxy.config.constants import (
     CTXGATE_INJECT_MAX_TOKENS_CFG, CTXGATE_INJECT_MAX_TOKENS_RECAP_CFG,
 )
 from proxy.window.state import _norm_content, _msg_anchor, _seed_sig, _newest_user_idx
-from proxy.token.counter import count_messages_tokens, count_message_tokens
+from proxy.token.exact import exact_count_messages
+from proxy.config.constants import VLLM_MODEL
 
 log = logging.getLogger("ctxgate-proxy")
 
@@ -63,7 +64,7 @@ def _safe_cut(groups: list, budget_tokens: int) -> int:
         quantized_budget = budget_tokens
     group_tokens = []
     for g in groups:
-        gt = sum(count_message_tokens(m) for m in g)
+        gt = sum(exact_count_messages([m], VLLM_MODEL) for m in g)
         group_tokens.append(gt)
     cum = 0
     cut_group_idx = len(groups)
@@ -76,7 +77,7 @@ def _safe_cut(groups: list, budget_tokens: int) -> int:
                 cut_group_idx = i
             break
     return cut_group_idx
-def _recut_to(messages: list, max_tokens: int) -> int:
+def _recut_to(messages: list, max_tokens: int, total_tokens: int | None = None) -> int:
     """Turn-group-aware budget cut targeting max_tokens.
 
     The immutable prefix is the system message (index 0) + the first user message.
@@ -101,8 +102,8 @@ def _recut_to(messages: list, max_tokens: int) -> int:
             break
     
     stub_tok = _note_tok()
-    seed_tok = count_messages_tokens(seed) if seed else 0
-    total_tok = count_messages_tokens(messages)
+    seed_tok = exact_count_messages(seed, VLLM_MODEL) if seed else 0  # [RULE 1: pre-vLLM]
+    total_tok = total_tokens if total_tokens is not None else exact_count_messages(messages, VLLM_MODEL)  # [RULE 1: pre-vLLM]
     lu = _newest_user_idx(rest)
     budget = max(500, max_tokens - seed_tok - stub_tok - 200)
     
@@ -120,16 +121,17 @@ def _recut_to(messages: list, max_tokens: int) -> int:
     
     # Post-check: guard against window collapse
     kept = _kept_messages(seed, rest, cut)
-    kept_tok = count_messages_tokens(kept)
-    if kept_tok < 0.5 * max_tokens and total_tok > max_tokens and len(rest) > 0:
-        log.error("WINDOW COLLAPSE guard: kept_tok=%d target=%d total_tok=%d cut=%d rest=%d - falling back to plain budget tail",
-                  kept_tok, max_tokens, total_tok, cut, len(rest))
+    # [allowed: post-cut verification]
+    post_cut_tokens = exact_count_messages(kept, VLLM_MODEL)
+    if post_cut_tokens < 0.5 * max_tokens and total_tok > max_tokens and len(rest) > 0:
+        log.error("WINDOW COLLAPSE guard: post_cut_tokens=%d target=%d total_tok=%d cut=%d rest=%d - falling back to plain budget tail",
+                  post_cut_tokens, max_tokens, total_tok, cut, len(rest))
         metrics["window_collapse_guard"] += 1
         # Fallback: newest-first budget walk (old behavior)
         tail = []
         t = 0
         for m in reversed(rest):
-            mt = count_message_tokens(m)
+            mt = exact_count_messages([m], VLLM_MODEL)
             if t + mt > budget and len(tail) > 5:
                 break
             tail.append(m)
@@ -141,17 +143,19 @@ def _recut_to(messages: list, max_tokens: int) -> int:
     
     # Over-shoot guard: estimate undercounted -> kept is still over budget
     kept = _kept_messages(seed, rest, cut)
-    kept_tok = count_messages_tokens(kept)
-    if kept_tok > max_tokens and cut_group_idx < len(groups):
-        log.warning("RECURT OVER-SHOOT: kept_tok=%d target=%d cut=%d groups=%d - cutting deeper",
-                    kept_tok, max_tokens, cut, len(groups))
+    # [allowed: post-cut verification]
+    post_cut_tokens = exact_count_messages(kept, VLLM_MODEL)
+    if post_cut_tokens > max_tokens and cut_group_idx < len(groups):
+        log.warning("RECURT OVER-SHOOT: post_cut_tokens=%d target=%d cut=%d groups=%d - cutting deeper",
+                    post_cut_tokens, max_tokens, cut, len(groups))
         metrics["recut_overshoot_guard"] += 1
         while cut_group_idx < len(groups):
             cut_group_idx += 1
             cut = sum(len(groups[i]) for i in range(cut_group_idx))
             kept = _kept_messages(seed, rest, cut)
-            kept_tok = count_messages_tokens(kept)
-            if kept_tok <= max_tokens:
+            # [allowed: post-cut verification]
+            post_cut_tokens = exact_count_messages(kept, VLLM_MODEL)
+            if post_cut_tokens <= max_tokens:
                 break
 
     # Guard: never cut past the newest user message (live prompt / protected region)
@@ -268,7 +272,7 @@ def _hard_cut_to(messages: list, actual_tokens: int, target_tokens: int) -> int:
     for i in removable:
         if removed >= tokens_to_remove:
             break
-        mt = count_message_tokens(messages[i])
+        mt = exact_count_messages([messages[i]], VLLM_MODEL)
         to_remove_set.add(i)
         removed += mt
 
@@ -276,7 +280,7 @@ def _hard_cut_to(messages: list, actual_tokens: int, target_tokens: int) -> int:
     _repair_tool_dependencies(messages, to_remove_set)
 
     # Recalculate removed tokens after dependency repair
-    removed = sum(count_message_tokens(messages[i]) for i in to_remove_set)
+    removed = sum(exact_count_messages([messages[i]], VLLM_MODEL) for i in to_remove_set)
 
     # Build new list excluding removed messages
     kept = [m for i, m in enumerate(messages) if i not in to_remove_set]
@@ -314,8 +318,8 @@ def _kept_messages(seed: list, rest: list, cut: int) -> list:
         live_idx_in_result = len(seed)  # rest[cut:] starts at rest[lu] since cut==lu
         if live_idx_in_result < len(result):
             live_msg = result[live_idx_in_result]
-            live_tok = count_message_tokens(live_msg)
-            seed_tok = count_messages_tokens(seed) if seed else 0
+            live_tok = exact_count_messages([live_msg], VLLM_MODEL)  # [RULE 3: post-cut]
+            seed_tok = exact_count_messages(seed, VLLM_MODEL)  # [RULE 3: post-cut] if seed else 0
             budget = MAX_INPUT
             max_live = budget - seed_tok - 500  # 500 for stub/overhead
             if max_live < 1000:

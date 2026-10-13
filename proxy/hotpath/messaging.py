@@ -141,12 +141,11 @@ def _detect_loop(text: str) -> int:
 
 
 def _classify_truncation(finish_reason: str, content: str, reasoning_content: str, tool_calls: list) -> str:
-    from proxy.app import count_tokens
     from proxy.config.constants import MAX_REASONING_TOKENS
-    reasoning_tok = count_tokens(reasoning_content or "")
+    reasoning_chars = len(reasoning_content or "")
     content_len = len(content or "")
     if finish_reason == "length":
-        if reasoning_tok >= MAX_REASONING_TOKENS and content_len < 50:
+        if reasoning_chars >= MAX_REASONING_TOKENS and content_len < 50:
             return "reasoning_overflow"
         return "content_truncation"
     if finish_reason == "tool_calls":

@@ -1,7 +1,8 @@
 """Emergency shrink: reduce context when it exceeds capacity."""
 import logging
 
-from proxy.token.counter import count_message_tokens, count_messages_tokens
+from proxy.token.exact import exact_count_messages
+from proxy.config.constants import VLLM_MODEL
 from proxy.window.state import _msg_anchor
 from proxy.window.elide import _elided_tool_content
 from proxy.window.invariants import protected_tool_groups
@@ -67,9 +68,8 @@ def _truncate_message_content(msg: dict, max_tokens: int) -> dict:
     if len(content) <= max_chars:
         return msg
     truncated = content[:max_chars] + "\n[... truncated by ctxgate ...]"
-    new_msg = dict(msg)
-    new_msg["content"] = truncated
-    return new_msg
+    msg["content"] = truncated
+    return msg
 
 
 def _strip_injection_block(content: str) -> str:
@@ -126,18 +126,18 @@ def _emergency_shrink(kept: list, ceiling: int, aggressive: bool = False,
 
     When actual_total > 0, it is used as the authoritative total token count for the
     initial "do we need to shrink?" check. This accounts for non-message overhead
-    (tool definitions, template separators, injection) that count_messages_tokens
+    (tool definitions, template separators, injection) that exact_count_messages
     does not include. Without this, the function can exit early when message tokens
     are below the ceiling but the full payload (messages + overhead) exceeds it.
     """
     import proxy.app as _app
     metrics = _app.metrics
 
-    before = count_messages_tokens(kept)
+    # Use actual_total (real token count) as the authoritative source.
+    # If not provided, proceed with shrink (conservative approach).
     # Use actual_total (full payload estimate) if provided, as it accounts for
     # non-message overhead (tools, template, injection) that message tokens miss.
-    effective_before = max(before, actual_total) if actual_total > 0 else before
-    if effective_before <= ceiling:
+    if actual_total > 0 and actual_total <= ceiling:
         return kept
     metrics["emergency_shrink_total"] += 1
     if aggressive:
@@ -146,8 +146,9 @@ def _emergency_shrink(kept: list, ceiling: int, aggressive: bool = False,
     protected = _protected_indices(work, aggressive=aggressive)
     # Pre-compute per-message token counts (O(n) once)
     # Prefer _tokens (real HF tokenizer count from annotate_message_usage) over char-based estimate
-    msg_toks = [m.get("_tokens") if m.get("_tokens") is not None else count_message_tokens(m) for m in work]
+    msg_toks = [m.get("_tokens") if m.get("_tokens") is not None else exact_count_messages([m], VLLM_MODEL) for m in work]
     running_total = sum(msg_toks)
+    before = running_total
     # Target: max message tokens such that (messages + overhead) <= ceiling.
     # Overhead = actual_total - running_total (tools, system, injection).
     # Uses a DIFFERENCE (stable across calls), not a ratio (which ratchets).
@@ -181,7 +182,7 @@ def _emergency_shrink(kept: list, ceiling: int, aggressive: bool = False,
         new_content = _elided_tool_content(c, session_key='', event_hash=event_hash)
         old_tok = msg_toks[i]
         work[i]["content"] = new_content
-        new_tok = count_message_tokens(work[i])
+        new_tok = exact_count_messages([work[i]], VLLM_MODEL)
         running_total += new_tok - old_tok
         msg_toks[i] = new_tok
     
@@ -227,7 +228,7 @@ def _emergency_shrink(kept: list, ceiling: int, aggressive: bool = False,
                 if stripped != content:
                     old_tok = msg_toks[lu_idx]
                     work[lu_idx]["content"] = stripped
-                    new_tok = count_message_tokens(work[lu_idx])
+                    new_tok = exact_count_messages([work[lu_idx]], VLLM_MODEL)
                     running_total += new_tok - old_tok
                     msg_toks[lu_idx] = new_tok
                     metrics["emergency_shrink_injection_pruned"] = metrics.get("emergency_shrink_injection_pruned", 0) + 1
@@ -253,7 +254,7 @@ def _emergency_shrink(kept: list, ceiling: int, aggressive: bool = False,
             if target_lu_tok < current_lu_tok:
                 old_msg = work[lu_idx]
                 work[lu_idx] = _truncate_message_content(old_msg, target_lu_tok)
-                new_lu_tok = count_message_tokens(work[lu_idx])
+                new_lu_tok = exact_count_messages([work[lu_idx]], VLLM_MODEL)
                 running_total += new_lu_tok - current_lu_tok
                 msg_toks[lu_idx] = new_lu_tok
                 metrics["emergency_shrink_live_truncated"] = metrics.get("emergency_shrink_live_truncated", 0) + 1

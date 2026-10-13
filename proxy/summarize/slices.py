@@ -45,7 +45,6 @@ async def _fetch_session_summary(task_uuid, budget=1500, session_key: str = ""):
     """
     from proxy.app import log, pool  # TODO(I4): replace with AppContext
     from proxy.config.constants import RHO_COLD
-    from proxy.token.counter import count_tokens
     if not pool:
         return ""
     try:
@@ -61,7 +60,7 @@ async def _fetch_session_summary(task_uuid, budget=1500, session_key: str = ""):
             )
         if row and row["summary"]:
             s = row["summary"].strip()
-            t = count_tokens(s)
+            t = len(s)  # char count for sizing
             if t <= budget:
                 return s
             return s[:int(budget * RHO_COLD)]

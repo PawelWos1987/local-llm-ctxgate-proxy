@@ -20,7 +20,6 @@ async def fetch_task_memory(session_id: str, messages: list, task_uuid: str = No
     from proxy.db.tasks import _resolve_task
     from proxy.memory.score import _already_in_context, _context_blob, _extract_terms, _score_memory
     from proxy.summarize.slices import _fetch_session_summary
-    from proxy.token.counter import count_tokens
     if not pool:
         return ""
     if task_uuid is None:
@@ -85,7 +84,7 @@ async def fetch_task_memory(session_id: str, messages: list, task_uuid: str = No
     wm_text = (wrow["content"].strip() if wrow and wrow["content"] else "")
     if wm_text and not _already_in_context(wm_text, blob):
         line = "WORKING MEMORY: " + wm_text
-        t = count_tokens(line)
+        t = len(line)
         if t <= wm_budget and total + t <= total_budget:
             parts.append(line)
             total += t
@@ -93,7 +92,7 @@ async def fetch_task_memory(session_id: str, messages: list, task_uuid: str = No
     if summary:  # Phase 4: digest is never suppressed by _already_in_context
         line = ("TASK STATE (background only; the NEWEST user message is the live instruction - never resume the first prompt unless the newest message asks for it. "
                 "Where an older message says something is not yet done but this state or the files on disk say it is, trust this state and the disk): " + summary)
-        t = count_tokens(line)
+        t = len(line)
         if t <= 1500 and total + t <= total_budget:
             parts.append(line)
             total += t
@@ -111,7 +110,7 @@ async def fetch_task_memory(session_id: str, messages: list, task_uuid: str = No
             continue
         if wm_text and row["value"] in wm_text:
             continue
-        t = count_tokens(line)
+        t = len(line)
         if total + t > min(mem_budget, total_budget):
             break
         parts.append(line)
@@ -140,7 +139,6 @@ async def fetch_relevant_knowledge(messages: list, max_items: int = 5, max_token
     """Fetch top-N most relevant knowledge items. Returns formatted text for system prompt injection.
     Phase 2: filters by tenant_id when provided."""
     from proxy.app import pool  # TODO(I4): replace with AppContext
-    from proxy.token.counter import count_tokens
     if not pool:
         return ""
     search_terms = set()
@@ -193,7 +191,7 @@ async def fetch_relevant_knowledge(messages: list, max_items: int = 5, max_token
     total_tokens = 0
     for row in rows:
         line = row['key'] + ": " + row['value']
-        tok = count_tokens(line)
+        tok = len(line)
         if total_tokens + tok > max_tokens:
             break
         parts.append(line)

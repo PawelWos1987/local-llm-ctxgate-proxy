@@ -25,14 +25,15 @@ async def forward_to_vllm_passthrough(vllm_body: dict,
     # Pre-send token guard: protect against estimator underestimation
     from proxy.window.shrink import _emergency_shrink
     from proxy.config.constants import MAX_CONTEXT, SAFETY_MARGIN, MAX_OUTPUT
-    from proxy.token.counter import count_messages_tokens
+    from proxy.token.exact import exact_count_messages
+    from proxy.config.constants import VLLM_MODEL
 
     _ceiling = MAX_CONTEXT - SAFETY_MARGIN - MAX_OUTPUT
-    _estimated = count_messages_tokens(vllm_body.get("messages", []))
+    _estimated = exact_count_messages(vllm_body.get("messages", []), VLLM_MODEL)  # [RULE 1: pre-vLLM]
     if _estimated > _ceiling:
         log.warning("Passthrough pre-send guard (json): input=%d > ceiling=%d - shrinking", _estimated, _ceiling)
         vllm_body["messages"] = _emergency_shrink(vllm_body["messages"], _ceiling)
-        _estimated = count_messages_tokens(vllm_body["messages"])
+        _estimated = exact_count_messages(vllm_body["messages"], VLLM_MODEL)  # [RULE 3: post-shrink]
         if _estimated > _ceiling:
             return JSONResponse(
                 {"error": {"message": "context exceeds maximum after shrink",
@@ -126,14 +127,15 @@ async def stream_to_vllm_passthrough(vllm_body: dict,
     # Pre-send token guard: protect against estimator underestimation
     from proxy.window.shrink import _emergency_shrink
     from proxy.config.constants import MAX_CONTEXT, SAFETY_MARGIN, MAX_OUTPUT
-    from proxy.token.counter import count_messages_tokens
+    from proxy.token.exact import exact_count_messages
+    from proxy.config.constants import VLLM_MODEL
 
     _ceiling = MAX_CONTEXT - SAFETY_MARGIN - MAX_OUTPUT
-    _estimated = count_messages_tokens(vllm_body.get("messages", []))
+    _estimated = exact_count_messages(vllm_body.get("messages", []), VLLM_MODEL)  # [RULE 1: pre-vLLM]
     if _estimated > _ceiling:
         log.warning("Passthrough pre-send guard (stream): input=%d > ceiling=%d - shrinking", _estimated, _ceiling)
         vllm_body["messages"] = _emergency_shrink(vllm_body["messages"], _ceiling)
-        _estimated = count_messages_tokens(vllm_body["messages"])
+        _estimated = exact_count_messages(vllm_body["messages"], VLLM_MODEL)  # [RULE 3: post-shrink]
         if _estimated > _ceiling:
             return JSONResponse(
                 {"error": {"message": "context exceeds maximum after shrink",
