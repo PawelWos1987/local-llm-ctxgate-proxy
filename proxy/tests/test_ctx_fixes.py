@@ -87,58 +87,42 @@ class TestParseVllmActualTokens:
 
 # ─── Fix 3: Escalating truncation logic ──────────────────────────────────────
 
-class TestEscalatingTruncation:
-    def test_counter_starts_at_zero(self):
-        """The per-session counter starts empty."""
-        from proxy.streaming.to_vllm_stream import _ctx_fail_counter
-        assert "nonexistent_session" not in _ctx_fail_counter
+class TestContextLengthError:
+    """Tests for the simplified context-length error handling.
 
-    def test_injected_message_is_user_role(self):
-        """[CONTEXT TRUNCATED - CONTINUE] must be role='user', not 'system'."""
-        # Simulate what the code does
-        messages = [
-            {"role": "system", "content": "You are helpful."},
-            {"role": "user", "content": "Do something"},
-            {"role": "assistant", "content": "Done"},
-        ]
-        # The injection appends a user message
-        messages.append({"role": "user", "content": "[CONTEXT TRUNCATED - CONTINUE]"})
-        
-        last_msg = messages[-1]
-        assert last_msg["role"] == "user"
-        assert last_msg["content"] == "[CONTEXT TRUNCATED - CONTINUE]"
+    Phase A (hotpath/context.py) guarantees the payload fits within budget.
+    Any context-length error from vLLM after Phase A sizing is unexpected
+    and results in a simple 413 error rather than emergency recuts.
+    """
 
-    def test_truncation_preserves_system_message(self):
-        """System message (index 0) must never be removed."""
-        messages = [
-            {"role": "system", "content": "S"},
-            {"role": "user", "content": "U1"},
-            {"role": "assistant", "content": "A1"},
-            {"role": "user", "content": "U2"},
-        ]
-        # Simulate removing oldest non-system
-        del messages[1]
-        assert messages[0]["role"] == "system"
-        assert len(messages) == 3
+    def test_error_type_is_context_length_exceeded(self):
+        """The error response uses type=context_length_exceeded."""
+        import inspect
+        from proxy.streaming import to_vllm
+        src = inspect.getsource(to_vllm.forward_to_vllm)
+        assert "context_length_exceeded" in src
+        assert "status_code=413" in src
 
-    def test_target_levels(self):
-        """Verify the escalation targets for MAX_CONTEXT=83200."""
-        level1_target = int(MAX_CONTEXT * 0.4)
-        level2_target = int(MAX_CONTEXT * 0.25)
-        
-        # Level 1: ~33280 tokens
-        assert 30_000 < level1_target < 35_000
-        # Level 2: ~20800 tokens  
-        assert 18_000 < level2_target < 23_000
+    def test_no_pre_send_gate_in_nonstream(self):
+        """The PRE-SEND GATE block should not exist in to_vllm.py."""
+        import inspect
+        from proxy.streaming import to_vllm
+        src = inspect.getsource(to_vllm.forward_to_vllm)
+        assert "PRE-SEND GATE" not in src
 
-    def test_third_failure_gives_up(self):
-        """After 3 consecutive failures, the system gives up cleanly."""
-        from proxy.streaming.to_vllm_stream import _ctx_fail_counter
-        _ctx_fail_counter["test_sess"] = 3
-        assert _ctx_fail_counter["test_sess"] >= 3
-        # Cleanup
-        del _ctx_fail_counter["test_sess"]
+    def test_no_pre_send_gate_in_stream(self):
+        """The PRE-SEND GATE block should not exist in to_vllm_stream.py."""
+        import inspect
+        from proxy.streaming import to_vllm_stream
+        src = inspect.getsource(to_vllm_stream.stream_to_vllm)
+        assert "PRE-SEND GATE" not in src
 
+    def test_no_hard_cut_in_error_path(self):
+        """_hard_cut_to should not appear in the non-stream file."""
+        import inspect
+        from proxy.streaming import to_vllm
+        src = inspect.getsource(to_vllm.forward_to_vllm)
+        assert "_hard_cut_to" not in src
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

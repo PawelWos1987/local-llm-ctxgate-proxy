@@ -11,12 +11,9 @@ import json
 import time
 import httpx
 from proxy.streaming.toolcall import ToolCallAccumulator
-from proxy.window.cut import _parse_vllm_actual_tokens, _hard_cut_to
 
 log = logging.getLogger("ctxgate-proxy")
 
-# Per-session consecutive context-length error counter
-_ctx_fail_counter: dict[str, int] = {}
 
 # TODO(I4): replace with AppContext
 
@@ -25,10 +22,9 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
     # TODO(I4): replace with AppContext
     from proxy.app import (metrics, _vllm_client, VLLM_URL, VLLM_MODEL,
                            CTXGATE_MAX_TOTAL_OUTPUT, MAX_OUTPUT, MAX_INPUT,
-                           MAX_CONTEXT, SAFETY_MARGIN,
+                           MAX_CONTEXT,
                            _output_budget, _validate_outgoing_payload,
-                           _check_vllm_breaker, _note_tok, _emergency_shrink, _recut_to,
-                           _trim_target,
+                           _check_vllm_breaker, _note_tok, _emergency_shrink,
                            _is_context_length_error, _record_call, CTXGATE_MIN_CONTINUATION_OUTPUT,
                            RETRY_PRESENCE_PENALTY, ContextCapacityError,
                            WALL_CLOCK_MAX, ctxgate_meta, BLOCK_UNBOUNDED_LOOPS,
@@ -44,12 +40,6 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
         global metrics
         nonlocal input_tokens
 
-        # === PRE-FLIGHT HARD CUT: massively oversized payloads ===
-        _pf_est = exact_count_messages(vllm_body.get('messages', []), VLLM_MODEL)  # [RULE 2: pre-vLLM]
-        if _pf_est > MAX_INPUT * 1.5:
-            log.warning('PRE-FLIGHT HARD CUT: est=%d >> MAX_INPUT=%d (session=%s)', _pf_est, MAX_INPUT, session_key)
-            _hard_cut_to(vllm_body['messages'], _pf_est, MAX_INPUT)
-        # Content is forwarded immediately. The only text ever held back is
         # the first SEAM_WINDOW chars of a continuation segment (to trim overlap
         # with what the client already has), and it is flushed on every exit path.
         SEAM_WINDOW = 120
@@ -178,34 +168,6 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                 loop_intentional = False
                 tc_buffer = []
                 _check_vllm_breaker()
-                # === PRE-SEND GATE: hard invariant ===
-                _pre_input = exact_count_messages(current_body["messages"], VLLM_MODEL)  # [RULE 2: pre-vLLM]
-                _pre_total = _pre_input + current_body["max_tokens"]
-                if _pre_total > MAX_CONTEXT:
-                    log.warning(
-                        "Pre-send gate: input=%d + output=%d = %d > MAX_CONTEXT=%d - shrinking (session=%s)",
-                        _pre_input, current_body["max_tokens"], _pre_total, MAX_CONTEXT, session_key
-                    )
-                    _target_input = MAX_CONTEXT - current_body["max_tokens"] - SAFETY_MARGIN
-                    if _target_input < 500:
-                        _reduced_output = max(100, MAX_CONTEXT - _pre_input - SAFETY_MARGIN)
-                        current_body["max_tokens"] = _reduced_output
-                        _target_input = MAX_CONTEXT - _reduced_output - SAFETY_MARGIN
-                    if _target_input > 0:
-                        _cut_n = _recut_to(current_body["messages"], _target_input)
-                        if _cut_n == 0:
-                            _est_now = exact_count_messages(current_body["messages"], VLLM_MODEL)  # [RULE 2: pre-vLLM]
-                            if _est_now > MAX_INPUT:
-                                log.warning('RECUT BLOCKED (guard), falling back to HARD CUT: est=%d target=%d (session=%s)', _est_now, MAX_INPUT, session_key)
-                                _hard_cut_to(current_body["messages"], _est_now, MAX_INPUT)
-                        _pre_input = exact_count_messages(current_body["messages"], VLLM_MODEL)  # [RULE 2: pre-vLLM]
-                        current_body["max_tokens"] = _output_budget(_pre_input)
-                    log.info(
-                        "Pre-send gate resolved: input=%d + output=%d = %d <= MAX_CONTEXT=%d",
-                        _pre_input, current_body["max_tokens"],
-                        _pre_input + current_body["max_tokens"], MAX_CONTEXT
-                    )
-                # === END PRE-SEND GATE ===
                 try:
                     async with client.stream("POST", VLLM_URL + "/chat/completions", json=current_body) as resp:
                         if resp.status_code != 200:
@@ -213,55 +175,12 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                             _et = body_bytes[:500].decode("utf-8", errors="replace")
                             _is_ctx_err = _is_context_length_error(resp.status_code, _et)
                             if _is_ctx_err and not _bytes_sent:
-                                # Escalating per-session failure counter
-                                _fail_count = _ctx_fail_counter.get(session_key, 0) + 1
-                                _ctx_fail_counter[session_key] = _fail_count
-
-                                if _fail_count >= 3:
-                                    # Give up - return clear error
-                                    log.error("SESSION UNRECOVERABLE: %d consecutive ctx errors (session=%s)", _fail_count, session_key)
-                                    metrics["requests_error"] += 1
-                                    _record_call(session_key, input_tokens, total_output_tokens, "context_overflow_unrecoverable", VLLM_MODEL, True, _et[:200])
-                                    yield "data: " + json.dumps({"error": {"type": "context_overflow", "message": f"Session context exceeds model limits after {_fail_count} recovery attempts. Manual compaction required."}}) + "\n\n"
-                                    yield "data: [DONE]" + "\n\n"
-                                    return
-
-                                # Determine target fraction based on failure count
-                                _target_frac = 0.4 if _fail_count == 1 else 0.25
-                                _target_input = int(MAX_CONTEXT * _target_frac)
-
-                                log.warning("ESCALATING TRUNCATION: attempt=%d target=%d%% MAX_CONTEXT (session=%s)",
-                                           _fail_count, int(_target_frac * 100), session_key)
-                                calibrator.bump_margin(session_key)
-
-                                # Hard cut to target
-                                _est_now = exact_count_messages(current_body["messages"], VLLM_MODEL)  # [RULE 2: pre-vLLM]
-                                _hard_cut_to(current_body["messages"], _est_now, _target_input)
-
-                                # Re-check: if still over, keep cutting
-                                while exact_count_messages(current_body["messages"], VLLM_MODEL) > _target_input:  # [RULE 3: post-cut]
-                                    _hard_cut_to(current_body["messages"], exact_count_messages(current_body["messages"], VLLM_MODEL), _target_input)  # [RULE 3: post-cut]
-
-                                # Inject [CONTEXT TRUNCATED - CONTINUE] as USER message (preserves prefix cache)
-                                current_body["messages"].append({
-                                    "role": "user",
-                                    "content": "[CONTEXT TRUNCATED - CONTINUE]"
-                                })
-
-                                # Re-estimate for tracking
-                                input_tokens = exact_count_messages(current_body["messages"], VLLM_MODEL)  # [RULE 2: pre-vLLM]
-                                _b2 = _output_budget(input_tokens)
-                                current_body["max_tokens"] = min(_b2, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens)
-                                # Validate recut payload
-                                _vok, _verr = _validate_outgoing_payload(current_body, live_prompt_hash)
-                                if not _vok:
-                                    metrics["requests_error"] += 1
-                                    log.error("Stream recut validation failed: %s (session=%s)", _verr, session_key)
-                                    _record_call(session_key, input_tokens, total_output_tokens, f"recut_validation_failed:{_verr}", VLLM_MODEL, True, _verr)
-                                    yield "data: " + json.dumps({"error": {"type": _verr, "message": f"Recut validation failed: {_verr}"}}) + chr(10)*2
-                                    yield "data: [DONE]" + chr(10)*2
-                                    return
-                                continue
+                                log.error("vLLM context-length error (should not happen after Phase A sizing): %s", _et[:200])
+                                metrics["requests_error"] += 1
+                                _record_call(session_key, input_tokens, total_output_tokens, "context_length_exceeded", VLLM_MODEL, True, _et[:200])
+                                yield "data: " + json.dumps({"error": {"type": "context_length_exceeded", "message": f"Upstream context length exceeded: {_et[:200]}"}}) + "\n\n"
+                                yield "data: [DONE]" + "\n\n"
+                                return
                             elif _is_ctx_err and _bytes_sent:
                                 # Phase 08: bytes already sent - cannot recut, emit error event
                                 log.warning("Stream context-length error AFTER bytes sent - emitting SSE error (no recut): %s", _et[:200])
@@ -387,7 +306,6 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                 total_output_tokens += seg_output_tokens
                 if interrupted is None:
                     _vllm_breaker.record_success()
-                    _ctx_fail_counter.pop(session_key, None)
                 else:
                     # Failure already recorded in except; early-close is also a failure
                     pass
@@ -623,34 +541,6 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                     tc_buffer = []
                     _check_vllm_breaker()
                     _retry_t0 = time.monotonic()
-                    # === PRE-SEND GATE: hard invariant ===
-                    _pre_input = exact_count_messages(current_body["messages"], VLLM_MODEL)  # [RULE 2: pre-vLLM]
-                    _pre_total = _pre_input + current_body["max_tokens"]
-                    if _pre_total > MAX_CONTEXT:
-                        log.warning(
-                            "Pre-send gate: input=%d + output=%d = %d > MAX_CONTEXT=%d - shrinking (session=%s)",
-                            _pre_input, current_body["max_tokens"], _pre_total, MAX_CONTEXT, session_key
-                        )
-                        _target_input = MAX_CONTEXT - current_body["max_tokens"] - SAFETY_MARGIN
-                        if _target_input < 500:
-                            _reduced_output = max(100, MAX_CONTEXT - _pre_input - SAFETY_MARGIN)
-                            current_body["max_tokens"] = _reduced_output
-                            _target_input = MAX_CONTEXT - _reduced_output - SAFETY_MARGIN
-                        if _target_input > 0:
-                            _cut_n = _recut_to(current_body["messages"], _target_input)
-                            if _cut_n == 0:
-                                _est_now = exact_count_messages(current_body["messages"], VLLM_MODEL)  # [RULE 2: pre-vLLM]
-                                if _est_now > MAX_INPUT:
-                                    log.warning('RECUT BLOCKED (guard), falling back to HARD CUT: est=%d target=%d (session=%s)', _est_now, MAX_INPUT, session_key)
-                                    _hard_cut_to(current_body["messages"], _est_now, MAX_INPUT)
-                            _pre_input = exact_count_messages(current_body["messages"], VLLM_MODEL)  # [RULE 2: pre-vLLM]
-                            current_body["max_tokens"] = _output_budget(_pre_input)
-                        log.info(
-                            "Pre-send gate resolved: input=%d + output=%d = %d <= MAX_CONTEXT=%d",
-                            _pre_input, current_body["max_tokens"],
-                            _pre_input + current_body["max_tokens"], MAX_CONTEXT
-                        )
-                    # === END PRE-SEND GATE ===
                     try:
                         async with client.stream("POST", VLLM_URL + "/chat/completions", json=current_body) as resp:
                             if loop_retries > 0:
@@ -660,23 +550,12 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                                 _et = body_bytes[:500].decode("utf-8", errors="replace").lower()
                                 if (resp.status_code == 400 and not shrink_retried
                                         and any(p in _et for p in ("context", "max_tokens", "max_completion_tokens", "maximum", "greater than"))):
-                                    shrink_retried = True
-                                    log.warning("Stream 400 retry (context/max_tokens) - re-shrinking: %s", _et[:200])
-                                    calibrator.bump_margin(session_key)
-                                    try:
-                                        current_body["messages"] = _emergency_shrink(current_body["messages"], int(input_tokens * 0.8))
-                                    except ContextCapacityError as cce:
-                                        for x in _flush_seam():
-                                            yield x
-                                        for _cg in _emit_ctxgate_final("length", "context_capacity", continuation_count, total_output_tokens, False, 0):
-                                            yield _cg
-                                        metrics["requests_error"] += 1
-                                        _record_call(session_key, input_tokens, total_output_tokens, "context_capacity", VLLM_MODEL, True, str(cce)[:200])
-                                        return
-                                    input_tokens = exact_count_messages(current_body["messages"], VLLM_MODEL)  # [RULE 2: pre-vLLM]
-                                    _b3 = _output_budget(input_tokens)
-                                    current_body["max_tokens"] = min(_b3, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens)
-                                    continue
+                                    log.error("vLLM context-length error in continuation (should not happen after Phase A sizing): %s", _et[:200])
+                                    metrics["requests_error"] += 1
+                                    _record_call(session_key, input_tokens, total_output_tokens, "context_length_exceeded", VLLM_MODEL, True, _et[:200])
+                                    yield "data: " + json.dumps({"error": {"type": "context_length_exceeded", "message": f"Upstream context length exceeded: {_et[:200]}"}}) + "\n\n"
+                                    yield "data: [DONE]" + "\n\n"
+                                    return
                                 metrics["requests_error"] += 1
                                 _record_call(session_key, input_tokens, total_output_tokens, "vllm_" + str(resp.status_code), VLLM_MODEL, True, body_bytes[:300].decode("utf-8", errors="replace"))
                                 for x in _flush_seam():

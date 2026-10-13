@@ -4,9 +4,7 @@ import asyncio
 import json
 import time
 import httpx
-from proxy.window.cut import _parse_vllm_actual_tokens, _hard_cut_to
 from proxy.window.shrink import _emergency_shrink
-from proxy.token.exact import exact_count_messages
 
 log = logging.getLogger("ctxgate-proxy")
 
@@ -16,9 +14,9 @@ log = logging.getLogger("ctxgate-proxy")
 async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, live_prompt_hash: str = ""):
     # TODO(I4): replace with AppContext
     from proxy.app import (metrics, _vllm_client, CTXGATE_MAX_TOTAL_OUTPUT, MAX_OUTPUT,
-                           MAX_INPUT, MAX_CONTEXT, SAFETY_MARGIN,
+                           MAX_INPUT, MAX_CONTEXT,
                            _output_budget, _strip_proxy_metadata, _validate_outgoing_payload,
-                           VLLM_URL, VLLM_MODEL, _is_context_length_error, _trim_target, _recut_to,
+                           VLLM_URL, VLLM_MODEL, _is_context_length_error,
                            _note_tok, _record_call,
                            JSONResponse, explain_status, CTXGATE_MIN_CONTINUATION_OUTPUT,
                            WALL_CLOCK_MAX, ctxgate_meta, BLOCK_UNBOUNDED_LOOPS, MAX_CONTINUATIONS,
@@ -55,29 +53,6 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
                 {"error": {"type": _verr,
                  "message": f"Outgoing payload validation failed: {_verr}"}},
                 status_code=400)
-        # === PRE-SEND GATE: hard invariant ===
-        _pre_input = exact_count_messages(vllm_body["messages"], VLLM_MODEL)  # [RULE 2: pre-vLLM]
-        _pre_total = _pre_input + vllm_body["max_tokens"]
-        if _pre_total > MAX_CONTEXT:
-            log.warning(
-                "Pre-send gate: input=%d + output=%d = %d > MAX_CONTEXT=%d - shrinking (session=%s)",
-                _pre_input, vllm_body["max_tokens"], _pre_total, MAX_CONTEXT, session_key
-            )
-            _target_input = MAX_CONTEXT - vllm_body["max_tokens"] - SAFETY_MARGIN
-            if _target_input < 500:
-                _reduced_output = max(100, MAX_CONTEXT - _pre_input - SAFETY_MARGIN)
-                vllm_body["max_tokens"] = _reduced_output
-                _target_input = MAX_CONTEXT - _reduced_output - SAFETY_MARGIN
-            if _target_input > 0:
-                _recut_to(vllm_body["messages"], _target_input)
-                _pre_input = exact_count_messages(vllm_body["messages"], VLLM_MODEL)  # [RULE 2: pre-vLLM]
-                vllm_body["max_tokens"] = _output_budget(_pre_input)
-            log.info(
-                "Pre-send gate resolved: input=%d + output=%d = %d <= MAX_CONTEXT=%d",
-                _pre_input, vllm_body["max_tokens"],
-                _pre_input + vllm_body["max_tokens"], MAX_CONTEXT
-            )
-        # === END PRE-SEND GATE ===
         while True:
             _attempts += 1
             _t0 = time.monotonic()
@@ -96,63 +71,14 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
             _et = resp.text.lower()
             _is_ctx_err = _is_context_length_error(resp.status_code, resp.text)
             if _is_ctx_err:
-                # Phase 08: ONE forced whole-group recut, then fail
-                log.warning("vLLM context-length error - ONE recut retry: %s", resp.text[:200])
-                calibrator.bump_margin(session_key)
-                
-                # Parse actual token count from vLLM error for accurate recut target
-                _parsed = _parse_vllm_actual_tokens(resp.text)
-                _actual_in = _parsed.get("actual_input")
-                _actual_max = _parsed.get("requested_output")
-                if _actual_in:
-                    _desired_out = min(_actual_max or MAX_OUTPUT, MAX_OUTPUT)
-                    target = MAX_CONTEXT - SAFETY_MARGIN - _desired_out
-                    log.info("Recut using vLLM actual: input=%d max_tokens=%d target_input=%d",
-                             _actual_in, _desired_out, target)
-                    # Hard cut: use vLLM's exact count, no estimation
-                    _hard_cut_to(vllm_body["messages"], _actual_in, target)
-                    # Fallback: if hard cut couldn't remove enough (e.g., single
-                    # protected user message), proportionally truncate content
-                    _post_cut_est = exact_count_messages(vllm_body["messages"], VLLM_MODEL)  # [RULE 3: post-cut]
-                    if _post_cut_est > target:
-                        _ratio = max(0.05, target * 0.9 / _post_cut_est)
-                        for _m in vllm_body["messages"]:
-                            _c = _m.get("content", "")
-                            if isinstance(_c, str) and len(_c) > 100:
-                                _m["content"] = _c[:int(len(_c) * _ratio)]
-                        log.warning("RECUT CONTENT TRUNCATION: session=%s ratio=%.2f est_before=%d target=%d",
-                                    session_key, _ratio, _post_cut_est, target)
-                else:
-                    target = _trim_target()
-                    _recut_to(vllm_body["messages"], target)
-                
-                new_input_tokens = exact_count_messages(vllm_body["messages"], VLLM_MODEL)  # [RULE 2: pre-vLLM]
-                _budget = _output_budget(new_input_tokens)
-                max_tokens = min(_budget, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT)
-                vllm_body["max_tokens"] = max_tokens
-                input_tokens = new_input_tokens
-                # Phase 08: validate the recut payload before retrying
-                _vok, _verr = _validate_outgoing_payload(vllm_body, live_prompt_hash)
-                if not _vok:
-                    metrics["requests_error"] += 1
-                    log.error("Recut payload validation failed: %s (session=%s)", _verr, session_key)
-                    _record_call(session_key, input_tokens, 0, f"recut_validation_failed:{_verr}", VLLM_MODEL, False, _verr)
-                    return JSONResponse(
-                        {"error": {"type": _verr,
-                         "message": f"Payload validation failed after recut: {_verr}"}},
-                        status_code=400)
-                resp = await client.post(VLLM_URL + "/chat/completions", json=vllm_body)
-                if resp.status_code != 200:
-                    metrics["requests_error"] += 1
-                    log.error("vLLM recut retry also failed %d: %s", resp.status_code, resp.text[:500])
-                    _record_call(session_key, input_tokens, 0, f"vllm_{resp.status_code}", VLLM_MODEL, False, resp.text[:300])
-                    if _is_context_length_error(resp.status_code, resp.text):
-                        return JSONResponse(
-                            {"error": {"type": "context_length_exceeded",
-                             "message": "Context length exceeded even after one recut retry. Reduce prompt size.",
-                             "input_tokens": input_tokens}},
-                            status_code=400)
-                    return JSONResponse({"error": {"message": "vLLM " + str(resp.status_code), "explanation": explain_status(f"vllm_{resp.status_code}", resp.text[:300])}}, status_code=resp.status_code)
+                log.error("vLLM context-length error (should not happen after Phase A sizing): %s", resp.text[:200])
+                metrics["requests_error"] += 1
+                _record_call(session_key, input_tokens, 0, "context_length_exceeded", VLLM_MODEL, False, resp.text[:200])
+                return JSONResponse(
+                    {"error": {"type": "context_length_exceeded",
+                     "message": f"Upstream context length exceeded: {resp.text[:200]}",
+                     "explanation": explain_status("context")}},
+                    status_code=413)
             else:
                 # Phase 08: non-context errors (401, 403, 429, 500, 503, non-context 400) pass through
                 metrics["requests_error"] += 1
