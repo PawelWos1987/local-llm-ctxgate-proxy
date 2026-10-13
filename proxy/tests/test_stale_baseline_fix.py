@@ -3,7 +3,7 @@
 The original bug: _emergency_shrink worked correctly (25346 -> 1686 tokens),
 but the calibrator's last_real baseline (87308, from a pre-shrink vLLM response)
 was never invalidated. This caused:
-  1. estimate_full_payload_tokens to return 87308 (stale)
+  1. token counting to return 87308 (stale)
   2. _output_budget(87308) = 0 -> triggers proactive trim
   3. _aggressive_trim early-returns (messages already small) WITHOUT invalidating
   4. Re-estimate still uses stale 87308 -> infinite loop -> reset
@@ -261,7 +261,7 @@ class TestCircularDependencyBroken:
         _set_calibrator_baseline(session_key, last_real=87308, msg_count=50)
         
         try:
-            from proxy.window.budget import estimate_full_payload_tokens
+            from proxy.token.counter import count_messages_tokens as _est_fn
             from proxy.hotpath.handler import _aggressive_trim
             
             # Simulate post-shrink state: messages are small
@@ -275,7 +275,7 @@ class TestCircularDependencyBroken:
             _aggressive_trim(msgs, target, session_key)
             
             # Now re-estimate: should use cold path (actual content)
-            estimated = estimate_full_payload_tokens(msgs, tools, note_n, session_key)
+            estimated = _est_fn(msgs)
             
             # The estimate should be close to actual message tokens, NOT 87308
             actual = count_messages_tokens(msgs)
@@ -302,8 +302,8 @@ class TestCircularDependencyBroken:
             _aggressive_trim(msgs, target, session_key)
             
             # Re-estimate and check budget
-            from proxy.window.budget import estimate_full_payload_tokens
-            estimated = estimate_full_payload_tokens(msgs, [], 0, session_key)
+            from proxy.token.counter import count_messages_tokens
+            estimated = count_messages_tokens(msgs)
             
             budget, is_valid = _output_budget_checked(estimated)
             assert budget > 0, f"Budget is {budget} (should be positive after fix)"
@@ -319,7 +319,8 @@ class TestCircularDependencyBroken:
         
         try:
             from proxy.hotpath.handler import _aggressive_trim
-            from proxy.window.budget import estimate_full_payload_tokens, _output_budget_checked
+            from proxy.window.budget import _output_budget_checked
+            from proxy.token.counter import count_messages_tokens
             
             msgs = _make_messages(4, tokens_each=100)
             target = 63000
@@ -328,7 +329,7 @@ class TestCircularDependencyBroken:
             _aggressive_trim(msgs, target, session_key)
             
             # Single re-estimate: should now be accurate
-            estimated = estimate_full_payload_tokens(msgs, [], 0, session_key)
+            estimated = count_messages_tokens(msgs)
             budget, valid = _output_budget_checked(estimated)
             
             # One pass is enough - no loop

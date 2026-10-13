@@ -28,7 +28,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                            MAX_CONTEXT, SAFETY_MARGIN,
                            _output_budget, _validate_outgoing_payload,
                            _check_vllm_breaker, _note_tok, _emergency_shrink, _recut_to,
-                           count_messages_tokens, estimate_full_payload_tokens, _trim_target,
+                           count_messages_tokens, _trim_target,
                            _is_context_length_error, _record_call, CTXGATE_MIN_CONTINUATION_OUTPUT,
                            RETRY_PRESENCE_PENALTY, ContextCapacityError,
                            WALL_CLOCK_MAX, ctxgate_meta, BLOCK_UNBOUNDED_LOOPS,
@@ -38,6 +38,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                            _lines_with_heartbeat, _sse_content, _track_session_tokens,
                            _unbounded_replace_loop, _vllm_breaker, calibrator)
     from starlette.responses import StreamingResponse
+    from proxy.token.exact import exact_count_messages
     global metrics
     async def generate():
         global metrics
@@ -178,9 +179,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                 tc_buffer = []
                 _check_vllm_breaker()
                 # === PRE-SEND GATE: hard invariant ===
-                _pre_input = estimate_full_payload_tokens(
-                    current_body["messages"], current_body.get("tools", []), _note_tok(), session_key
-                )
+                _pre_input = exact_count_messages(current_body["messages"], VLLM_MODEL)
                 _pre_total = _pre_input + current_body["max_tokens"]
                 if _pre_total > MAX_CONTEXT:
                     log.warning(
@@ -199,9 +198,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                             if _est_now > MAX_INPUT:
                                 log.warning('RECUT BLOCKED (guard), falling back to HARD CUT: est=%d target=%d (session=%s)', _est_now, MAX_INPUT, session_key)
                                 _hard_cut_to(current_body["messages"], _est_now, MAX_INPUT)
-                        _pre_input = estimate_full_payload_tokens(
-                            current_body["messages"], current_body.get("tools", []), _note_tok(), session_key
-                        )
+                        _pre_input = exact_count_messages(current_body["messages"], VLLM_MODEL)
                         current_body["max_tokens"] = _output_budget(_pre_input)
                     log.info(
                         "Pre-send gate resolved: input=%d + output=%d = %d <= MAX_CONTEXT=%d",
@@ -252,7 +249,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                                 })
 
                                 # Re-estimate for tracking
-                                input_tokens = estimate_full_payload_tokens(current_body["messages"], current_body.get("tools", []), _note_tok(), session_key)
+                                input_tokens = exact_count_messages(current_body["messages"], VLLM_MODEL)
                                 _b2 = _output_budget(input_tokens)
                                 current_body["max_tokens"] = min(_b2, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens)
                                 # Validate recut payload
@@ -600,9 +597,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                     _check_vllm_breaker()
                     _retry_t0 = time.monotonic()
                     # === PRE-SEND GATE: hard invariant ===
-                    _pre_input = estimate_full_payload_tokens(
-                        current_body["messages"], current_body.get("tools", []), _note_tok(), session_key
-                    )
+                    _pre_input = exact_count_messages(current_body["messages"], VLLM_MODEL)
                     _pre_total = _pre_input + current_body["max_tokens"]
                     if _pre_total > MAX_CONTEXT:
                         log.warning(
@@ -621,9 +616,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                                 if _est_now > MAX_INPUT:
                                     log.warning('RECUT BLOCKED (guard), falling back to HARD CUT: est=%d target=%d (session=%s)', _est_now, MAX_INPUT, session_key)
                                     _hard_cut_to(current_body["messages"], _est_now, MAX_INPUT)
-                            _pre_input = estimate_full_payload_tokens(
-                                current_body["messages"], current_body.get("tools", []), _note_tok(), session_key
-                            )
+                            _pre_input = exact_count_messages(current_body["messages"], VLLM_MODEL)
                             current_body["max_tokens"] = _output_budget(_pre_input)
                         log.info(
                             "Pre-send gate resolved: input=%d + output=%d = %d <= MAX_CONTEXT=%d",
@@ -653,7 +646,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                                         metrics["requests_error"] += 1
                                         _record_call(session_key, input_tokens, total_output_tokens, "context_capacity", VLLM_MODEL, True, str(cce)[:200])
                                         return
-                                    input_tokens = estimate_full_payload_tokens(current_body["messages"], current_body.get("tools", []), _note_tok(), session_key)
+                                    input_tokens = exact_count_messages(current_body["messages"], VLLM_MODEL)
                                     _b3 = _output_budget(input_tokens)
                                     current_body["max_tokens"] = min(_b3, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens)
                                     continue

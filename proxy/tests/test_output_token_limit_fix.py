@@ -99,7 +99,7 @@ class TestOutputTokenLimitFix:
         Fix: _think_trigger = MAX_INPUT. When input exceeds this, thinking is
         disabled so the full output budget goes to visible content.
         
-        We mock estimate_full_payload_tokens to simulate a 65000-token payload
+        We mock count_messages_tokens to simulate a 65000-token payload
         (above MAX_INPUT=64800) without needing to generate megabytes of text.
         """
         
@@ -144,7 +144,7 @@ class TestOutputTokenLimitFix:
             }
         
         # Mock the token estimator to return our simulated high value
-        with patch("proxy.hotpath.handler.estimate_full_payload_tokens", 
+        with patch("proxy.hotpath.handler.count_messages_tokens", 
                    return_value=simulated_input_tokens), \
              patch("proxy.hotpath.handler._forward_to_vllm", side_effect=fake_forward):
             transport = ASGITransport(app=app)

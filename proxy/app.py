@@ -51,7 +51,7 @@ from proxy.resilience.breaker import _CircuitBreaker, _BreakerOpen, _check_vllm_
 from proxy.resilience.rate_limit import _TokenBucket, _get_tenant_rate_limiter, _get_tenant_semaphore  # noqa: F401
 from proxy.window.state import _norm_content, _msg_anchor, _seed_sig, _newest_user_idx, _strip_proxy_metadata, _NOTE_TOK_CACHE  # noqa: F401
 from proxy.window.cut import _eviction_trigger, _trim_target, _turn_groups, _safe_cut, _recut_to, _recut, _kept_messages, _is_context_length_error  # noqa: F401
-from proxy.window.budget import _output_budget, estimate_full_payload_tokens  # noqa: F401
+from proxy.window.budget import _output_budget  # noqa: F401
 from proxy.window.elide import _elided_tool_content, _stable_elide_inplace, _stable_elide_idx  # noqa: F401
 from proxy.window.shrink import ContextCapacityError, _emergency_shrink, _protected_indices  # noqa: F401
 from proxy.window.invariants import verify_context_invariants, _validate_outgoing_payload, _live_prompt_identity  # noqa: F401

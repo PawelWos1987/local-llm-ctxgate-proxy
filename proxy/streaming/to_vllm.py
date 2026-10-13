@@ -6,6 +6,7 @@ import time
 import httpx
 from proxy.window.cut import _parse_vllm_actual_tokens, _hard_cut_to
 from proxy.window.shrink import _emergency_shrink
+from proxy.token.exact import exact_count_messages
 
 log = logging.getLogger("ctxgate-proxy")
 
@@ -18,7 +19,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
                            MAX_INPUT, MAX_CONTEXT, SAFETY_MARGIN,
                            _output_budget, _strip_proxy_metadata, _validate_outgoing_payload,
                            VLLM_URL, VLLM_MODEL, _is_context_length_error, _trim_target, _recut_to,
-                           estimate_full_payload_tokens, _note_tok, count_messages_tokens, _record_call,
+                           _note_tok, count_messages_tokens, _record_call,
                            JSONResponse, explain_status, CTXGATE_MIN_CONTINUATION_OUTPUT,
                            WALL_CLOCK_MAX, ctxgate_meta, BLOCK_UNBOUNDED_LOOPS, MAX_CONTINUATIONS,
                            _classify_truncation, _safe_truncate, _track_session_tokens,
@@ -55,9 +56,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
                  "message": f"Outgoing payload validation failed: {_verr}"}},
                 status_code=400)
         # === PRE-SEND GATE: hard invariant ===
-        _pre_input = estimate_full_payload_tokens(
-            vllm_body["messages"], vllm_body.get("tools", []), _note_tok(), session_key
-        )
+        _pre_input = exact_count_messages(vllm_body["messages"], VLLM_MODEL)
         _pre_total = _pre_input + vllm_body["max_tokens"]
         if _pre_total > MAX_CONTEXT:
             log.warning(
@@ -71,9 +70,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
                 _target_input = MAX_CONTEXT - _reduced_output - SAFETY_MARGIN
             if _target_input > 0:
                 _recut_to(vllm_body["messages"], _target_input)
-                _pre_input = estimate_full_payload_tokens(
-                    vllm_body["messages"], vllm_body.get("tools", []), _note_tok(), session_key
-                )
+                _pre_input = exact_count_messages(vllm_body["messages"], VLLM_MODEL)
                 vllm_body["max_tokens"] = _output_budget(_pre_input)
             log.info(
                 "Pre-send gate resolved: input=%d + output=%d = %d <= MAX_CONTEXT=%d",
@@ -116,8 +113,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
                     _hard_cut_to(vllm_body["messages"], _actual_in, target)
                     # Fallback: if hard cut couldn't remove enough (e.g., single
                     # protected user message), proportionally truncate content
-                    _post_cut_est = estimate_full_payload_tokens(
-                        vllm_body["messages"], vllm_body.get("tools", []), _note_tok(), session_key)
+                    _post_cut_est = exact_count_messages(vllm_body["messages"], VLLM_MODEL)
                     if _post_cut_est > target:
                         _ratio = max(0.05, target * 0.9 / _post_cut_est)
                         for _m in vllm_body["messages"]:
@@ -130,7 +126,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
                     target = _trim_target()
                     _recut_to(vllm_body["messages"], target)
                 
-                new_input_tokens = estimate_full_payload_tokens(vllm_body["messages"], vllm_body.get("tools", []), _note_tok(), session_key)
+                new_input_tokens = exact_count_messages(vllm_body["messages"], VLLM_MODEL)
                 _budget = _output_budget(new_input_tokens)
                 max_tokens = min(_budget, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT)
                 vllm_body["max_tokens"] = max_tokens
