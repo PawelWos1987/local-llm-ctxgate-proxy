@@ -15,7 +15,7 @@ from proxy.config import (
     VLLM_MODEL,
 )
 from proxy.token.calibrator import calibrator
-from proxy.token.counter import _rho_var, count_messages_tokens
+from proxy.token.counter import _rho_var
 from proxy.token.exact import exact_count_messages
 from proxy.window.budget import _output_budget
 from proxy.window.invariants import _live_prompt_identity
@@ -144,11 +144,11 @@ def _aggressive_trim(built: list, target_tokens: int, session_key: str,
     # tokens such that raw + injected <= target_tokens overall.
     inject_overhead = 0
     if total_input_tokens is not None:
-        msg_tok_now = count_messages_tokens(built)
+        msg_tok_now = exact_count_messages(built, VLLM_MODEL)  # [RULE 2: pre-vLLM]
         inject_overhead = max(0, total_input_tokens - msg_tok_now)
     effective_target = max(1, target_tokens - inject_overhead)
 
-    current_tokens = count_messages_tokens(built)
+    current_tokens = exact_count_messages(built, VLLM_MODEL)  # [RULE 2: pre-vLLM]
     if current_tokens <= effective_target:
         # Even though messages fit (after accounting for injection),
         # the calibrator baseline may be stale (e.g., from a pre-shrink
@@ -163,7 +163,7 @@ def _aggressive_trim(built: list, target_tokens: int, session_key: str,
     # Step 1: aggressive emergency shrink (unprotects tool groups)
     try:
         trimmed = _emergency_shrink(built, effective_target, aggressive=True)
-        trimmed_tokens = count_messages_tokens(trimmed)
+        trimmed_tokens = exact_count_messages(trimmed, VLLM_MODEL)  # [RULE 3: post-cut]
         if trimmed_tokens <= effective_target:
             log.info("AGGRESSIVE TRIM: success (aggressive) %d -> %d tokens (eff_target=%d)",
                      current_tokens, trimmed_tokens, effective_target)
@@ -175,7 +175,7 @@ def _aggressive_trim(built: list, target_tokens: int, session_key: str,
     # Step 2: with injection pruning
     try:
         trimmed = _emergency_shrink(built, effective_target, aggressive=True, allow_injection_prune=True)
-        trimmed_tokens = count_messages_tokens(trimmed)
+        trimmed_tokens = exact_count_messages(trimmed, VLLM_MODEL)  # [RULE 3: post-cut]
         if trimmed_tokens <= effective_target:
             log.info("AGGRESSIVE TRIM: success (injection_prune) %d -> %d tokens (eff_target=%d)",
                      current_tokens, trimmed_tokens, effective_target)
@@ -195,7 +195,7 @@ def _aggressive_trim(built: list, target_tokens: int, session_key: str,
             trimmed.append(user_msgs[-1])  # last user msg = current prompt
     else:
         trimmed = built[:1] if built else []
-    trimmed_tokens = count_messages_tokens(trimmed)
+    # token count omitted per 3-rule policy (logging only)
     log.info("AGGRESSIVE TRIM: nuclear result %d -> %d tokens (msgs=%d)", current_tokens, trimmed_tokens, len(trimmed))
     _invalidate_baseline(session_key)
     return trimmed
@@ -220,7 +220,7 @@ async def _try_full_reset_and_forward(built, body, input_tokens, session_key, _c
     """Last-resort: full context reset and forward to vLLM. Returns response or None."""
     import time as _time
     _minimal = _full_context_reset(built)
-    _reset_tokens = exact_count_messages(_minimal, VLLM_MODEL)
+    _reset_tokens = exact_count_messages(_minimal, VLLM_MODEL)  # [RULE 2: pre-vLLM]
     _reset_max = MAX_OUTPUT
     log.warning("FULL RESET: session=%s msgs %d->%d in=%d max=%d",
                 session_key, len(built), len(_minimal), _reset_tokens, _reset_max)
@@ -361,19 +361,19 @@ async def chat_completions(request: Request):
                 # Last-resort recovery: hard-cut/truncate messages to fit budget
                 try:
                     _safe_max = MAX_INPUT
-                    _orig_tokens = exact_count_messages(_reset_msgs, VLLM_MODEL)
+                    _orig_tokens = exact_count_messages(_reset_msgs, VLLM_MODEL)  # [RULE 2: pre-vLLM]
                     _msgs_copy = [dict(m) for m in _reset_msgs]
                     _hard_cut_to(_msgs_copy, _orig_tokens, _safe_max)
                     # If hard cut removed whole messages but content is still over,
                     # truncate content proportionally (preserves beginning)
-                    _post_tokens = exact_count_messages(_msgs_copy, VLLM_MODEL)
+                    _post_tokens = exact_count_messages(_msgs_copy, VLLM_MODEL)  # [RULE 3: post-cut]
                     if _post_tokens > _safe_max and _msgs_copy:
                         _ratio = (_safe_max * 0.95) / _post_tokens
                         for _m in _msgs_copy:
                             _c = _m.get("content", "")
                             if isinstance(_c, str) and len(_c) > 100:
                                 _m["content"] = _c[:int(len(_c) * _ratio)]
-                        _post_tokens = exact_count_messages(_msgs_copy, VLLM_MODEL)
+                        _post_tokens = exact_count_messages(_msgs_copy, VLLM_MODEL)  # [RULE 3: post-cut]
                     if _post_tokens <= _safe_max and any(
                         m.get("content") for m in _msgs_copy):
                         log.warning(
@@ -431,8 +431,8 @@ async def chat_completions(request: Request):
 
         # --- Phase 4: Epoch-freeze injection ---
         # Capture pre-injection token count for truthful WINDOW log
-        from proxy.token.counter import count_messages_tokens as _cmt
-        _app._pre_injection_tokens = _cmt(built)
+        # pre-injection token count omitted per 3-rule policy
+        # _app._pre_injection_tokens omitted per 3-rule policy
         built = await _apply_epoch_injection(
             built, messages, session_key, task_uuid, x_sid, tenant_id)
 
@@ -456,10 +456,10 @@ async def chat_completions(request: Request):
                 log.info("Recovered session baseline from Goose DB: session=%s input_tokens=%d", session_key, _recovered)
         _t0 = time.monotonic()
         # SINGLE SOURCE OF TRUTH: input_tokens is computed AFTER injection
-        input_tokens = exact_count_messages(built, VLLM_MODEL)
+        input_tokens = exact_count_messages(built, VLLM_MODEL)  # [RULE 2: pre-vLLM]
         _dt = (time.monotonic() - _t0) * 1000
         if _dt > 50:
-            log.warning("SLOW: count_messages_tokens %.0fms (tokens=%d)", _dt, input_tokens)
+            log.warning("SLOW: exact_count_messages %.0fms (tokens=%d)", _dt, input_tokens)
         _app.metrics["max_context_seen"] = max(_app.metrics.get("max_context_seen", 0), input_tokens)
         _app.metrics["tokens_in_total"] += input_tokens
         _track_session_tokens(session_key, input_tokens)
@@ -521,7 +521,7 @@ async def chat_completions(request: Request):
             _app.metrics["hard_ceiling_trim"] = _app.metrics.get("hard_ceiling_trim", 0) + 1
             # DISABLED:            trimmed = _aggressive_trim(built, _safe_max_input, session_key, input_tokens)
             # DISABLED:            built = trimmed
-            input_tokens = exact_count_messages(built, VLLM_MODEL)
+            input_tokens = exact_count_messages(built, VLLM_MODEL)  # [RULE 2: pre-vLLM]
         
         # === PROACTIVE TRIM: ensure input + output fits in context window ===
         # This is the KEY fix: BEFORE sending to vLLM, verify that
@@ -539,7 +539,7 @@ async def chat_completions(request: Request):
             # DISABLED:            trimmed = _aggressive_trim(built, max_allowed_input, session_key, input_tokens)
             # DISABLED:            built = trimmed
             # Re-estimate with invalidated baseline (cold path = actual content)
-            input_tokens = exact_count_messages(built, VLLM_MODEL)
+            input_tokens = exact_count_messages(built, VLLM_MODEL)  # [RULE 2: pre-vLLM]
 
             if _disable_thinking:
                 _budget = min(MAX_OUTPUT, MAX_CONTEXT - input_tokens - SAFETY_MARGIN)
@@ -552,7 +552,7 @@ async def chat_completions(request: Request):
                 _minimal = _full_context_reset(built)
                 built = _minimal
                 _invalidate_baseline(session_key)
-                input_tokens = exact_count_messages(built, VLLM_MODEL)
+                input_tokens = exact_count_messages(built, VLLM_MODEL)  # [RULE 2: pre-vLLM]
                 if _disable_thinking:
                     _budget = min(MAX_OUTPUT, MAX_CONTEXT - input_tokens - SAFETY_MARGIN)
                 else:
@@ -573,7 +573,7 @@ async def chat_completions(request: Request):
                 if _truncated_any:
                     _invalidate_baseline(session_key)
                     _live_prompt_hash = _live_prompt_identity(built)
-                    input_tokens = exact_count_messages(built, VLLM_MODEL)
+                    input_tokens = exact_count_messages(built, VLLM_MODEL)  # [RULE 2: pre-vLLM]
                     if _disable_thinking:
                         _budget = min(MAX_OUTPUT, MAX_CONTEXT - input_tokens - SAFETY_MARGIN)
                     else:
@@ -639,7 +639,7 @@ async def chat_completions(request: Request):
             trimmed = _aggressive_trim(built, max_allowed_input, session_key, input_tokens)
             if trimmed is not built:  # Actually trimmed something
                 built = trimmed
-                input_tokens = exact_count_messages(built, VLLM_MODEL)
+                input_tokens = exact_count_messages(built, VLLM_MODEL)  # [RULE 2: pre-vLLM]
                 max_tokens = min(MAX_OUTPUT, MAX_CONTEXT - input_tokens - SAFETY_MARGIN)
                 if max_tokens < 1:
                     max_tokens = 1
@@ -665,55 +665,101 @@ async def chat_completions(request: Request):
                         _app.metrics['finish_length_retry'] = _app.metrics.get('finish_length_retry', 0) + 1
 
                         _cont_msgs = built
-                        _ceiling = MAX_INPUT - 1024
-                        _retry_success = False
+                        _max_retries = 6
+                        _success = False
 
-                        for _attempt in range(3):
-                            _shrunken = _emergency_shrink(_cont_msgs, _ceiling, aggressive=True)
+                        for _attempt in range(_max_retries):
+                            _resp_data = _json_fr.loads(result.body)
+                            _resp_usage = _resp_data.get('usage', {})
+                            _ew_total = _resp_usage.get('total_tokens', 0)
+                            _resp_fr = _resp_data.get('choices', [{}])[0].get('finish_reason', '')
 
-                            if len(_shrunken) >= len(_cont_msgs):
+                            _limit = MAX_CONTEXT - SAFETY_MARGIN - max_tokens
+
+                            if _ew_total <= _limit and _resp_fr != 'length':
+                                # Case 1: SUCCESS
+                                log.info('FINISH_RETRY_SUCCESS: session=%s attempt=%d ew_total=%d limit=%d',
+                                         session_key, _attempt+1, _ew_total, _limit)
+                                _app.metrics['finish_length_success'] = _app.metrics.get('finish_length_success', 0) + 1
+                                _success = True
                                 break
 
-                            _cont_msgs = _shrunken
-                            _new_input_tokens = exact_count_messages(_cont_msgs, VLLM_MODEL)
-
-                            _new_max = min(MAX_OUTPUT, MAX_CONTEXT - _new_input_tokens - SAFETY_MARGIN)
-                            if _new_max < 1:
-                                _new_max = 1
-
-                            _retry_vllm_body = _build_vllm_body(_cont_msgs, body, _new_max, False, _client_cap, session_key, disable_thinking=_disable_thinking)
-                            _retry_result = await _forward_to_vllm(_retry_vllm_body, _new_input_tokens, session_key, _client_cap, _live_prompt_hash)
-
-                            if _retry_result is None:
-                                continue
-
-                            try:
-                                _check_data = _json_fr.loads(_retry_result.body)
-                                _check_choices = _check_data.get('choices', [])
-                                if not _check_choices:
+                            elif _ew_total <= _limit and _resp_fr == 'length':
+                                # Case 2: Tokens OK but still truncated - just retry (model may vary)
+                                log.info('FINISH_RETRY_RESUBMIT: session=%s attempt=%d ew_total=%d (under limit, retrying)',
+                                         session_key, _attempt+1, _ew_total)
+                                _retry_result = await _forward_to_vllm(vllm_body, input_tokens, session_key, _client_cap, _live_prompt_hash)
+                                if _retry_result is None:
                                     continue
-                                _check_fr = _check_choices[0].get('finish_reason')
+                                result = _retry_result
 
-                                if _check_fr != 'length':
-                                    log.info('FINISH_REASON_RETRY_SUCCESS: session=%s attempt=%d', session_key, _attempt + 1)
-                                    _app.metrics['finish_length_success'] = _app.metrics.get('finish_length_success', 0) + 1
-                                    result = _retry_result
-                                    _retry_success = True
+                            elif _ew_total > _limit and _resp_fr == 'length':
+                                # Case 3: Over limit AND truncated - emergency cut first, then retry
+                                log.warning('FINISH_RETRY_SHRINK: session=%s attempt=%d ew_total=%d > limit=%d',
+                                           session_key, _attempt+1, _ew_total, _limit)
+                                _ceiling = MAX_INPUT - 1024
+                                _shrunken = _emergency_shrink(_cont_msgs, _ceiling, aggressive=True)
+
+                                if len(_shrunken) >= len(_cont_msgs):
+                                    log.warning('FINISH_RETRY_EXHAUSTED: cannot shrink further, session=%s', session_key)
                                     break
-                            except Exception:
-                                continue
 
-                        if not _retry_success:
-                            # Final fallback: deliver with TRUNCATED marker
-                            log.warning('FINISH_REASON_LENGTH: session=%s retries exhausted, delivering partial', session_key)
-                            _app.metrics['finish_length_partial'] = _app.metrics.get('finish_length_partial', 0) + 1
-                            _fr_msg = _fr_choices[0].get('message', {})
-                            _fr_content = _fr_msg.get('content', '') or ''
-                            _fr_msg['content'] = _fr_content + '\n\n[TRUNCATED: response hit max_tokens limit. Content may be incomplete.]'
-                            _fr_data['choices'][0]['message'] = _fr_msg
-                            _new_body = _json_fr.dumps(_fr_data).encode()
-                            result.body = _new_body
-                            result.headers['content-length'] = str(len(_new_body))
+                                _cont_msgs = _shrunken
+                                # [RULE 3: post-cut] Re-tokenize with REAL tokenizer after emergency cut
+                                input_tokens = exact_count_messages(_cont_msgs, VLLM_MODEL)
+                                max_tokens = min(MAX_OUTPUT, MAX_CONTEXT - input_tokens - SAFETY_MARGIN)
+                                if max_tokens < 1:
+                                    max_tokens = 1
+
+                                vllm_body = _build_vllm_body(_cont_msgs, body, max_tokens, False, _client_cap, session_key, disable_thinking=_disable_thinking)
+
+                                _retry_result = await _forward_to_vllm(vllm_body, input_tokens, session_key, _client_cap, _live_prompt_hash)
+                                if _retry_result is None:
+                                    continue
+                                result = _retry_result
+
+                            else:
+                                # Case 4: Over limit but NOT truncated (edge case) - emergency cut
+                                log.warning('FINISH_RETRY_OVERLIMIT: session=%s attempt=%d ew_total=%d > limit=%d fr=%s',
+                                           session_key, _attempt+1, _ew_total, _limit, _resp_fr)
+                                _ceiling = MAX_INPUT - 1024
+                                _shrunken = _emergency_shrink(_cont_msgs, _ceiling, aggressive=True)
+
+                                if len(_shrunken) >= len(_cont_msgs):
+                                    break
+
+                                _cont_msgs = _shrunken
+                                # [RULE 3: post-cut] Re-tokenize with REAL tokenizer after emergency cut
+                                input_tokens = exact_count_messages(_cont_msgs, VLLM_MODEL)
+                                max_tokens = min(MAX_OUTPUT, MAX_CONTEXT - input_tokens - SAFETY_MARGIN)
+                                if max_tokens < 1:
+                                    max_tokens = 1
+
+                                vllm_body = _build_vllm_body(_cont_msgs, body, max_tokens, False, _client_cap, session_key, disable_thinking=_disable_thinking)
+
+                                _retry_result = await _forward_to_vllm(vllm_body, input_tokens, session_key, _client_cap, _live_prompt_hash)
+                                if _retry_result is None:
+                                    continue
+                                result = _retry_result
+
+                        if not _success:
+                            # Exhausted all retries - deliver with TRUNCATED marker as final fallback
+                            log.warning('FINISH_RETRY_EXHAUSTED: session=%s delivering partial after %d attempts', session_key, _max_retries)
+                            _app.metrics['finish_length_fallback'] = _app.metrics.get('finish_length_fallback', 0) + 1
+                            try:
+                                _fallback_data = _json_fr.loads(result.body)
+                                _fb_choices = _fallback_data.get('choices', [])
+                                if _fb_choices:
+                                    _fb_msg = _fb_choices[0].get('message', {})
+                                    _fb_content = _fb_msg.get('content', '') or ''
+                                    _fb_msg['content'] = _fb_content + '\n\n[TRUNCATED: response incomplete after max retry attempts.]'
+                                    _fb_choices[0]['message'] = _fb_msg
+                                    _fallback_data['choices'][0] = _fb_choices[0]
+                                    _new_fb = _json_fr.dumps(_fallback_data).encode()
+                                    result.body = _new_fb
+                                    result.headers['content-length'] = str(len(_new_fb))
+                            except Exception:
+                                pass
             except Exception:
                 pass  # Non-fatal: deliver as-is if parsing fails
         

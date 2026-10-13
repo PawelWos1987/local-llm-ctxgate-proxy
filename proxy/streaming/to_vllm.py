@@ -19,7 +19,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
                            MAX_INPUT, MAX_CONTEXT, SAFETY_MARGIN,
                            _output_budget, _strip_proxy_metadata, _validate_outgoing_payload,
                            VLLM_URL, VLLM_MODEL, _is_context_length_error, _trim_target, _recut_to,
-                           _note_tok, count_messages_tokens, _record_call,
+                           _note_tok, _record_call,
                            JSONResponse, explain_status, CTXGATE_MIN_CONTINUATION_OUTPUT,
                            WALL_CLOCK_MAX, ctxgate_meta, BLOCK_UNBOUNDED_LOOPS, MAX_CONTINUATIONS,
                            _classify_truncation, _safe_truncate, _track_session_tokens,
@@ -56,7 +56,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
                  "message": f"Outgoing payload validation failed: {_verr}"}},
                 status_code=400)
         # === PRE-SEND GATE: hard invariant ===
-        _pre_input = exact_count_messages(vllm_body["messages"], VLLM_MODEL)
+        _pre_input = exact_count_messages(vllm_body["messages"], VLLM_MODEL)  # [RULE 2: pre-vLLM]
         _pre_total = _pre_input + vllm_body["max_tokens"]
         if _pre_total > MAX_CONTEXT:
             log.warning(
@@ -70,7 +70,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
                 _target_input = MAX_CONTEXT - _reduced_output - SAFETY_MARGIN
             if _target_input > 0:
                 _recut_to(vllm_body["messages"], _target_input)
-                _pre_input = exact_count_messages(vllm_body["messages"], VLLM_MODEL)
+                _pre_input = exact_count_messages(vllm_body["messages"], VLLM_MODEL)  # [RULE 2: pre-vLLM]
                 vllm_body["max_tokens"] = _output_budget(_pre_input)
             log.info(
                 "Pre-send gate resolved: input=%d + output=%d = %d <= MAX_CONTEXT=%d",
@@ -113,7 +113,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
                     _hard_cut_to(vllm_body["messages"], _actual_in, target)
                     # Fallback: if hard cut couldn't remove enough (e.g., single
                     # protected user message), proportionally truncate content
-                    _post_cut_est = exact_count_messages(vllm_body["messages"], VLLM_MODEL)
+                    _post_cut_est = exact_count_messages(vllm_body["messages"], VLLM_MODEL)  # [RULE 3: post-cut]
                     if _post_cut_est > target:
                         _ratio = max(0.05, target * 0.9 / _post_cut_est)
                         for _m in vllm_body["messages"]:
@@ -126,7 +126,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
                     target = _trim_target()
                     _recut_to(vllm_body["messages"], target)
                 
-                new_input_tokens = exact_count_messages(vllm_body["messages"], VLLM_MODEL)
+                new_input_tokens = exact_count_messages(vllm_body["messages"], VLLM_MODEL)  # [RULE 2: pre-vLLM]
                 _budget = _output_budget(new_input_tokens)
                 max_tokens = min(_budget, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT)
                 vllm_body["max_tokens"] = max_tokens
@@ -276,7 +276,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
             if trunc_type == "reasoning_overflow":
                 cb = dict(vllm_body)
                 cb["chat_template_kwargs"] = {"enable_thinking": False}
-                _cb_budget = _output_budget(count_messages_tokens(vllm_body.get("messages", [])))
+                _cb_budget = _output_budget(exact_count_messages(vllm_body.get("messages", []), VLLM_MODEL))  # [RULE 2: pre-vLLM]
                 cb["max_tokens"] = min(_cb_budget, MAX_OUTPUT, remaining)
                 r2 = await client.post(VLLM_URL + "/chat/completions", json=cb)
                 if r2.status_code == 200:
@@ -295,7 +295,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
             cont_msgs = list(vllm_body.get("messages", []))
             cont_msgs.append({"role": "assistant", "content": partial})
             cont_msgs.append({"role": "user", "content": "Continue from exactly where you left off. Do not repeat any content already provided. Resume the next word/sentence/code line."})
-            cont_tokens = count_messages_tokens(cont_msgs)
+            cont_tokens = exact_count_messages(cont_msgs, VLLM_MODEL)  # [RULE 2: pre-vLLM]
             _cont_budget = _output_budget(cont_tokens)
             max_tokens = min(_cont_budget, MAX_OUTPUT, remaining)
             if cont_tokens > MAX_INPUT or max_tokens < CTXGATE_MIN_CONTINUATION_OUTPUT:
@@ -303,7 +303,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
                 _shrink_ok = False
                 try:
                     shrunken = _emergency_shrink(cont_msgs, ceiling=_ceiling)
-                    new_cont_tokens = count_messages_tokens(shrunken)
+                    new_cont_tokens = exact_count_messages(shrunken, VLLM_MODEL)  # [RULE 3: post-cut]
                     if new_cont_tokens <= MAX_INPUT:
                         cont_msgs = shrunken
                         cont_tokens = new_cont_tokens
