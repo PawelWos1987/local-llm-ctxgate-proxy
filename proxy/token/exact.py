@@ -7,6 +7,7 @@ log = logging.getLogger("ctxgate-proxy")
 
 _tokenizer = None
 _tokenizer_model = None
+_gt_tokenizer = None
 
 
 def _get_tokenizer(model_name: str):
@@ -17,7 +18,7 @@ def _get_tokenizer(model_name: str):
     2. model_name as a local directory path (if it exists on disk)
     3. model_name as a HuggingFace Hub identifier (fallback)
     """
-    global _tokenizer, _tokenizer_model
+    global _tokenizer, _tokenizer_model, _gt_tokenizer
     if _tokenizer is not None and _tokenizer_model == model_name:
         return _tokenizer
 
@@ -43,9 +44,24 @@ def _get_tokenizer(model_name: str):
         _tokenizer = AutoTokenizer.from_pretrained(model_name)
         log.info("Loaded tokenizer from HF hub: %s", model_name)
 
+    # Attempt to enable gigatoken accelerator for the encode step
+    try:
+        import gigatoken as gt
+        _gt_tokenizer = gt.Tokenizer(_tokenizer).as_hf()
+        log.info("Gigatoken accelerator enabled for tokenizer")
+    except ImportError:
+        _gt_tokenizer = None
+        log.warning("gigatoken not available, using pure HF tokenizer")
+
     _tokenizer_model = model_name
     return _tokenizer
 
+
+def _fast_encode(text: str, add_special_tokens: bool = False) -> list:
+    """Encode text using gigatoken if available, else fall back to HF tokenizer."""
+    if _gt_tokenizer is not None:
+        return _gt_tokenizer.encode(text, add_special_tokens=add_special_tokens)
+    return _tokenizer.encode(text, add_special_tokens=add_special_tokens)
 
 
 def _flatten_content(content) -> str:
@@ -162,7 +178,7 @@ def exact_count_messages(messages: list[dict], model_name: str) -> int:
     cleaned = _sanitize_for_template(messages)
     try:
         rendered = tok.apply_chat_template(cleaned, tokenize=False, add_generation_prompt=True)
-        ids = tok.encode(rendered, add_special_tokens=False)
+        ids = _fast_encode(rendered, add_special_tokens=False)
         return len(ids)
     except Exception as e:
         est = _rough_estimate(messages)
@@ -176,5 +192,4 @@ def exact_count_messages(messages: list[dict], model_name: str) -> int:
 def exact_count_string(text: str, model_name: str) -> int:
     """Count exact tokens for a plain string."""
     tok = _get_tokenizer(model_name)
-    return len(tok.encode(text, add_special_tokens=False))
-
+    return len(_fast_encode(text, add_special_tokens=False))

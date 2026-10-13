@@ -25,7 +25,7 @@ def annotate_message_usage(messages: list[dict], model_name: str) -> list[dict]:
     Returns:
         The same list (mutated in place) with _tokens added to each message.
     """
-    from proxy.token.exact import _get_tokenizer
+    from proxy.token.exact import _get_tokenizer, _fast_encode
 
     tok = _get_tokenizer(model_name)
 
@@ -37,7 +37,7 @@ def annotate_message_usage(messages: list[dict], model_name: str) -> list[dict]:
             content = "\n".join(text_parts)
 
         if content:
-            ids = tok.encode(str(content), add_special_tokens=False)
+            ids = _fast_encode(str(content), add_special_tokens=False)
             msg["_tokens"] = len(ids)
         else:
             msg["_tokens"] = 0
