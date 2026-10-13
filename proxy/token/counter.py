@@ -67,6 +67,8 @@ def count_message_tokens(msg: dict) -> int:
     Uses chars/token ratio with a small per-message overhead for
     role markers and JSON structure.
     """
+    if not isinstance(msg, dict):
+        return 0
     chars = _count_chars(msg.get("content", ""))
     # Add overhead for role, name, tool_call_id fields
     overhead = 10  # approximate tokens for JSON structure

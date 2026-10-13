@@ -121,11 +121,11 @@ def _newest_user_idx(rest: list):
 
 
 def _strip_proxy_metadata(messages: list) -> list:
-    """Remove internal ctxgate_* keys from messages before sending to vLLM."""
+    """Remove internal ctxgate_* and _tokens keys from messages before sending to vLLM."""
     cleaned = []
     for m in messages:
-        if any(k.startswith("ctxgate_") for k in m):
-            c = {k: v for k, v in m.items() if not k.startswith("ctxgate_")}
+        if any(k.startswith("ctxgate_") for k in m) or "_tokens" in m:
+            c = {k: v for k, v in m.items() if not k.startswith("ctxgate_") and k != "_tokens"}
             cleaned.append(c)
         else:
             cleaned.append(m)

@@ -6,3 +6,4 @@ aiosqlite>=0.19.0
 tiktoken>=0.5.0
 tokenizers>=0.15.0
 pydantic>=2.0.0
+transformers>=4.35.0

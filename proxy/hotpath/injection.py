@@ -10,7 +10,6 @@ from proxy.config import (
 )
 from proxy.window.state import _msg_anchor
 from proxy.utils.helpers import _detect_recap_intent, _compute_epoch_key, _fit_to_budget
-from proxy.memory.fetch import fetch_relevant_knowledge
 from proxy.memory import fetch_task_memory
 from proxy.lifecycle.injection import _record_injection
 
@@ -56,8 +55,8 @@ async def _apply_epoch_injection(
         else:
             # New epoch: compute the block
             _t0 = time.monotonic()
-            kn, tm, _digest = await asyncio.gather(
-                fetch_relevant_knowledge(messages, max_items=5, max_tokens=400, tenant_id=tenant_id),
+            kn = ""  # knowledge injection disabled
+            tm, _digest = await asyncio.gather(
                 fetch_task_memory(x_sid, built, task_uuid=task_uuid, recap=_recap, tenant_id=tenant_id),
                 _build_session_digest(task_uuid, session_key, tenant_id=tenant_id),
                 return_exceptions=True
@@ -138,8 +137,8 @@ async def _apply_epoch_injection(
     else:
         # Old path (fallback)
         _t0 = time.monotonic()
-        kn, tm = await asyncio.gather(
-            fetch_relevant_knowledge(messages, max_items=5, max_tokens=400, tenant_id=tenant_id),
+        kn = ""  # knowledge injection disabled
+        tm = await asyncio.gather(
             fetch_task_memory(x_sid, built, task_uuid=task_uuid, tenant_id=tenant_id),
             return_exceptions=True
         )

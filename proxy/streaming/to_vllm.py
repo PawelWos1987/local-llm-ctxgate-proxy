@@ -388,6 +388,10 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
         if _ptd and _ptd.get("cached_tokens", 0) > data["usage"]["prompt_tokens"]:
             _ptd["cached_tokens"] = data["usage"]["prompt_tokens"]
         data["usage"]["total_tokens"] = data["usage"]["prompt_tokens"] + output_tokens
+        # Safety clamp: total_tokens must never exceed MAX_CONTEXT (goose rejects overflow)
+        if data["usage"]["total_tokens"] > MAX_CONTEXT:
+            log.warning("Usage clamp: total_tokens %d > MAX_CONTEXT %d - clamping", data["usage"]["total_tokens"], MAX_CONTEXT)
+            data["usage"]["total_tokens"] = MAX_CONTEXT
         for ch in data.get("choices", []):
             msg = ch.get("message", {})
             if "reasoning" in msg and "reasoning_content" not in msg:

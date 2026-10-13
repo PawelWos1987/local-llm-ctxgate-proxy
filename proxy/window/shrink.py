@@ -140,8 +140,9 @@ def _emergency_shrink(kept: list, ceiling: int, aggressive: bool = False,
         metrics["emergency_shrink_aggressive"] = metrics.get("emergency_shrink_aggressive", 0) + 1
     work = [dict(m) for m in kept]
     protected = _protected_indices(work, aggressive=aggressive)
-    # Pre-compute per-message token estimates (O(n) once)
-    msg_toks = [count_message_tokens(m) for m in work]
+    # Pre-compute per-message token counts (O(n) once)
+    # Prefer _tokens (real HF tokenizer count from annotate_message_usage) over char-based estimate
+    msg_toks = [m.get("_tokens") if m.get("_tokens") is not None else count_message_tokens(m) for m in work]
     running_total = sum(msg_toks)
     # Target: max message tokens such that (messages + overhead) <= ceiling.
     # Overhead = actual_total - running_total (tools, system, injection).

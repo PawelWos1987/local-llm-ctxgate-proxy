@@ -81,6 +81,28 @@ def _repair_dangling_tool_calls(msgs: list) -> list:
     return result
 
 
+
+
+def _sanitize_none_content(msgs: list) -> list:
+    """Replace content=None with content="" in all messages.
+
+    Qwen's Jinja chat template crashes with 'Can only get item pairs from a mapping'
+    when an assistant message has content=None alongside tool_calls.
+    Setting content to "" preserves the message structure while satisfying the template.
+    """
+    result = []
+    modified = False
+    for m in msgs:
+        if m.get("content") is None:
+            new_m = dict(m)
+            new_m["content"] = ""
+            result.append(new_m)
+            modified = True
+        else:
+            result.append(m)
+    return result if modified else msgs
+
+
 def _detect_loop(text: str) -> int:
     """Detect a repetition loop in the recent tail of generated text.
 

@@ -137,7 +137,7 @@ def _normalize_system_messages(messages):
     return res
 
 
-async def build_context(request_messages: list, task_uuid: str = None, session_key: str = None) -> list:
+async def build_context(request_messages: list, task_uuid: str = None, session_key: str = None, goose_reported_tokens: int | None = None) -> tuple[list, int]:
     import proxy.app as _app
     from proxy.app import _inject_ledger_into_context
 
@@ -184,10 +184,11 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
             _app.last_prefix_cache = _determine_prefix_cache(sk, kept)
             ceiling = min(MAX_INPUT, MAX_CONTEXT - SAFETY_MARGIN - MAX_OUTPUT) - _note_n
             trigger = _eviction_trigger()
-            if kept_tok > ceiling:
+            _trigger_val = goose_reported_tokens if goose_reported_tokens is not None else kept_tok
+            if _trigger_val > ceiling:
                 # Hard ceiling exceeded: must re-cut (capacity risk).
                 log.info('sticky window over hard ceiling %d > %d: re-cutting', kept_tok, ceiling)
-            elif kept_tok > trigger:
+            elif _trigger_val > trigger:
                 # High watermark crossed: hysteresis re-cut to target.
                 log.info('sticky window over trigger %d > %d: hysteresis re-cut to target %d',
                          kept_tok, trigger, _trim_target())
@@ -236,7 +237,7 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
                     kept = _inject_ledger_into_context(kept, task_uuid, sk, "")
                     _app.last_context_path = "sticky-reuse"
                     _app.last_msg_counts = {"total": len(raw), "stable": len(seed_raw), "kept": len(kept), "new": max(0, len(rest_raw) - eff_cut), "dropped": eff_cut}
-                    return kept
+                    return kept, count_messages_tokens(kept)
         # SLOW PATH: no valid state (or kept over limit) -> full count + re-cut.
         messages = _prep_messages(raw)
         if messages and messages[0].get("role") == "system":
@@ -257,6 +258,7 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
             # never runs -> real-baseline check never fires).
             _last_real = calibrator.get_last_real(sk)
             _trigger = _eviction_trigger()
+            _trigger_val = goose_reported_tokens if goose_reported_tokens is not None else total
             if _last_real > _trigger:
                 log.info(
                     "Slow path real-baseline over trigger: total(char)=%d last_real=%d trigger=%d - forcing re-cut",
@@ -267,7 +269,7 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
             else:
                 _app.last_context_path = "none"
                 _app.last_msg_counts = {"total": len(raw), "stable": len(seed), "kept": len(messages), "new": max(0, len(raw) - len(seed)), "dropped": 0}
-                return messages
+                return messages, count_messages_tokens(messages)
         target = _trim_target()
         # Pre-recut elision: shrink tool bodies up to the newest-4 boundary so
         # _recut_to budgets on stable (post-elision) sizes, not full originals.
@@ -355,4 +357,12 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
             new_ws["in_flight"] = True
             _spawn(_summarize_trimmed_messages(task_uuid, sk, rest, pending_cut=cut))
         kept = _inject_ledger_into_context(kept, task_uuid, sk, "")
-        return kept
+        # Proportion-based post-cut token estimate (replaces estimation)
+        if goose_reported_tokens is not None:
+            original_chars = sum(len(str(m.get("content", ""))) for m in raw)
+            new_chars = sum(len(str(m.get("content", ""))) for m in kept)
+            post_cut_estimate = int(new_chars * (goose_reported_tokens / max(1, original_chars)))
+        else:
+            post_cut_estimate = count_messages_tokens(kept)
+        
+        return kept, post_cut_estimate
