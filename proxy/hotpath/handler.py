@@ -348,12 +348,13 @@ async def chat_completions(request: Request):
 
         _t0 = time.monotonic()
         try:
-            built, _toks = await build_context(messages, task_uuid=task_uuid, session_key=session_key)
+            _goose_toks = body.get("usage", {}).get("total_tokens")
+            built, _toks = await build_context(messages, task_uuid=task_uuid, session_key=session_key, goose_reported_tokens=_goose_toks)
         except ContextCapacityError as cce:
             log.warning("Context capacity: %s - full reset", cce)
             _reset_msgs = _full_context_reset(messages)
             try:
-                built, _toks = await build_context(_reset_msgs, task_uuid=task_uuid, session_key=session_key)
+                built, _toks = await build_context(_reset_msgs, task_uuid=task_uuid, session_key=session_key, goose_reported_tokens=_goose_toks)
                 log.info("Capacity recovered via full reset: session=%s", session_key)
                 _invalidate_baseline(session_key)
             except ContextCapacityError as cce2:

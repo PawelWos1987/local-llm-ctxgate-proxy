@@ -334,7 +334,7 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
         _app.last_context_path = "emergency-shrink" if post_cut_tokens > ceiling else ("full-recut" if ws is None else "hysteresis-recut")
         _app.last_msg_counts = {"total": len(raw), "stable": len(seed), "kept": len(kept), "new": max(0, len(raw) - len(kept)), "dropped": cut}
         # Verify context invariants - HARD GATE on Goose path
-        _viols = verify_context_invariants(kept, raw, ceiling, vllm_send_tokens)
+        _viols = verify_context_invariants(kept, raw, ceiling, post_cut_tokens)
         if _viols:
             _fatal_viols = []
             for _v in _viols:
