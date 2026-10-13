@@ -282,12 +282,6 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                                             log.warning("Loop in content (period=%d chars=%d) - stopping stream", lp, len(full_content))
                                             loop_intentional = True
                                             break
-                                if not loop_period and reasoning_chars > MAX_REASONING_TOKENS * 3 and not full_content and not tc_accum.count():
-                                    loop_in_reasoning = True
-                                    reasoning_overflow = True
-                                    log.warning("Reasoning budget backstop (chars=%d > %d) with no content - treating as loop", reasoning_chars, MAX_REASONING_TOKENS * 3)
-                                    loop_intentional = True
-                                    break
                             except (json.JSONDecodeError, ValueError):
                                 yield "data: " + data_str + "\n\n"
                 except httpx.TransportError as e:
@@ -481,12 +475,12 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
 
             # Empty-response recovery
             if (not notice and not full_content and not tc_accum.count()
-                    and finish_reason == "stop" and reasoning_chars > 500
+                    and finish_reason in ("stop", "length") and seg_output_tokens > 500
                     and loop_retries < LOOP_RETRIES):
                 log.warning(
-                    "Empty content after %d reasoning chars (finish=stop) - "
+                    "Empty content after %d output tokens (finish=%s) - "
                     "treating as reasoning_overflow for non-thinking retry",
-                    reasoning_chars,
+                    seg_output_tokens, finish_reason,
                 )
                 reasoning_overflow = True
 
@@ -658,10 +652,10 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                                 loop_in_reasoning = True
                                 log.warning("Retry looped in reasoning (period=%d) - stopping", lp)
                                 break
-                    if not loop_period and reasoning_chars > MAX_REASONING_TOKENS * 3 and not full_content and not tc_accum.count():
+                    if seg_output_tokens > MAX_OUTPUT and not full_content:
                         loop_in_reasoning = True
                         reasoning_overflow = True
-                        log.warning("Retry reasoning budget backstop (chars=%d > %d) - stopping", reasoning_chars, MAX_REASONING_TOKENS * 3)
+                        log.warning("Retry: output tokens %d > MAX_OUTPUT %d with no content - stopping", seg_output_tokens, MAX_OUTPUT)
                         break
                     # --- Flush buffered tool calls from retry (after safety check) ---
                     tc_complete_r = tc_accum.is_complete() if tc_accum.count() > 0 else False
