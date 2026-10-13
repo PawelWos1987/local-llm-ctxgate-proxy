@@ -191,9 +191,9 @@ class TestPrefixCacheStability:
         source = open("/home/pawelw/ctxproxy/proxy/hotpath/handler.py").read()
         # All patches are after the message-building phase
         build_idx = source.find("built =")
-        ceiling_idx = source.find("HARD CEILING ENFORCEMENT")
+        ceiling_idx = source.find("Hard Ceiling Enforcement")
         budget_idx = source.find("MAX_CONTEXT - input_tokens - SAFETY_MARGIN")
-        length_idx = source.find("FINISH_REASON_LENGTH")
+        length_idx = source.find("Finish Reason Length")
         
         assert ceiling_idx > build_idx, "Ceiling patch must be after message building"
         assert budget_idx > build_idx, "Budget patch must be after message building"
