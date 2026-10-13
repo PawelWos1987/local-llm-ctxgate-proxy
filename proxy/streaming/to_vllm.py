@@ -5,6 +5,7 @@ import json
 import time
 import httpx
 from proxy.window.cut import _parse_vllm_actual_tokens, _hard_cut_to
+from proxy.window.shrink import _emergency_shrink
 
 log = logging.getLogger("ctxgate-proxy")
 
@@ -83,6 +84,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
         while True:
             _attempts += 1
             _t0 = time.monotonic()
+            _serialized = json.dumps(vllm_body); log.warning("OUTBOUND_BODY: session=%s bytes=%d chars=%d", session_key, len(_serialized.encode('utf-8')), len(_serialized))
             resp = await client.post(VLLM_URL + "/chat/completions", json=vllm_body)
             _dt = time.monotonic() - _t0
             if _dt > 2.0:
@@ -102,7 +104,9 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
                 calibrator.bump_margin(session_key)
                 
                 # Parse actual token count from vLLM error for accurate recut target
-                _actual_in, _actual_max = _parse_vllm_actual_tokens(resp.text)
+                _parsed = _parse_vllm_actual_tokens(resp.text)
+                _actual_in = _parsed.get("actual_input")
+                _actual_max = _parsed.get("requested_output")
                 if _actual_in:
                     _desired_out = min(_actual_max or MAX_OUTPUT, MAX_OUTPUT)
                     target = MAX_CONTEXT - SAFETY_MARGIN - _desired_out
@@ -110,6 +114,18 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
                              _actual_in, _desired_out, target)
                     # Hard cut: use vLLM's exact count, no estimation
                     _hard_cut_to(vllm_body["messages"], _actual_in, target)
+                    # Fallback: if hard cut couldn't remove enough (e.g., single
+                    # protected user message), proportionally truncate content
+                    _post_cut_est = estimate_full_payload_tokens(
+                        vllm_body["messages"], vllm_body.get("tools", []), _note_tok(), session_key)
+                    if _post_cut_est > target:
+                        _ratio = max(0.05, target * 0.9 / _post_cut_est)
+                        for _m in vllm_body["messages"]:
+                            _c = _m.get("content", "")
+                            if isinstance(_c, str) and len(_c) > 100:
+                                _m["content"] = _c[:int(len(_c) * _ratio)]
+                        log.warning("RECUT CONTENT TRUNCATION: session=%s ratio=%.2f est_before=%d target=%d",
+                                    session_key, _ratio, _post_cut_est, target)
                 else:
                     target = _trim_target()
                     _recut_to(vllm_body["messages"], target)
@@ -287,9 +303,25 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
             _cont_budget = _output_budget(cont_tokens)
             max_tokens = min(_cont_budget, MAX_OUTPUT, remaining)
             if cont_tokens > MAX_INPUT or max_tokens < CTXGATE_MIN_CONTINUATION_OUTPUT:
-                log.info("Non-stream cont: would exceed input budget or starve output - stopping")
-                exit_reason = "continuation_budget"
-                break
+                _ceiling = MAX_INPUT - CTXGATE_MIN_CONTINUATION_OUTPUT
+                _shrink_ok = False
+                try:
+                    shrunken = _emergency_shrink(cont_msgs, ceiling=_ceiling)
+                    new_cont_tokens = count_messages_tokens(shrunken)
+                    if new_cont_tokens <= MAX_INPUT:
+                        cont_msgs = shrunken
+                        cont_tokens = new_cont_tokens
+                        _cont_budget = _output_budget(cont_tokens)
+                        max_tokens = min(_cont_budget, MAX_OUTPUT, remaining)
+                        metrics["continuation_shrink_total"] = metrics.get("continuation_shrink_total", 0) + 1
+                        log.info(f"Non-stream cont: emergency shrink reclaimed space ({new_cont_tokens} tokens after shrink), continuing")
+                        _shrink_ok = True
+                except ContextCapacityError:
+                    pass
+                if not _shrink_ok:
+                    log.info("Non-stream cont: would exceed input budget or starve output - stopping")
+                    exit_reason = "continuation_budget"
+                    break
             cont_body = dict(vllm_body)
             cont_body["messages"] = cont_msgs
             cont_body["max_tokens"] = max_tokens

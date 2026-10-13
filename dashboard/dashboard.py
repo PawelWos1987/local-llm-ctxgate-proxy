@@ -346,8 +346,14 @@ async def check_worker_file(path: str) -> dict:
             result["lm_latency_ms"] = sdata.get("lm_latency_ms", 0)
             result["lm_ctx_avg"] = sdata.get("lm_ctx_avg", 0)
             result["lm_ctx_max"] = sdata.get("lm_ctx_max", 0)
-            result["lm_tokens_in"] = sdata.get("lm_tokens_in_total", 0)
-            result["lm_tokens_out"] = sdata.get("lm_tokens_out_total", 0)
+            result["lm_tokens_in_total"] = sdata.get("lm_tokens_in_total", 0)
+            result["lm_tokens_out_total"] = sdata.get("lm_tokens_out_total", 0)
+            result["jobs_done"] = sdata.get("jobs_done", 0)
+            result["pending_jobs"] = sdata.get("pending_jobs", 0)
+            result["inflight_tasks"] = sdata.get("inflight_tasks", 0)
+            result["consumers_total"] = sdata.get("consumers_total", 0)
+            result["consumers_active"] = sdata.get("consumers_active", 0)
+            result["lag_seconds"] = sdata.get("lag_seconds", 0)
         except Exception as e:
             _log.debug("worker status file read failed: %s", e)
         return result
@@ -440,11 +446,12 @@ _worker_window = WorkerWindow()
 
 
 def _worker_limits() -> dict:
+    # Model limits: 500k tokens/min, 16.67 req/s (= 1000 req/min)
     rpm_limit = int(os.environ.get("CTXGATE_WORKER_RPM", "0"))
     if rpm_limit <= 0:
-        rpm_limit = 60
+        rpm_limit = 1000  # 16.67 rps × 60
     ctx_limit = int(os.environ.get("CTXGATE_WORKER_CTX_LIMIT", "8192"))
-    tok_limit = rpm_limit * 4096
+    tok_limit = int(os.environ.get("CTXGATE_WORKER_TOK_LIMIT", "500000"))
     return {
         "rpm_limit": rpm_limit,
         "ctx_limit": ctx_limit,
@@ -813,7 +820,8 @@ def _proc_snapshot() -> list:
             _proc_prev_ticks[pid] = {"ticks": ticks, "ts": now}
             seen.add(pid)
             # Per-core: for pinned procs, divide by #pinned cores
-            per_core = min(100.0, cpu_pct / max(1, pin_count)) if core_pin else cpu_pct
+            divisor = max(1, pin_count) if core_pin else max(1, threads)
+            per_core = min(100.0, cpu_pct / divisor)
             rows.append({
                 "pid": int(pid),
                 "name": name[:20],
@@ -1788,7 +1796,7 @@ DASHBOARD_HTML = r"""
 --green:#00ff88;--yellow:#ffaa00;--red:#ff3344;--blue:#4488ff;
 --cyan:#22d3ee;--text:#c8d8e8;--dim:#4a6a8a;
 }
-body{font-size:21px;font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background:var(--bg);color:var(--text);height:100vh;overflow:hidden;display:flex;flex-direction:column}
+body{font-family:'Consolas','SF Mono','Menlo','Courier New',monospace;background:var(--bg);color:var(--text);height:100vh;overflow:hidden;display:flex;flex-direction:column}
 /* Header */
 .header{background:#080c12;border-bottom:2px solid var(--border);padding:6px 20px;display:flex;justify-content:space-between;align-items:center;height:46px;flex-shrink:0;gap:12px}
 .header .left{display:flex;align-items:center;gap:10px}
@@ -1798,7 +1806,7 @@ body{font-size:21px;font-family:'Consolas','SF Mono','Menlo','Courier New',monos
 .btn:hover{border-color:var(--green);color:var(--green)}
 .btn.green{color:var(--green)}
 /* Main grid: top row = 5 service boxes, bottom row = system + processes */
-.main{flex:1;display:grid;grid-template-columns:1fr 1fr 1fr;grid-template-rows:auto 1fr;gap:8px;padding:10px;min-height:0}
+.main{flex:1;display:grid;grid-template-columns:24% 38% 1fr;grid-template-rows:auto 1fr;gap:8px;padding:10px;min-height:0}
 /* Service boxes (top row) */
 .box{background:var(--panel);border:2px solid var(--border);border-radius:6px;padding:10px;position:relative;display:flex;flex-direction:column;transition:border-color .3s,box-shadow .3s;min-width:0}
 .box.up{border-color:var(--green);box-shadow:0 0 14px #00ff8833}
@@ -1811,6 +1819,12 @@ body{font-size:21px;font-family:'Consolas','SF Mono','Menlo','Courier New',monos
 .box.down .led{background:var(--red);box-shadow:0 0 9px var(--red)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
 .box .metrics{display:flex;flex-direction:column;gap:3px;font-size:.76em}
+.wk-table{width:100%;border-collapse:collapse;font-size:.76em}
+.wk-table th{text-align:left;font-size:.68em;text-transform:uppercase;letter-spacing:1px;color:var(--dim);padding:2px 4px;border-bottom:1px solid var(--border)}
+.wk-table td{padding:3px 4px;border-bottom:1px solid #1a2030;vertical-align:middle}
+.wk-table .wk-k{color:var(--dim);white-space:nowrap;width:70px}
+.wk-table .wk-v{color:var(--text)}
+.wk-table .wk-bar-track{height:4px;background:#1a2030;border-radius:2px;overflow:hidden;min-width:60px}
 .box .metric-row{display:flex;justify-content:space-between;gap:6px;padding:1px 0}
 .box .metric-row .k{color:var(--dim)}
 .box .metric-row .v{color:var(--text);text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1851,7 +1865,6 @@ body{font-size:21px;font-family:'Consolas','SF Mono','Menlo','Courier New',monos
 
 .ccard{padding:5px}
 .ccard .uc-name{font-size:.65em}
-.ccard{min-height:32px!important;padding:5px 8px}
 .ccard .uc-val{font-size:.9em;margin-left:auto}
 .ccard .bar-track{height:6px}
 .ccard .bar-fill{transition:width .5s,background .5s}
@@ -1861,7 +1874,7 @@ body{font-size:21px;font-family:'Consolas','SF Mono','Menlo','Courier New',monos
 .corebar-fill{height:100%;border-radius:1px;transition:width .5s}
 .fill-mio{background:linear-gradient(90deg,#38bdf8,#06b6d4)}
 .fill-pf{background:linear-gradient(90deg,#fbbf24,#f59e0b)}
-.ucard{background:#0a0e14;border:1px solid var(--border);border-radius:5px;padding:8px;display:flex;flex-direction:column;gap:5px;min-height:72px;transition:border-color .3s}
+.ucard{background:#0a0e14;border:1px solid var(--border);border-radius:5px;padding:8px;display:flex;flex-direction:column;gap:5px;transition:border-color .3s}
 .uc-head{display:flex;align-items:center;gap:6px}
 .uc-ic{font-size:1.1em}
 .uc-name{font-size:.72em;color:var(--dim);text-transform:uppercase;letter-spacing:.5px}
@@ -1882,9 +1895,9 @@ body{font-size:21px;font-family:'Consolas','SF Mono','Menlo','Courier New',monos
 .kvbar-l .k{color:var(--dim)}
 .kvbar-l .v{color:var(--text)}
 /* Top processes table (bottom-right) */
-.procs{background:var(--panel);border:2px solid var(--border);border-radius:6px;display:flex;flex-direction:column;max-height:350px;min-height:0;overflow:hidden}
+.procs{background:var(--panel);border:2px solid var(--border);border-radius:6px;display:flex;flex-direction:column;min-height:0;overflow:hidden}
 .procs .pt{font-size:.72em;font-weight:bold;text-transform:uppercase;letter-spacing:1.5px;color:var(--cyan);padding:2px 0 6px}
-.procs .table-wrap{flex:1;overflow-y:auto;min-height:0;max-height:288px}
+.procs .table-wrap{flex:1;overflow-y:auto;min-height:0}
 .ptable{width:100%;border-collapse:collapse;font-size:.72em}
 .ptable th{text-align:left;padding:4px 6px;border-bottom:2px solid var(--border);color:var(--dim);font-size:.72em;letter-spacing:.5px;text-transform:uppercase;position:sticky;top:0;background:var(--panel)}
 .ptable td{padding:4px 6px;border-bottom:1px solid #111;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1997,20 +2010,20 @@ body{font-size:21px;font-family:'Consolas','SF Mono','Menlo','Courier New',monos
   <!-- [1,0] WORKER 4B -->
   <div class="box" id="box-worker">
   <div class="title" data-tip="WORKER 4B|Memory-extraction daemon. Consumes context-gate events, distils them into durable memories in PostgreSQL. Rolling 60s/5m windows computed dashboard-side."><span class="led"></span>WORKER 4B<span class="wk-badge" id="wk-badge">--</span></div>
-  <div class="metrics">
-  <div class="metric-row" data-tip="Status|HEALTHY / WARN / THROTTLED / STARVED / DEGRADED / DOWN. Derived from utilization, queue depth, latency, context pressure."><span class="k">Status</span><span class="v" id="wk-status">--</span></div>
-  <div class="metric-row" data-tip="PID / Heartbeat|OS process ID and seconds since last heartbeat."><span class="k">PID / HB</span><span class="v" id="wk-pid">--</span></div>
-  <div class="metric-row" data-tip="Queue|Processing / Pending / Done today / Failed today."><span class="k">Queue</span><span class="v" id="wk-queue">--</span></div>
-  <div class="metric-row" data-tip="Req/min (60s)|Actual requests in the last 60s vs the configured RPM limit."><span class="k">Req/min</span><span class="v" id="wk-rpm">--</span></div>
-  <div class="wk-bar-track"><div class="wk-bar-fill" id="wk-rpm-bar" style="width:0%"></div></div>
-  <div class="metric-row" data-tip="Tok/min (60s)|Total tokens (in+out) in the last 60s vs the token limit."><span class="k">Tok/min</span><span class="v" id="wk-tok">--</span></div>
-  <div class="wk-bar-track"><div class="wk-bar-fill" id="wk-tok-bar" style="width:0%"></div></div>
-  <div class="metric-row" data-tip="Context|Avg / Max / Limit tokens. Warns at >=80% of context window."><span class="k">Context</span><span class="v" id="wk-ctx">--</span></div>
-  <div class="wk-bar-track"><div class="wk-bar-fill fill-ctx" id="wk-ctx-bar" style="width:0%"></div></div>
-  <div class="metric-row" data-tip="Latency (60s)|avg / p50 / p95 / p99 in the last 60 seconds."><span class="k">Latency</span><span class="v" id="wk-lat">--</span></div>
-  <div class="metric-row" data-tip="In/Out (60s)|Avg and p95 input & output tokens per request."><span class="k">In/Out</span><span class="v" id="wk-io">--</span></div>
-  <div class="metric-row" data-tip="ETA drain|Estimated time to clear the pending queue at the current 60s rate."><span class="k">ETA drain</span><span class="v" id="wk-eta">--</span></div>
-  </div>
+  <table class="wk-table">
+  <thead><tr><th>Metric</th><th>Value</th><th>Bar</th></tr></thead>
+  <tbody>
+  <tr data-tip="Status|HEALTHY / WARN / THROTTLED / STARVED / DEGRADED / DOWN. Derived from utilization, queue depth, latency, context pressure."><td class="wk-k">Status</td><td class="wk-v" id="wk-status">--</td><td></td></tr>
+  <tr data-tip="PID / Heartbeat|OS process ID and seconds since last heartbeat."><td class="wk-k">PID / HB</td><td class="wk-v" id="wk-pid">--</td><td></td></tr>
+  <tr data-tip="Queue|Processing / Pending / Done today / Failed today."><td class="wk-k">Queue</td><td class="wk-v" id="wk-queue">--</td><td></td></tr>
+  <tr data-tip="Requests (60s)|Requests completed in the last 60 seconds vs the 1000 req/min limit."><td class="wk-k">Reqs (60s)</td><td class="wk-v" id="wk-rpm">--</td><td><div class="wk-bar-track"><div class="wk-bar-fill" id="wk-rpm-bar" style="width:0%"></div></div></td></tr>
+  <tr data-tip="Tokens (60s)|Total tokens consumed (in+out) in the last 60 seconds vs the 500k TPM limit."><td class="wk-k">Tokens (60s)</td><td class="wk-v" id="wk-tok">--</td><td><div class="wk-bar-track"><div class="wk-bar-fill" id="wk-tok-bar" style="width:0%"></div></div></td></tr>
+  <tr data-tip="Context|Avg / Max / Limit tokens. Warns at >=80% of context window."><td class="wk-k">Context</td><td class="wk-v" id="wk-ctx">--</td><td><div class="wk-bar-track"><div class="wk-bar-fill fill-ctx" id="wk-ctx-bar" style="width:0%"></div></div></td></tr>
+  <tr data-tip="Latency (60s)|avg / p50 / p95 / p99 in the last 60 seconds."><td class="wk-k">Latency</td><td class="wk-v" id="wk-lat">--</td><td></td></tr>
+  <tr data-tip="In/Out (60s)|Avg and p95 input & output tokens per request."><td class="wk-k">In/Out</td><td class="wk-v" id="wk-io">--</td><td></td></tr>
+  <tr data-tip="ETA drain|Estimated time to clear the pending queue at the current 60s rate."><td class="wk-k">ETA drain</td><td class="wk-v" id="wk-eta">--</td><td></td></tr>
+  </tbody>
+  </table>
   <div class="controls">
   <button class="s" onclick="ctrl(event,'worker','start')">START</button>
   <button class="p" onclick="ctrl(event,'worker','stop')">STOP</button>
@@ -2024,7 +2037,7 @@ body{font-size:21px;font-family:'Consolas','SF Mono','Menlo','Courier New',monos
   <div class="pt">&#128202; TOP PROCESSES (by memory)</div>
   <div class="table-wrap">
   <table class="ptable">
-  <thead><tr><th>PID</th><th>NAME</th><th>MEM</th><th>MEM%</th><th>CORE</th><th>CORE%</th></tr></thead>
+  <thead><tr><th>PID</th><th>NAME</th><th>MEM</th><th>MEM%</th><th>CORE</th><th>CPU/CORE</th></tr></thead>
   <tbody id="procBody"><tr><td colspan="6" style="color:var(--dim)">loading…</td></tr></tbody>
   </table>
   </div>
@@ -2032,50 +2045,8 @@ body{font-size:21px;font-family:'Consolas','SF Mono','Menlo','Courier New',monos
 
   <!-- [0,1] Service stack: PG, Proxy, Sync, System -->
   <div class="svc-stack" style="grid-column:1;grid-row:2">
-  <div class="box" id="box-pg">
-    <div class="title"><span class="led"></span>POSTGRESQL</div>
-    <div class="metrics">
-      <div class="metric-row"><span class="k">Status</span><span class="v" id="pg-status">--</span></div>
-      <div class="metric-row"><span class="k">Tasks</span><span class="v" id="pg-tasks">--</span></div>
-      <div class="metric-row"><span class="k">Events (1h)</span><span class="v" id="pg-ev1h">--</span></div>
-      <div class="metric-row"><span class="k">Memories</span><span class="v" id="pg-mem">--</span></div>
-      <div class="metric-row"><span class="k">Knowledge</span><span class="v" id="pg-know">--</span></div>
-    </div>
-    <div class="note">Session store + durable memory. Events(1h) = activity in the last hour.</div>
-  </div>
-
-  <div class="box" id="box-proxy">
-    <div class="title"><span class="led"></span>CTXGATE PROXY</div>
-    <div class="metrics">
-      <div class="metric-row"><span class="k">Status</span><span class="v" id="px-status">--</span></div>
-      <div class="metric-row"><span class="k">Latency</span><span class="v big" id="px-lat">--</span></div>
-      <div class="metric-row"><span class="k">Unit</span><span class="v blue" id="px-unit">--</span></div>
-    </div>
-    <div class="controls">
-      <button class="s" onclick="ctrl(event,'ctxgate_proxy','start')">START</button>
-      <button class="p" onclick="ctrl(event,'ctxgate_proxy','stop')">STOP</button>
-      <button class="r" onclick="ctrl(event,'ctxgate_proxy','restart')">RESTART</button>
-    </div>
-    <div class="note">:9201 Context window manager. STOP/RESTART are graceful (SIGTERM → drains in-flight).</div>
-  </div>
-
-  <div class="box" id="box-sync">
-    <div class="title" data-tip="Session Sync|Syncs Goose sessions from SQLite into PostgreSQL proxy.tasks every 15 minutes. Runs as a systemd user unit (ctxgate-session-sync.service)."><span class="led"></span>SESSION SYNC</div>
-    <div class="metrics">
-      <div class="metric-row" data-tip="Syncer Status|Based on systemd ActiveState. active = UP, failed = DOWN, inactive = DOWN."><span class="k">Status</span><span class="v" id="sy-status">--</span></div>
-      <div class="metric-row" data-tip="Systemd Unit|The user unit managing the session syncer process."><span class="k">Unit</span><span class="v blue" id="sy-unit">--</span></div>
-      <div class="metric-row" data-tip="Sync Interval|How often the syncer reads Goose sessions and upserts into PostgreSQL."><span class="k">Interval</span><span class="v" id="sy-interval">15m</span></div>
-    </div>
-    <div class="controls">
-      <button class="s" onclick="ctrl(event,'session_sync','start')">START</button>
-      <button class="p" onclick="ctrl(event,'session_sync','stop')">STOP</button>
-      <button class="r" onclick="ctrl(event,'session_sync','restart')">RESTART</button>
-      <button class="s" onclick="ctrl(event,'session_sync','status')">STATUS</button>
-      <button class="s" onclick="ctrl(event,'session_sync','health')">HEALTH</button>
-    </div>
-    <div class="note">Goose sessions → PG tasks. 15-min sync cycle.</div>
-  </div>
-  <div class="syspanel" id="syspanel">
+  
+<div class="syspanel" id="syspanel">
     <div class="sp-title">&#128450; SYSTEM</div>
     <div class="gauge">
       <div class="gl"><span class="k">RAM LOAD</span><span class="v" id="s-ramload">--</span></div>
@@ -2106,6 +2077,50 @@ body{font-size:21px;font-family:'Consolas','SF Mono','Menlo','Courier New',monos
       <div class="bar-track"><div class="bar-fill fill-disk" id="b-disk" style="width:0%"></div></div>
       <div class="gl"><span class="k">CPU PSI</span><span class="v" id="s-psi-cpu">--</span></div>
     </div>
+  </div>
+
+<div class="box" id="box-pg">
+    <div class="title"><span class="led"></span>POSTGRESQL</div>
+    <div class="metrics">
+      <div class="metric-row"><span class="k">Status</span><span class="v" id="pg-status">--</span></div>
+      <div class="metric-row"><span class="k">Tasks</span><span class="v" id="pg-tasks">--</span></div>
+      <div class="metric-row"><span class="k">Events (1h)</span><span class="v" id="pg-ev1h">--</span></div>
+      <div class="metric-row"><span class="k">Memories</span><span class="v" id="pg-mem">--</span></div>
+      <div class="metric-row"><span class="k">Knowledge</span><span class="v" id="pg-know">--</span></div>
+    </div>
+    <div class="note">Session store + durable memory. Events(1h) = activity in the last hour.</div>
+  </div>
+
+<div class="box" id="box-proxy">
+    <div class="title"><span class="led"></span>CTXGATE PROXY</div>
+    <div class="metrics">
+      <div class="metric-row"><span class="k">Status</span><span class="v" id="px-status">--</span></div>
+      <div class="metric-row"><span class="k">Latency</span><span class="v big" id="px-lat">--</span></div>
+      <div class="metric-row"><span class="k">Unit</span><span class="v blue" id="px-unit">--</span></div>
+    </div>
+    <div class="controls">
+      <button class="s" onclick="ctrl(event,'ctxgate_proxy','start')">START</button>
+      <button class="p" onclick="ctrl(event,'ctxgate_proxy','stop')">STOP</button>
+      <button class="r" onclick="ctrl(event,'ctxgate_proxy','restart')">RESTART</button>
+    </div>
+    <div class="note">:9201 Context window manager. STOP/RESTART are graceful (SIGTERM → drains in-flight).</div>
+  </div>
+
+<div class="box" id="box-sync">
+    <div class="title" data-tip="Session Sync|Syncs Goose sessions from SQLite into PostgreSQL proxy.tasks every 15 minutes. Runs as a systemd user unit (ctxgate-session-sync.service)."><span class="led"></span>SESSION SYNC</div>
+    <div class="metrics">
+      <div class="metric-row" data-tip="Syncer Status|Based on systemd ActiveState. active = UP, failed = DOWN, inactive = DOWN."><span class="k">Status</span><span class="v" id="sy-status">--</span></div>
+      <div class="metric-row" data-tip="Systemd Unit|The user unit managing the session syncer process."><span class="k">Unit</span><span class="v blue" id="sy-unit">--</span></div>
+      <div class="metric-row" data-tip="Sync Interval|How often the syncer reads Goose sessions and upserts into PostgreSQL."><span class="k">Interval</span><span class="v" id="sy-interval">15m</span></div>
+    </div>
+    <div class="controls">
+      <button class="s" onclick="ctrl(event,'session_sync','start')">START</button>
+      <button class="p" onclick="ctrl(event,'session_sync','stop')">STOP</button>
+      <button class="r" onclick="ctrl(event,'session_sync','restart')">RESTART</button>
+      <button class="s" onclick="ctrl(event,'session_sync','status')">STATUS</button>
+      <button class="s" onclick="ctrl(event,'session_sync','health')">HEALTH</button>
+    </div>
+    <div class="note">Goose sessions → PG tasks. 15-min sync cycle.</div>
   </div>
   </div>
 
@@ -2405,10 +2420,10 @@ if(sys.procs&&sys.procs.length){
     var cccol=pc>=90?'var(--red)':(pc>=70?'var(--yellow)':'var(--text)');
     var th=p.threads||1;var tot=p.cpu_pct||0;
     var tip='PID '+p.pid+'|'+p.name+' &middot; '+th+' thread'+(th>1?'s':'')+' &middot; '+tot.toFixed(1)+'% total CPU';
-    if(pin) tip+=' &middot; pinned to '+pin+' ('+p.pin_count+' cores) &middot; '+pc.toFixed(1)+'% per core';
-    else tip+=' &middot; not pinned (spread across all cores)';
+    if(pin) tip+=' &middot; pinned to '+pin+' ('+p.pin_count+' cores) &middot; avg '+pc.toFixed(1)+'%/core';
+    else tip+=' &middot; spread across '+th+' thread'+(th>1?'s':'')+' &middot; avg '+pc.toFixed(1)+'%/thread';
     tip+=' &middot; RSS '+fmtKB(p.rss_kb);
-    var cu=(p.core_now>=0&&sys.cpu_per_core&&sys.cpu_per_core[p.core_now]!=null)?sys.cpu_per_core[p.core_now]:pc;
+    var cu=pc;
     return '<tr data-tip="'+tip+'">'+
       '<td class="num">'+p.pid+'</td><td class="pname">'+p.name+'</td><td class="num">'+fmtKB(p.rss_kb)+'</td><td class="num">'+mp.toFixed(1)+'%</td><td class="num" style="color:var(--cyan)">'+(p.core_now>=0?p.core_now:'?')+'</td><td class="num" style="color:'+(cu>=90?'var(--red)':(cu>=70?'var(--yellow)':'var(--green)'))+'">'+cu.toFixed(1)+'%</td></tr>';
   }).join('');

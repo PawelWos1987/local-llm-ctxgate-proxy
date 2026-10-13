@@ -1,0 +1,9 @@
+[2026-10-13 02:16:56] === PHASE 3: LONG-SESSION SIMULATION v2 ===
+[2026-10-13 02:16:56] Session: e2e-long-001 | Turns: 100 | Tok/turn: ~500 | Target cum: ~50000
+[2026-10-13 02:17:54] T20/100: cum=41991ok ok=20 err=0 rss=unknown
+[2026-10-13 02:19:22] T40/100: cum=90338ok ok=40 err=0 rss=unknown
+[2026-10-13 02:19:57] T60/100: cum=136901ok ok=60 err=0 rss=unknown
+[2026-10-13 02:20:51] T80/100: cum=182314ok ok=80 err=0 rss=unknown
+[2026-10-13 02:21:26] T100/100: cum=228425ok ok=100 err=0 rss=unknown
+[2026-10-13 02:21:26] === DONE === T=100 ok=100 err=0 cum=228425
+[2026-10-13 02:21:26] Saved: /home/pawelw/ctxproxy/e2e-evidence/phase3-results.json

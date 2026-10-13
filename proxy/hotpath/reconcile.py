@@ -16,9 +16,8 @@ from typing import Optional
 
 from proxy.config.constants import (
     MAX_CONTEXT, MAX_INPUT, SAFETY_MARGIN, MAX_OUTPUT,
-    CTXGATE_INJECT_MAX_TOKENS_CFG, CTXGATE_INPUT_ESTIMATE_HEADROOM,
+    CTXGATE_INJECT_MAX_TOKENS_CFG,
 )
-from proxy.window.budget import _safe_admitted_budget
 from proxy.window.state import _new_window_state
 from proxy.token.counter import count_messages_tokens
 
@@ -161,7 +160,7 @@ def resume_reconcile(
         return (messages, True, "reduce_injection")
 
     # Step 3: Shrink the rolling window
-    _safe_ceiling = _safe_admitted_budget()
+    _safe_ceiling = MAX_INPUT
     if _window_tokens > _safe_ceiling:
         # Re-cut: keep only enough messages to fit the safe ceiling
         _current_cut = window_state.get("cut", 0)

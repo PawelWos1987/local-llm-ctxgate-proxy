@@ -8,18 +8,20 @@ from proxy.config.constants import (
     CTXGATE_PREFIX_DIAG_ON, CTXGATE_INJECT_EPOCH_FREEZE_ON,
     CTXGATE_INJECT_MAX_TOKENS_CFG, CTXGATE_INJECT_MAX_TOKENS_RECAP_CFG,
 )
-from proxy.window.budget import _safe_admitted_budget
 from proxy.window.state import _norm_content, _msg_anchor, _seed_sig, _newest_user_idx
 from proxy.token.counter import count_messages_tokens, count_message_tokens
 
 log = logging.getLogger("ctxgate-proxy")
+
+# Module-level metrics counter (TODO(I4): replace with AppContext)
+metrics: dict[str, int] = {}
 
 # TODO(I4): replace with AppContext
 
 
 def _eviction_trigger() -> int:
     """High-watermark trigger: eviction triggers when kept tokens exceed this."""
-    return int(_safe_admitted_budget() * CTXGATE_WINDOW_TRIGGER_FRAC)
+    return int(MAX_INPUT * CTXGATE_WINDOW_TRIGGER_FRAC)
 
 def _trim_target() -> int:
     """Low-watermark target after eviction."""
@@ -27,7 +29,7 @@ def _trim_target() -> int:
     if TRIM_TARGET_TOKENS > 0:
         t = TRIM_TARGET_TOKENS
     else:
-        t = int(_safe_admitted_budget() * CTXGATE_WINDOW_TARGET_FRAC)
+        t = int(MAX_INPUT * CTXGATE_WINDOW_TARGET_FRAC)
     return max(floor_eff, min(t, MAX_INPUT))
 def _turn_groups(messages: list) -> list:
     """Parse messages into turn groups. A turn group is a maximal sequence
@@ -77,21 +79,26 @@ def _safe_cut(groups: list, budget_tokens: int) -> int:
 def _recut_to(messages: list, max_tokens: int) -> int:
     """Turn-group-aware budget cut targeting max_tokens.
 
-    The immutable prefix is ONLY the system message (index 0) if it exists.
-    Messages 1 and 2 (first user/assistant) are ordinary history.
+    The immutable prefix is the system message (index 0) + the first user message.
+    All other messages are ordinary history subject to budget cutting.
     Cuts are quantized to turn group boundaries - never in the middle of a
     turn group. If the budget boundary falls inside a group, extend to the
     end of that group (or start of next group, whichever keeps fewer tokens).
     """
     # TODO(I4): replace with AppContext
     from proxy.app import _note_tok, metrics
-    # Immutable prefix: only the system message (index 0) if it exists
+    # Immutable prefix: system message (index 0) + first user message
+    seed = []
+    rest = list(messages)
     if messages and messages[0].get("role") == "system":
-        seed = [messages[0]]
+        seed.append(messages[0])
         rest = list(messages[1:])
-    else:
-        seed = []
-        rest = list(messages)
+    # Add first user message to the immutable seed
+    for i, m in enumerate(rest):
+        if m.get("role") == "user":
+            seed.append(m)
+            rest = rest[:i] + rest[i+1:]
+            break
     
     stub_tok = _note_tok()
     seed_tok = count_messages_tokens(seed) if seed else 0
@@ -309,8 +316,7 @@ def _kept_messages(seed: list, rest: list, cut: int) -> list:
             live_msg = result[live_idx_in_result]
             live_tok = count_message_tokens(live_msg)
             seed_tok = count_messages_tokens(seed) if seed else 0
-            from proxy.window.budget import _safe_admitted_budget
-            budget = _safe_admitted_budget()
+            budget = MAX_INPUT
             max_live = budget - seed_tok - 500  # 500 for stub/overhead
             if max_live < 1000:
                 max_live = 1000  # absolute minimum
@@ -366,24 +372,47 @@ def _is_context_length_error(status_code: int, error_body: str) -> bool:
     return any(ind in _et for ind in indicators)
 
 
-def _parse_vllm_actual_tokens(error_body: str) -> tuple:
-    """Parse actual input and max_tokens from vLLM's context-length error.
+def _parse_vllm_actual_tokens(error_body: str) -> dict:
+    """Parse token counts from vLLM's context-length error.
 
     vLLM format: "This model's maximum context length is {MAX_CONTEXT} tokens.
     However, you requested {MAX_OUTPUT} output tokens and your prompt contains
     at least {N} input tokens, for a total of at least {TOTAL}"
 
-    Returns (actual_input_tokens, requested_max_tokens) or (None, None).
+    Returns dict with keys: max_context, requested_output, actual_input, total.
+    Values are ints or None if not found.
     """
+    result: dict = {"max_context": None, "requested_output": None, "actual_input": None, "total": None}
+
+    # Primary: match the full sentence pattern
     m = re.search(
-        r"you requested (\d+) output tokens and your prompt contains at least (\d+) input tokens",
+        r"maximum context length is (\d+) tokens.*?you requested (\d+) output tokens.*?"
+        r"prompt contains at least (\d+) input tokens.*?total of at least (\d+)",
         error_body,
-        re.IGNORECASE,
+        re.IGNORECASE | re.DOTALL,
     )
     if m:
-        return int(m.group(2)), int(m.group(1))
-    # Fallback: try to get just the input tokens
-    m2 = re.search(r"at least (\d+) input tokens", error_body, re.IGNORECASE)
-    if m2:
-        return int(m2.group(1)), None
-    return None, None
+        result["max_context"] = int(m.group(1))
+        result["requested_output"] = int(m.group(2))
+        result["actual_input"] = int(m.group(3))
+        result["total"] = int(m.group(4))
+        return result
+
+    # Partial fallbacks (individual patterns)
+    m_ctx = re.search(r"maximum context length is (\d+) tokens", error_body, re.IGNORECASE)
+    if m_ctx:
+        result["max_context"] = int(m_ctx.group(1))
+
+    m_out = re.search(r"you requested (\d+) output tokens", error_body, re.IGNORECASE)
+    if m_out:
+        result["requested_output"] = int(m_out.group(1))
+
+    m_in = re.search(r"at least (\d+) input tokens", error_body, re.IGNORECASE)
+    if m_in:
+        result["actual_input"] = int(m_in.group(1))
+
+    m_tot = re.search(r"total of at least (\d+)", error_body, re.IGNORECASE)
+    if m_tot:
+        result["total"] = int(m_tot.group(1))
+
+    return result

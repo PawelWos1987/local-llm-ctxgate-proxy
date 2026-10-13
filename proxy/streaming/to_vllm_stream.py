@@ -15,6 +15,9 @@ from proxy.window.cut import _parse_vllm_actual_tokens, _hard_cut_to
 
 log = logging.getLogger("ctxgate-proxy")
 
+# Per-session consecutive context-length error counter
+_ctx_fail_counter: dict[str, int] = {}
+
 # TODO(I4): replace with AppContext
 
 
@@ -39,6 +42,12 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
     async def generate():
         global metrics
         nonlocal input_tokens
+
+        # === PRE-FLIGHT HARD CUT: massively oversized payloads ===
+        _pf_est = count_messages_tokens(vllm_body.get('messages', []))
+        if _pf_est > MAX_INPUT * 1.5:
+            log.warning('PRE-FLIGHT HARD CUT: est=%d >> MAX_INPUT=%d (session=%s)', _pf_est, MAX_INPUT, session_key)
+            _hard_cut_to(vllm_body['messages'], _pf_est, MAX_INPUT)
         # Content is forwarded immediately. The only text ever held back is
         # the first SEAM_WINDOW chars of a continuation segment (to trim overlap
         # with what the client already has), and it is flushed on every exit path.
@@ -184,7 +193,12 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                         current_body["max_tokens"] = _reduced_output
                         _target_input = MAX_CONTEXT - _reduced_output - SAFETY_MARGIN
                     if _target_input > 0:
-                        _recut_to(current_body["messages"], _target_input)
+                        _cut_n = _recut_to(current_body["messages"], _target_input)
+                        if _cut_n == 0:
+                            _est_now = count_messages_tokens(current_body["messages"])
+                            if _est_now > MAX_INPUT:
+                                log.warning('RECUT BLOCKED (guard), falling back to HARD CUT: est=%d target=%d (session=%s)', _est_now, MAX_INPUT, session_key)
+                                _hard_cut_to(current_body["messages"], _est_now, MAX_INPUT)
                         _pre_input = estimate_full_payload_tokens(
                             current_body["messages"], current_body.get("tools", []), _note_tok(), session_key
                         )
@@ -201,45 +215,53 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                             body_bytes = await resp.aread()
                             _et = body_bytes[:500].decode("utf-8", errors="replace")
                             _is_ctx_err = _is_context_length_error(resp.status_code, _et)
-                            if _is_ctx_err and not shrink_retried and not _bytes_sent:
-                                # Phase 08: ONE recut retry, only if no bytes sent to client
-                                shrink_retried = True
-                                log.warning("Stream context-length error - ONE recut retry (no bytes sent): %s", _et[:200])
+                            if _is_ctx_err and not _bytes_sent:
+                                # Escalating per-session failure counter
+                                _fail_count = _ctx_fail_counter.get(session_key, 0) + 1
+                                _ctx_fail_counter[session_key] = _fail_count
+
+                                if _fail_count >= 3:
+                                    # Give up - return clear error
+                                    log.error("SESSION UNRECOVERABLE: %d consecutive ctx errors (session=%s)", _fail_count, session_key)
+                                    metrics["requests_error"] += 1
+                                    _record_call(session_key, input_tokens, total_output_tokens, "context_overflow_unrecoverable", VLLM_MODEL, True, _et[:200])
+                                    yield "data: " + json.dumps({"error": {"type": "context_overflow", "message": f"Session context exceeds model limits after {_fail_count} recovery attempts. Manual compaction required."}}) + "\n\n"
+                                    yield "data: [DONE]" + "\n\n"
+                                    return
+
+                                # Determine target fraction based on failure count
+                                _target_frac = 0.4 if _fail_count == 1 else 0.25
+                                _target_input = int(MAX_CONTEXT * _target_frac)
+
+                                log.warning("ESCALATING TRUNCATION: attempt=%d target=%d%% MAX_CONTEXT (session=%s)",
+                                           _fail_count, int(_target_frac * 100), session_key)
                                 calibrator.bump_margin(session_key)
-                                
-                                # Parse actual token count from vLLM error for accurate recut target
-                                _actual_in, _actual_max = _parse_vllm_actual_tokens(_et)
-                                if _actual_in:
-                                    _desired_out = min(_actual_max or MAX_OUTPUT, MAX_OUTPUT)
-                                    _recut_target = MAX_CONTEXT - SAFETY_MARGIN - _desired_out
-                                    log.info("Recut using vLLM actual: input=%d max_tokens=%d target_input=%d",
-                                             _actual_in, _desired_out, _recut_target)
-                                    # Hard cut: use vLLM's exact count, no estimation
-                                    _hard_cut_to(current_body["messages"], _actual_in, _recut_target)
-                                else:
-                                    _recut_target = _trim_target()
-                                    try:
-                                        _recut_to(current_body["messages"], _recut_target)
-                                    except ContextCapacityError as cce:
-                                        for x in _flush_seam():
-                                            yield x
-                                        for _cg in _emit_ctxgate_final("length", "context_capacity", continuation_count, total_output_tokens, False, 0):
-                                            yield _cg
-                                        metrics["requests_error"] += 1
-                                        _record_call(session_key, input_tokens, total_output_tokens, "context_capacity", VLLM_MODEL, True, str(cce)[:200])
-                                        return
+
+                                # Hard cut to target
+                                _est_now = count_messages_tokens(current_body["messages"])
+                                _hard_cut_to(current_body["messages"], _est_now, _target_input)
+
+                                # Re-check: if still over, keep cutting
+                                while count_messages_tokens(current_body["messages"]) > _target_input:
+                                    _hard_cut_to(current_body["messages"], count_messages_tokens(current_body["messages"]), _target_input)
+
+                                # Inject [CONTEXT TRUNCATED - CONTINUE] as USER message (preserves prefix cache)
+                                current_body["messages"].append({
+                                    "role": "user",
+                                    "content": "[CONTEXT TRUNCATED - CONTINUE]"
+                                })
 
                                 # Re-estimate for tracking
                                 input_tokens = estimate_full_payload_tokens(current_body["messages"], current_body.get("tools", []), _note_tok(), session_key)
                                 _b2 = _output_budget(input_tokens)
                                 current_body["max_tokens"] = min(_b2, MAX_OUTPUT, CTXGATE_MAX_TOTAL_OUTPUT - total_output_tokens)
-                                # Phase 08: validate recut payload
+                                # Validate recut payload
                                 _vok, _verr = _validate_outgoing_payload(current_body, live_prompt_hash)
                                 if not _vok:
                                     metrics["requests_error"] += 1
                                     log.error("Stream recut validation failed: %s (session=%s)", _verr, session_key)
                                     _record_call(session_key, input_tokens, total_output_tokens, f"recut_validation_failed:{_verr}", VLLM_MODEL, True, _verr)
-                                    yield "data: " + json.dumps({"error": {"type": _verr, "message": f"Recut validation failed: {_verr}"}})  + chr(10)*2
+                                    yield "data: " + json.dumps({"error": {"type": _verr, "message": f"Recut validation failed: {_verr}"}}) + chr(10)*2
                                     yield "data: [DONE]" + chr(10)*2
                                     return
                                 continue
@@ -368,6 +390,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                 total_output_tokens += seg_output_tokens
                 if interrupted is None:
                     _vllm_breaker.record_success()
+                    _ctx_fail_counter.pop(session_key, None)
                 else:
                     # Failure already recorded in except; early-close is also a failure
                     pass
@@ -592,7 +615,12 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                             current_body["max_tokens"] = _reduced_output
                             _target_input = MAX_CONTEXT - _reduced_output - SAFETY_MARGIN
                         if _target_input > 0:
-                            _recut_to(current_body["messages"], _target_input)
+                            _cut_n = _recut_to(current_body["messages"], _target_input)
+                            if _cut_n == 0:
+                                _est_now = count_messages_tokens(current_body["messages"])
+                                if _est_now > MAX_INPUT:
+                                    log.warning('RECUT BLOCKED (guard), falling back to HARD CUT: est=%d target=%d (session=%s)', _est_now, MAX_INPUT, session_key)
+                                    _hard_cut_to(current_body["messages"], _est_now, MAX_INPUT)
                             _pre_input = estimate_full_payload_tokens(
                                 current_body["messages"], current_body.get("tools", []), _note_tok(), session_key
                             )

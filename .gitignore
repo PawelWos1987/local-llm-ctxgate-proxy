@@ -98,3 +98,4 @@ sandbox_start.sh
 worker/.worker.lock
 worker/.worker_status.json
 *.pid
+/.pytest_cache/

@@ -11,7 +11,7 @@ from proxy.window.cut import (
     _kept_messages, _is_context_length_error,
     _repair_tool_dependencies,
 )
-from proxy.window.budget import _safe_admitted_budget, _output_budget, estimate_full_payload_tokens
+from proxy.window.budget import _output_budget, estimate_full_payload_tokens
 from proxy.window.elide import _elided_tool_content, _stable_elide_inplace, _stable_elide_idx
 from proxy.window.shrink import ContextCapacityError, _emergency_shrink, _protected_indices
 from proxy.window.persist import (
@@ -32,7 +32,7 @@ __all__ = [
     "_turn_groups", "_safe_cut", "_recut_to", "_recut",
     "_kept_messages", "_is_context_length_error",
     "_repair_tool_dependencies",
-    "_safe_admitted_budget", "_output_budget", "estimate_full_payload_tokens",
+    "_output_budget", "estimate_full_payload_tokens",
     "_elided_tool_content", "_stable_elide_inplace", "_stable_elide_idx",
     "ContextCapacityError", "_emergency_shrink", "_protected_indices",
     "_window_persist", "_window_load", "_window_cleanup_ttl",

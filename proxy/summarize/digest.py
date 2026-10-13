@@ -24,7 +24,7 @@ async def _build_session_digest(task_uuid, session_key: str = "", tenant_id: str
             if ledger_lines:
                 parts.append("LEDGER:" + chr(10) + chr(10).join(ledger_lines))
         phase_rows = await pool.fetch(
-            "SELECT phase_number, summary FROM proxy.phase_summaries WHERE task_id=$1 ORDER BY phase_number DESC",
+            "SELECT phase_number, summary FROM proxy.phase_summaries WHERE task_id=$1 ORDER BY phase_number DESC LIMIT 50",
             task_uuid
         )
         if phase_rows:

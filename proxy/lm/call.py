@@ -115,7 +115,7 @@ async def _call_4b(messages, max_tokens=2000, json_mode=True, priority=LM_PRI_HI
         "seq": _lm_seq_counter,
         "messages": messages,
         "max_tokens": max_tokens,
-        "temperature": 0,
+        "temperature": 0.3,
         "json_mode": json_mode,
         "system": system,
         "kind": kind,

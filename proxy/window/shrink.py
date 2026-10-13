@@ -29,12 +29,20 @@ class ContextCapacityError(Exception):
 def _protected_indices(work: list, aggressive: bool = False) -> set:
     """Indices that _emergency_shrink must never drop.
 
-    Standard mode: seed (first 3) + protected tool groups + live prompt.
-    Aggressive mode: seed (first 3) + live prompt ONLY (tool groups unprotected).
+    Standard mode: seed (system + first user) + protected tool groups + live prompt.
+    Aggressive mode: seed (system + first user) + live prompt ONLY (tool groups unprotected).
     """
-    protected = set(range(min(3, len(work))))
+    # Protect the immutable seed: system message + first user message
+    protected = set()
+    for i, m in enumerate(work):
+        if m.get("role") == "system":
+            protected.add(i)
+        elif m.get("role") == "user" and i < 3:
+            # First user message is part of the immutable seed
+            protected.add(i)
+            break
     if not aggressive:
-        # Canonical: newest 4 tool groups (replaces old "newest 6" ad-hoc logic)
+        # Canonical: newest 4 tool groups
         protected |= protected_tool_groups(work)
     # Live prompt (last user message) must NEVER be elided
     for k in range(len(work) - 1, -1, -1):

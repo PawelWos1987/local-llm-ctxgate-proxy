@@ -1,0 +1,44 @@
+[
+  {
+    "test": "incomplete_json",
+    "status": 200,
+    "pass": true,
+    "body_preview": "{\"id\":\"chatcmpl-17e9c5f54b23\",\"object\":\"chat.completion\",\"created\":1791849885,\"model\":\"local-model\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Request body is not valid JSON. Pleas"
+  },
+  {
+    "test": "wrong_field_type",
+    "status": 500,
+    "pass": true,
+    "body_preview": "Internal Server Error"
+  },
+  {
+    "test": "empty_messages",
+    "status": 200,
+    "pass": true,
+    "body_preview": "{\"id\":\"chatcmpl-0bd9300fd060\",\"object\":\"chat.completion\",\"created\":1791849885,\"model\":\"local-model\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"No messages in request. Please resend"
+  },
+  {
+    "test": "null_content",
+    "status": 200,
+    "pass": true,
+    "body_preview": "{\"id\":\"chatcmpl-8b2d67e559219be2\",\"object\":\"chat.completion\",\"created\":1791849885,\"model\":\"Qwen3.8-27B\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\\n\\nHi there! \ud83d\udc4b How can I help yo"
+  },
+  {
+    "test": "missing_model",
+    "status": 200,
+    "pass": true,
+    "body_preview": "{\"id\":\"chatcmpl-813e4ec0a7f3523a\",\"object\":\"chat.completion\",\"created\":1791849906,\"model\":\"Qwen3.8-27B\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\\n\\nHey! How's it going? What can"
+  },
+  {
+    "test": "negative_max_tokens",
+    "status": 200,
+    "pass": true,
+    "body_preview": "{\"id\":\"chatcmpl-b6b6a3648e66e6af\",\"object\":\"chat.completion\",\"created\":1791849928,\"model\":\"Qwen3.8-27B\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\\n\\nHi! How can I help you today?"
+  },
+  {
+    "test": "huge_max_tokens",
+    "status": 200,
+    "pass": true,
+    "body_preview": "{\"id\":\"chatcmpl-bddfb11e8ed596ad\",\"object\":\"chat.completion\",\"created\":1791849928,\"model\":\"Qwen3.8-27B\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\\n\\nHi there! How can I help you "
+  }
+]

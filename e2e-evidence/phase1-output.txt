@@ -1,0 +1,15 @@
+=== PHASE 1: BASELINE ===
+Timestamp: $(date)
+
+--- Health Check ---
+HTTP 200
+{"status":"ok","version":"1.0.0","sessions":0,"fd_count":22}
+
+--- Test Request (X-Session-ID: e2e-baseline-001) ---
+HTTP 200
+Model: Qwen3.8-27B
+Response: "Hello there friend."
+CtxGate: truncated=false, reason=ok
+Prompt tokens: 86, Completion tokens: 73, Total: 159
+
+=== PHASE 1 COMPLETE ===

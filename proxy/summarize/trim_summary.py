@@ -69,8 +69,8 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
                 role = m.get("role", "")
                 t = _mtext(m)
                 if role == "tool" and SUMMARY_TOOL_CAP_CHARS > 0 and len(t) > SUMMARY_TOOL_CAP_CHARS:
-                    omitted = len(t) - 1000
-                    t = t[:600] + "[..." + str(omitted) + " chars omitted...]" + t[-400:]
+                    omitted = len(t) - SUMMARY_TOOL_CAP_CHARS
+                    t = t[:int(SUMMARY_TOOL_CAP_CHARS * 0.6)] + "[..." + str(omitted) + " chars omitted...]" + t[-int(SUMMARY_TOOL_CAP_CHARS * 0.4):]
                 if role == "assistant":
                     tcs = m.get("tool_calls")
                     if tcs:
@@ -93,7 +93,7 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
             # SUMMARY_BACKFILL_CHARS env var retained for backward compat but its
             # skip behavior is removed.
 
-            per_cap = 500
+            per_cap = 5000
             def _build_chunks(cap):
                 chunks = []
                 cur = []

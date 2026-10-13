@@ -70,7 +70,7 @@ OUTAGE_TTL = float(os.environ.get("CTXGATE_WORKER_OUTAGE_TTL", "1800"))
 CONSUMERS = int(os.environ.get("CTXGATE_WORKER_CONSUMERS", "4"))
 # No BASE_URL needed: Mistral is a cloud API (no local model management)
 # Generation settings (memory LLM = Mistral). Low temperature for extraction.
-TEMP = float(os.environ.get("CTXGATE_WORKER_TEMP", "0.1"))
+TEMP = float(os.environ.get("CTXGATE_WORKER_TEMP", "0.3"))
 TOP_P = 0.9
 MAX_TOKENS = int(os.environ.get("CTXGATE_WORKER_MAX_TOKENS", "2048"))
 # Per-call timeout (matches the proxy's MISTRAL_TIMEOUT)

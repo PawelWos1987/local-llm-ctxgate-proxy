@@ -51,7 +51,7 @@ from proxy.resilience.breaker import _CircuitBreaker, _BreakerOpen, _check_vllm_
 from proxy.resilience.rate_limit import _TokenBucket, _get_tenant_rate_limiter, _get_tenant_semaphore  # noqa: F401
 from proxy.window.state import _norm_content, _msg_anchor, _seed_sig, _newest_user_idx, _strip_proxy_metadata, _NOTE_TOK_CACHE  # noqa: F401
 from proxy.window.cut import _eviction_trigger, _trim_target, _turn_groups, _safe_cut, _recut_to, _recut, _kept_messages, _is_context_length_error  # noqa: F401
-from proxy.window.budget import _safe_admitted_budget, _output_budget, estimate_full_payload_tokens  # noqa: F401
+from proxy.window.budget import _output_budget, estimate_full_payload_tokens  # noqa: F401
 from proxy.window.elide import _elided_tool_content, _stable_elide_inplace, _stable_elide_idx  # noqa: F401
 from proxy.window.shrink import ContextCapacityError, _emergency_shrink, _protected_indices  # noqa: F401
 from proxy.window.invariants import verify_context_invariants, _validate_outgoing_payload, _live_prompt_identity  # noqa: F401
@@ -182,6 +182,7 @@ metrics: dict = {
         "knowledge": 0, "phase": 0, "root": 0, "other": 0,
     },
     "recut_user_pinned": 0,
+    "recut_overshoot_guard": 0,
     "emergency_shrink_total": 0,
     "emergency_shrink_groups_dropped": 0,
     "inject_skipped_stale_user": 0,
@@ -259,9 +260,190 @@ _session_tenant: dict = {}
 # --- FastAPI app ---
 app = FastAPI(title="local-llm-ctxgate-proxy", version="1.0.0", lifespan=lifespan)
 
+# --- Global Exception Handler (sanitized 500s, no stack traces exposed) ---
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Catch-all: returns sanitized 500 JSON, logs full trace server-side."""
+    import uuid as _uuid
+    req_id = getattr(request.state, "request_id", None) or str(_uuid.uuid4())
+    log.error("UNHANDLED EXCEPTION [%s]: %s: %s", req_id, type(exc).__name__, str(exc), exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": {
+                "message": "Internal server error",
+                "type": "internal_error",
+                "request_id": req_id,
+            }
+        },
+    )
+
+
+
+
+# --- Request ID Middleware ---
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    """Assign a unique request ID to every incoming request for tracing."""
+    import uuid as _uuid
+    request_id = request.headers.get("X-Request-ID") or str(_uuid.uuid4())
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 
 # --- Route registration ---
 app.get("/health")(health)
+
+@app.get("/status")
+def status() -> dict[str, Any]:
+    """Comprehensive configuration and runtime state documentation endpoint."""
+    import time as _time
+    from proxy.config.docs import (
+        ENV_VAR_DESCRIPTIONS,
+        CONSTANT_DESCRIPTIONS,
+        COMPUTED_DESCRIPTIONS,
+        FIXED_VALUE_DESCRIPTIONS,
+    )
+    import os as _os
+
+    def _type_name(val: Any) -> str:
+        if isinstance(val, bool):
+            return "bool"
+        if isinstance(val, int):
+            return "int"
+        if isinstance(val, float):
+            return "float"
+        return "str"
+
+    # --- environment_variables section ---
+    env_entries: list[dict[str, Any]] = []
+    for var_name, desc in sorted(ENV_VAR_DESCRIPTIONS.items()):
+        raw_val = _os.environ.get(var_name)
+        # Try to determine the type from the constant module
+        mod_val = None
+        try:
+            from proxy.config import constants as _c
+            mod_val = getattr(_c, var_name, None)
+        except Exception:
+            pass
+
+        if mod_val is not None:
+            value = mod_val
+            default = None  # defaults are complex (computed); omit for simplicity
+            tname = _type_name(mod_val)
+        elif raw_val is not None:
+            # Infer type from string
+            try:
+                value = int(raw_val)
+                tname = "int"
+            except ValueError:
+                try:
+                    value = float(raw_val)
+                    tname = "float"
+                except ValueError:
+                    if raw_val.lower() in ("true", "false"):
+                        value = raw_val.lower() == "true"
+                        tname = "bool"
+                    else:
+                        value = raw_val
+                        tname = "str"
+            default = None
+        else:
+            value = None
+            tname = "unknown"
+            default = None
+
+        entry: dict[str, Any] = {
+            "name": var_name,
+            "value": value,
+            "type": tname,
+            "source": "env_var",
+            "description": desc,
+        }
+        if default is not None:
+            entry["default"] = default
+        env_entries.append(entry)
+
+    # --- constants section ---
+    const_entries: list[dict[str, Any]] = []
+    from proxy.config import constants as _const_mod
+    for cname, cdesc in sorted(CONSTANT_DESCRIPTIONS.items()):
+        try:
+            cval = getattr(_const_mod, cname, None)
+        except Exception:
+            cval = None
+        if cval is None:
+            continue
+        # Skip module-level imports (json, os, uuid, annotations)
+        if hasattr(cval, '__file__') or hasattr(cval, '__module__'):
+            continue
+        entry_c: dict[str, Any] = {
+            "name": cname,
+            "value": cval,
+            "type": _type_name(cval),
+            "source": "constant",
+            "description": cdesc,
+        }
+        const_entries.append(entry_c)
+
+    # --- computed_values section ---
+    comp_entries: list[dict[str, Any]] = []
+    computed_map = {
+        "trim_target": _trim_target(),
+        "eviction_trigger": _eviction_trigger(),
+        "effective_max_input": MAX_INPUT,
+    }
+    for comp_name, comp_desc in sorted(COMPUTED_DESCRIPTIONS.items()):
+        val = computed_map.get(comp_name)
+        if val is None:
+            continue
+        entry_comp: dict[str, Any] = {
+            "name": comp_name,
+            "value": val,
+            "type": _type_name(val),
+            "source": "computed",
+            "description": comp_desc,
+        }
+        comp_entries.append(entry_comp)
+
+    # --- fixed_values section ---
+    fixed_entries: list[dict[str, Any]] = []
+    # These are hardcoded in resilience/breaker and streaming modules
+    fixed_map: dict[str, Any] = {}
+    try:
+        from proxy.resilience.breaker import _vllm_breaker
+        fixed_map["breaker_failure_threshold"] = getattr(_vllm_breaker, "failure_threshold", 5)
+        fixed_map["breaker_cooldown_seconds"] = getattr(_vllm_breaker, "cooldown_seconds", 30)
+    except Exception:
+        fixed_map["breaker_failure_threshold"] = 5
+        fixed_map["breaker_cooldown_seconds"] = 30
+    fixed_map["httpx_connect_timeout"] = 10
+    fixed_map["httpx_read_timeout"] = 300
+    fixed_map["sse_keepalive_interval"] = SSE_HEARTBEAT_INTERVAL
+
+    for fx_name, fx_desc in sorted(FIXED_VALUE_DESCRIPTIONS.items()):
+        val = fixed_map.get(fx_name)
+        if val is None:
+            continue
+        entry_fx: dict[str, Any] = {
+            "name": fx_name,
+            "value": val,
+            "type": _type_name(val),
+            "source": "fixed",
+            "description": fx_desc,
+        }
+        fixed_entries.append(entry_fx)
+
+    return {
+        "service": "ctxgate-proxy",
+        "uptime_seconds": round(_time.time() - metrics["started_at"], 1),
+        "environment_variables": env_entries,
+        "constants": const_entries,
+        "computed_values": comp_entries,
+        "fixed_values": fixed_entries,
+    }
 app.get("/metrics", dependencies=[Depends(require_admin)])(get_metrics)
 app.get("/ready")(ready)
 app.get("/metrics/prometheus", dependencies=[Depends(require_admin)])(metrics_prometheus)

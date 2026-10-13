@@ -17,7 +17,7 @@ async def _fire_and_forget_extract(session_id: str, session_key: str, messages: 
     from proxy.memory.store import store_knowledge
     from proxy.lm.call import _EXTRACT_SEM
     # Kill switch (read at call time so it can be toggled via env without restart)
-    if os.environ.get("CTXGATE_KNOWLEDGE_EXTRACT", "1") == "0":
+    if os.environ.get("CTXGATE_KNOWLEDGE_EXTRACT", "0") == "0":
         return
     # Newest-user-message anchor (None => trivial/short turn, not worth it)
     anchor = _newest_user_anchor(messages)

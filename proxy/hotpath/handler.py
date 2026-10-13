@@ -8,17 +8,18 @@ from fastapi.responses import JSONResponse
 
 from proxy.config import (
     CTXGATE_TENANT_RATE_PER_SEC, CTXGATE_TENANT_MAX_CONCURRENCY,
-    CTXGATE_INPUT_ESTIMATE_HEADROOM, CTXGATE_PROACTIVE_TRIM_FRAC,
+    CTXGATE_PROACTIVE_TRIM_FRAC,
     MAX_BODY_BYTES, MAX_INPUT, MAX_CONTEXT, SAFETY_MARGIN, MAX_OUTPUT,
+    MAX_REASONING_TOKENS,
     TRIM_TARGET_TOKENS, TRIM_TARGET_FRACTION, TRIM_TARGET_FLOOR,
     VLLM_MODEL,
 )
 from proxy.token.calibrator import calibrator
 from proxy.token.counter import _rho_var, count_messages_tokens
-from proxy.window.budget import estimate_full_payload_tokens, _output_budget, _safe_admitted_budget
+from proxy.window.budget import estimate_full_payload_tokens, _output_budget
 from proxy.window.invariants import _live_prompt_identity
 from proxy.window.shrink import ContextCapacityError, _emergency_shrink
-from proxy.window.cut import _trim_target
+from proxy.window.cut import _trim_target, _hard_cut_to
 from proxy.streaming import stream_to_vllm, stream_to_vllm_passthrough
 from proxy.streaming import forward_to_vllm, forward_to_vllm_passthrough
 from proxy.resilience.rate_limit import _get_tenant_rate_limiter, _get_tenant_semaphore
@@ -106,7 +107,7 @@ def _invalidate_baseline(session_key: str):
 
 
 def _full_context_reset(messages: list) -> list:
-    """Reduce to ONLY system prompt + last user message.
+    """Reduce to minimal viable context: system + first user + last user.
 
     The proxy is the sole context manager. It never asks goose to compact.
     Nuclear option when progressive trimming has failed.
@@ -115,11 +116,20 @@ def _full_context_reset(messages: list) -> list:
     user_msgs = [m for m in messages if m.get("role") == "user"]
     if not user_msgs:
         return messages[:1] if messages else messages
-    return system_msgs + [user_msgs[-1]]
+    result = list(system_msgs)
+    result.append(user_msgs[0])  # first user msg = task origin
+    if len(user_msgs) > 1:
+        result.append(user_msgs[-1])  # last user msg = current prompt
+    return result
 
 
-def _aggressive_trim(built: list, target_tokens: int, session_key: str) -> list:
+def _aggressive_trim(built: list, target_tokens: int, session_key: str,
+                   total_input_tokens: int | None = None) -> list:
     """Aggressively trim a built context to fit within target_tokens.
+
+    When total_input_tokens is provided (including injected context overhead),
+    the effective target for raw message tokens is reduced by that overhead.
+    This ensures trimming accounts for the FULL payload size, not just messages.
 
     Strategy:
     1. Try emergency_shrink with aggressive=True (drops tool groups)
@@ -129,23 +139,33 @@ def _aggressive_trim(built: list, target_tokens: int, session_key: str) -> list:
     After trimming, invalidates the calibrator baseline so re-estimation
     uses the cold path (actual content size, not stale baseline).
     """
+    # Account for injected context: the target must be met by RAW message
+    # tokens such that raw + injected <= target_tokens overall.
+    inject_overhead = 0
+    if total_input_tokens is not None:
+        msg_tok_now = count_messages_tokens(built)
+        inject_overhead = max(0, total_input_tokens - msg_tok_now)
+    effective_target = max(1, target_tokens - inject_overhead)
+
     current_tokens = count_messages_tokens(built)
-    if current_tokens <= target_tokens:
-        # Even though messages fit, the calibrator baseline may be stale
-        # (e.g., from a pre-shrink vLLM response). Invalidate it so the
-        # next estimate_full_payload_tokens uses the cold path.
+    if current_tokens <= effective_target:
+        # Even though messages fit (after accounting for injection),
+        # the calibrator baseline may be stale (e.g., from a pre-shrink
+        # vLLM response). Invalidate it so the next
+        # estimate_full_payload_tokens uses the cold path.
         _invalidate_baseline(session_key)
         return built
 
-    log.info("AGGRESSIVE TRIM: session=%s current=%d target=%d msgs=%d",
-             session_key, current_tokens, target_tokens, len(built))
+    log.info("AGGRESSIVE TRIM: session=%s current=%d eff_target=%d (target=%d inject_ovhd=%d) msgs=%d",
+             session_key, current_tokens, effective_target, target_tokens, inject_overhead, len(built))
 
     # Step 1: aggressive emergency shrink (unprotects tool groups)
     try:
-        trimmed = _emergency_shrink(built, target_tokens, aggressive=True)
+        trimmed = _emergency_shrink(built, effective_target, aggressive=True)
         trimmed_tokens = count_messages_tokens(trimmed)
-        if trimmed_tokens <= target_tokens:
-            log.info("AGGRESSIVE TRIM: success (aggressive) %d -> %d tokens", current_tokens, trimmed_tokens)
+        if trimmed_tokens <= effective_target:
+            log.info("AGGRESSIVE TRIM: success (aggressive) %d -> %d tokens (eff_target=%d)",
+                     current_tokens, trimmed_tokens, effective_target)
             _invalidate_baseline(session_key)
             return trimmed
     except ContextCapacityError:
@@ -153,21 +173,25 @@ def _aggressive_trim(built: list, target_tokens: int, session_key: str) -> list:
 
     # Step 2: with injection pruning
     try:
-        trimmed = _emergency_shrink(built, target_tokens, aggressive=True, allow_injection_prune=True)
+        trimmed = _emergency_shrink(built, effective_target, aggressive=True, allow_injection_prune=True)
         trimmed_tokens = count_messages_tokens(trimmed)
-        if trimmed_tokens <= target_tokens:
-            log.info("AGGRESSIVE TRIM: success (injection_prune) %d -> %d tokens", current_tokens, trimmed_tokens)
+        if trimmed_tokens <= effective_target:
+            log.info("AGGRESSIVE TRIM: success (injection_prune) %d -> %d tokens (eff_target=%d)",
+                     current_tokens, trimmed_tokens, effective_target)
             _invalidate_baseline(session_key)
             return trimmed
     except ContextCapacityError:
         pass
 
-    # Step 3: nuclear - system + last user message only
-    log.warning("AGGRESSIVE TRIM: nuclear (system + last user) session=%s", session_key)
+    # Step 3: nuclear - minimal viable context (system + first user + last user + memories)
+    log.warning("AGGRESSIVE TRIM: nuclear (minimal viable) session=%s", session_key)
     system_msgs = [m for m in built if m.get("role") == "system"]
     user_msgs = [m for m in built if m.get("role") == "user"]
+    trimmed = list(system_msgs)
     if user_msgs:
-        trimmed = system_msgs + [user_msgs[-1]]
+        trimmed.append(user_msgs[0])  # first user msg = task origin
+        if len(user_msgs) > 1:
+            trimmed.append(user_msgs[-1])  # last user msg = current prompt
     else:
         trimmed = built[:1] if built else []
     trimmed_tokens = count_messages_tokens(trimmed)
@@ -245,8 +269,22 @@ async def chat_completions(request: Request):
             _sem = _get_tenant_semaphore(tenant_id)
             _sem_acquired = False
             try:
-                await asyncio.wait_for(_sem.acquire(), timeout=60)
+                await asyncio.wait_for(_sem.acquire(), timeout=30)
                 _sem_acquired = True
+            except asyncio.TimeoutError:
+                log.warning("CONCURRENCY LIMIT REACHED: tenant=%s sem_full after 30s", tenant_id)
+                metrics["concurrency_limit_reached"] = metrics.get("concurrency_limit_reached", 0) + 1
+                return JSONResponse(
+                    status_code=503,
+                    headers={"Retry-After": "5"},
+                    content={
+                        "error": {
+                            "message": "Server busy, please retry shortly",
+                            "type": "overloaded",
+                            "retry_after": 5,
+                        }
+                    },
+                )
             except asyncio.TimeoutError:
                 # Proceed without slot - serve slowly rather than reject
                 log.warning("Concurrency: tenant=%s 60s timeout - proceeding", tenant_id)
@@ -318,9 +356,39 @@ async def chat_completions(request: Request):
                 log.info("Capacity recovered via full reset: session=%s", session_key)
                 _invalidate_baseline(session_key)
             except ContextCapacityError as cce2:
-                log.error("Capacity unrecoverable: %s", cce2)
-                return _minimal_valid_response("context_capacity",
-                    content="Context too large even after reset. Please start a new session.")
+                log.error("Capacity unrecoverable via reset: %s", cce2)
+                # Last-resort recovery: hard-cut/truncate messages to fit budget
+                try:
+                    _safe_max = MAX_INPUT
+                    _orig_tokens = estimate_full_payload_tokens(
+                        _reset_msgs, body.get("tools", []), 0, session_key)
+                    _msgs_copy = [dict(m) for m in _reset_msgs]
+                    _hard_cut_to(_msgs_copy, _orig_tokens, _safe_max)
+                    # If hard cut removed whole messages but content is still over,
+                    # truncate content proportionally (preserves beginning)
+                    _post_tokens = estimate_full_payload_tokens(
+                        _msgs_copy, body.get("tools", []), 0, session_key)
+                    if _post_tokens > _safe_max and _msgs_copy:
+                        _ratio = (_safe_max * 0.95) / _post_tokens
+                        for _m in _msgs_copy:
+                            _c = _m.get("content", "")
+                            if isinstance(_c, str) and len(_c) > 100:
+                                _m["content"] = _c[:int(len(_c) * _ratio)]
+                        _post_tokens = estimate_full_payload_tokens(
+                            _msgs_copy, body.get("tools", []), 0, session_key)
+                    if _post_tokens <= _safe_max and any(
+                        m.get("content") for m in _msgs_copy):
+                        log.warning(
+                            "SINGLE_MSG_RECOVERY: session=%s original=%d tokens, truncated to ~%d",
+                            session_key, _orig_tokens, _post_tokens)
+                        built = _msgs_copy
+                        _invalidate_baseline(session_key)
+                    else:
+                        raise ValueError("Hard cut produced empty/too-small result")
+                except Exception as _recovery_err:
+                    log.error("Single-msg recovery failed: %s", _recovery_err)
+                    return _minimal_valid_response("context_capacity",
+                        content="Context too large even after reset. Please start a new session.")
         _dt = (time.monotonic() - _t0) * 1000
         if _dt > 50:
             log.warning("SLOW: build_context %.0fms (msgs=%d)", _dt, len(messages))
@@ -422,6 +490,20 @@ async def chat_completions(request: Request):
                 _disable_thinking = False  # will be set below if needed
                 _ws["live_prompt_hash"] = _current_live_hash
 
+        # Proactive thinking disable: when input exceeds MAX_INPUT, the model
+        # needs its full output budget for content. With thinking ON, it wastes
+        # ~90% of that budget on internal reasoning, leaving goose an empty response.
+        # Disable thinking so the model produces actual content.
+        # Disable thinking early: when input + expected reasoning tokens would
+        # consume most of the output budget, leave no room for visible content.
+        # Trigger threshold = MAX_INPUT - MAX_REASONING_TOKENS, so thinking is
+        # off before the model burns its entire budget on internal reasoning.
+        _think_trigger = MAX_INPUT
+        if not _disable_thinking and input_tokens > _think_trigger:
+            _disable_thinking = True
+            log.info("THINKING DISABLED: session=%s input=%d > trigger=%d (MAX_INPUT=%d - REASONING=%d)",
+                     session_key, input_tokens, _think_trigger, MAX_INPUT, MAX_REASONING_TOKENS)
+        
         # Output budget
         # When thinking is OFF, use full MAX_OUTPUT (respecting goose's request)
         # but cap by remaining context room to never exceed MAX_CONTEXT.
@@ -431,6 +513,18 @@ async def chat_completions(request: Request):
         else:
             _budget = _output_budget(input_tokens)
 
+        # === HARD CEILING ENFORCEMENT: never admit input exceeding safe budget ===
+        # MAX_INPUT is the authoritative input ceiling.
+        # If estimated input exceeds it, trim BEFORE the proactive trim logic below.
+        _safe_max_input = MAX_INPUT
+        if input_tokens > _safe_max_input:
+            log.warning("HARD CEILING: session=%s input=%d exceeds safe_max=%d, trimming",
+                        session_key, input_tokens, _safe_max_input)
+            _app.metrics["hard_ceiling_trim"] = _app.metrics.get("hard_ceiling_trim", 0) + 1
+            trimmed = _aggressive_trim(built, _safe_max_input, session_key, input_tokens)
+            built = trimmed
+            input_tokens = estimate_full_payload_tokens(built, body.get("tools", []), _note_n, session_key)
+        
         # === PROACTIVE TRIM: ensure input + output fits in context window ===
         # This is the KEY fix: BEFORE sending to vLLM, verify that
         # input_tokens + max_tokens <= MAX_CONTEXT. If not, trim aggressively.
@@ -444,7 +538,7 @@ async def chat_completions(request: Request):
             _app.metrics["proactive_trim"] = _app.metrics.get("proactive_trim", 0) + 1
 
             # Step 1: aggressive emergency shrink
-            trimmed = _aggressive_trim(built, max_allowed_input, session_key)
+            trimmed = _aggressive_trim(built, max_allowed_input, session_key, input_tokens)
             built = trimmed
             # Re-estimate with invalidated baseline (cold path = actual content)
             input_tokens = estimate_full_payload_tokens(built, body.get("tools", []), _note_n, session_key)
@@ -466,14 +560,35 @@ async def chat_completions(request: Request):
                 else:
                     _budget = _output_budget(input_tokens)
 
-            # Final check: if truly no room (system prompt too large), use minimum
+            # Final check: if truly no room, truncate content to fit
             if _budget < 1:
-                log.error("PROACTIVE TRIM: even nuclear reset leaves no room: session=%s input=%d max_ctx=%d",
-                          session_key, input_tokens, MAX_CONTEXT)
-                _budget = 1  # Force at least 1 token so vLLM can respond
-                _disable_thinking = True
-                if _ws is not None:
-                    _ws["thinking_disabled"] = True
+                log.warning("PROACTIVE TRIM: nuclear reset insufficient - attempting content truncation: session=%s input=%d max_ctx=%d",
+                            session_key, input_tokens, MAX_CONTEXT)
+                # Truncate message content proportionally to fit within max_allowed_input
+                _truncated_any = False
+                for _m in built:
+                    _c = _m.get("content", "")
+                    if isinstance(_c, str) and len(_c) > 100:
+                        _ratio = max(0.05, (max_allowed_input * 0.9) / max(input_tokens, 1))
+                        _m["content"] = _c[:int(len(_c) * _ratio)]
+                        _truncated_any = True
+                if _truncated_any:
+                    _invalidate_baseline(session_key)
+                    _live_prompt_hash = _live_prompt_identity(built)
+                    input_tokens = estimate_full_payload_tokens(built, body.get("tools", []), _note_n, session_key)
+                    if _disable_thinking:
+                        _budget = min(MAX_OUTPUT, MAX_CONTEXT - input_tokens - SAFETY_MARGIN)
+                    else:
+                        _budget = _output_budget(input_tokens)
+                    log.warning("PROACTIVE TRIM: content truncated session=%s new_input=%d budget=%d",
+                                session_key, input_tokens, _budget)
+                if _budget < 1:
+                    log.error("PROACTIVE TRIM: even content truncation leaves no room: session=%s input=%d max_ctx=%d",
+                              session_key, input_tokens, MAX_CONTEXT)
+                    _budget = 1  # Absolute last resort
+                    _disable_thinking = True
+                    if _ws is not None:
+                        _ws["thinking_disabled"] = True
 
             log.info("PROACTIVE TRIM: resolved session=%s input=%d budget=%d", session_key, input_tokens, _budget)
 
@@ -523,7 +638,7 @@ async def chat_completions(request: Request):
 
             # Trim more aggressively: reduce input to leave more room for output
             max_allowed_input = MAX_CONTEXT - MAX_OUTPUT - SAFETY_MARGIN
-            trimmed = _aggressive_trim(built, max_allowed_input, session_key)
+            trimmed = _aggressive_trim(built, max_allowed_input, session_key, input_tokens)
             if trimmed is not built:  # Actually trimmed something
                 built = trimmed
                 input_tokens = estimate_full_payload_tokens(built, body.get("tools", []), _note_n, session_key)
@@ -538,6 +653,28 @@ async def chat_completions(request: Request):
                 log.info("EMPTY RESPONSE RETRY: session=%s input=%d max=%d msgs=%d",
                          session_key, input_tokens, max_tokens, len(built))
                 result = await _forward_to_vllm(vllm_body, input_tokens, session_key, _client_cap, _live_prompt_hash)
+
+        # === FINISH_REASON=LENGTH HANDLING: deliver partial content with marker ===
+        if result is not None and not stream and isinstance(result, JSONResponse):
+            try:
+                import json as _json_fr
+                _fr_data = _json_fr.loads(result.body)
+                _fr_choices = _fr_data.get('choices', [])
+                if _fr_choices:
+                    _fr = _fr_choices[0].get('finish_reason')
+                    if _fr == 'length':
+                        log.warning('FINISH_REASON_LENGTH: session=%s delivering partial response', session_key)
+                        _app.metrics['finish_length_partial'] = _app.metrics.get('finish_length_partial', 0) + 1
+                        _fr_msg = _fr_choices[0].get('message', {})
+                        _fr_content = _fr_msg.get('content', '') or ''
+                        _fr_msg['content'] = _fr_content + '\n\n[TRUNCATED: response hit max_tokens limit. Content may be incomplete.]'
+                        _fr_data['choices'][0]['message'] = _fr_msg
+                        _new_body = _json_fr.dumps(_fr_data).encode()
+                        result.body = _new_body
+                        result.headers['content-length'] = str(len(_new_body))
+            except Exception:
+                pass  # Non-fatal: deliver as-is if parsing fails
+        
 
             # If STILL empty after retry, try full context reset
             if result is not None and _is_empty_completion(result):

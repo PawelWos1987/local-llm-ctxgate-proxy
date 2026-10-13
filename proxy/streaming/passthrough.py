@@ -47,6 +47,7 @@ async def forward_to_vllm_passthrough(vllm_body: dict,
         _app._check_vllm_breaker()
         body = {k: v for k, v in vllm_body.items()
                 if not k.startswith("_ctxgate_")}
+        _serialized = json.dumps(body); log.warning("OUTBOUND_BODY: session=%s bytes=%d chars=%d", session_key, len(_serialized.encode('utf-8')), len(_serialized))
         resp = await client.post(
             VLLM_URL + "/chat/completions", json=body)
         if resp.status_code != 200:

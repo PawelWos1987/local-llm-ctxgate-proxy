@@ -40,7 +40,7 @@ async def fetch_task_memory(session_id: str, messages: list, task_uuid: str = No
             rows = await pool.fetch(
                 "SELECT id, key, value, category, importance, updated_at FROM proxy.memories "
                 "WHERE task_id=$1 AND active=true "
-                "AND category IN ('DECISION','FAILURE','MILESTONE') "
+                "AND category IN ('DECISION','FAILURE','MILESTONE','TODO') "
                 "ORDER BY updated_at ASC LIMIT 20",
                 task_uuid
             )
