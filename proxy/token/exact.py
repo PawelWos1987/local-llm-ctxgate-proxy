@@ -46,13 +46,44 @@ def _get_tokenizer(model_name: str):
     return _tokenizer
 
 
+
+def _sanitize_for_template(messages: list[dict]) -> list[dict]:
+    """Strip non-standard keys from messages before applying chat template.
+
+    Qwen3 Jinja templates iterate over msg.items() and choke on non-string
+    values like _tokens (int). We keep only the standard chat-template keys.
+    """
+    allowed = {'role', 'content', 'tool_calls', 'name', 'tool_call_id'}
+    cleaned = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        entry = {k: v for k, v in m.items() if k in allowed}
+        c = entry.get('content')
+        if c is None:
+            entry['content'] = ''
+        elif isinstance(c, list):
+            parts = []
+            for p in c:
+                if isinstance(p, dict):
+                    parts.append(str(p.get('text', '')))
+                elif isinstance(p, str):
+                    parts.append(p)
+            entry['content'] = ' '.join(parts)
+        elif not isinstance(c, str):
+            entry['content'] = str(c)
+        cleaned.append(entry)
+    return cleaned
+
+
 def exact_count_messages(messages: list[dict], model_name: str) -> int:
     """Count EXACT tokens for a list of chat messages using the model tokenizer.
 
     Applies the chat template to get the true prompt that will be sent.
     """
     tok = _get_tokenizer(model_name)
-    rendered = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    cleaned = _sanitize_for_template(messages)
+    rendered = tok.apply_chat_template(cleaned, tokenize=False, add_generation_prompt=True)
     ids = tok.encode(rendered, add_special_tokens=False)
     return len(ids)
 

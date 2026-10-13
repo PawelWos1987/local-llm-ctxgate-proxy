@@ -55,11 +55,15 @@ def _protected_indices(work: list, aggressive: bool = False) -> set:
 def _truncate_message_content(msg: dict, max_tokens: int) -> dict:
     """Truncate a message's content to fit within max_tokens.
     Returns a new dict with truncated content. Only works on string content."""
+    if max_tokens is None:
+        max_tokens = 0
+    max_tokens = max(1, int(max_tokens))
+
     content = msg.get("content")
     if not isinstance(content, str):
         return msg
     # Rough estimate: 1 token ~= 4 chars for English text
-    max_chars = max_tokens * 4
+    max_chars = max(1, int(max_tokens * 4))
     if len(content) <= max_chars:
         return msg
     truncated = content[:max_chars] + "\n[... truncated by ctxgate ...]"
