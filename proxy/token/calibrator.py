@@ -55,6 +55,11 @@ class Calibrator:
         """No-op in exact mode."""
         pass
 
+    @property
+    def ratio(self) -> float:
+        """Exact-mode ratio. Always 1.0 since we use Gigatoken."""
+        return 1.0
+
     def get_last_real(self, session_key: str) -> int:
         """Return the last observed real token count for this session."""
         stats = self._sessions.get(session_key)

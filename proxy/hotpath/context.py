@@ -6,7 +6,7 @@ import time
 from proxy.config import STABLE_ELIDE, MAX_INPUT, MAX_CONTEXT, SAFETY_MARGIN, MAX_OUTPUT, VLLM_MODEL
 from proxy.token.calibrator import calibrator
 # _rho_var removed: using exact gigatoken counting
-from proxy.token.exact import exact_count_messages
+from proxy.token.exact import exact_count_messages, exact_count_string
 from proxy.window import (
     _window_valid, _newest_user_idx, _stable_elide_idx, _stable_elide_inplace,
     _seed_sig, _new_window_state, _recut, _kept_messages,
@@ -241,6 +241,8 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
                     return kept, vllm_send_tokens
         # SLOW PATH: no valid state (or kept over limit) -> full count + re-cut.
         messages = _prep_messages(raw)
+        # Progressive truncation: trim oversized newest user message before pipeline
+        _truncate_long_user_message(messages, MAX_INPUT)
         if messages and messages[0].get("role") == "system":
             seed = [messages[0]]
             rest = messages[1:]
@@ -370,3 +372,66 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
             post_cut_estimate = exact_count_messages(kept, VLLM_MODEL)  # [RULE 3: post-cut]
         
         return kept, post_cut_estimate
+
+
+def _truncate_long_user_message(messages: list, ceiling: int) -> None:
+    """Progressively truncate the newest user message if it alone would
+    push protected material past the ceiling.
+
+    Removes trailing lines (last line first) until the total fits.
+    Always preserves at least the first line. Modifies *messages* in place.
+    """
+    if len(messages) < 2:
+        return
+
+    # Find the newest user message
+    newest_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "user":
+            newest_idx = i
+            break
+    if newest_idx is None:
+        return
+
+    msg = messages[newest_idx]
+    content = msg.get("content", "")
+    if not isinstance(content, str) or not content.strip():
+        return
+
+    # Fixed overhead = tokens for everything EXCEPT the newest user message
+    others = [m for j, m in enumerate(messages) if j != newest_idx]
+    overhead = exact_count_messages(others, VLLM_MODEL) if others else 0
+
+    # Budget available for the newest user message
+    budget = ceiling - overhead
+    if budget <= 0:
+        return  # Can't help; let emergency shrink handle it
+
+    msg_tokens = exact_count_string(content, VLLM_MODEL)
+    if msg_tokens <= budget:
+        return  # Fits fine, no truncation needed
+
+    # Progressive truncation: keep first line, add lines forward until budget met
+    lines = content.splitlines()
+    if len(lines) <= 1:
+        return  # Single line; cannot truncate further
+
+    kept = [lines[0]]
+    cur = lines[0]
+    for ln in lines[1:]:
+        candidate = cur + "\n" + ln
+        if exact_count_string(candidate, VLLM_MODEL) > budget:
+            break
+        kept.append(ln)
+        cur = candidate
+
+    new_content = "\n".join(kept)
+    removed = len(lines) - len(kept)
+    new_tokens = exact_count_string(new_content, VLLM_MODEL)
+
+    msg["content"] = new_content
+    log.warning(
+        "LONG INPUT TRUNCATED: removed %d trailing lines from newest user "
+        "message (was %d tokens, now %d tokens, budget %d)",
+        removed, msg_tokens, new_tokens, budget,
+    )
