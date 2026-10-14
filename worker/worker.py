@@ -183,6 +183,7 @@ pending_jobs_cache: int = 0  # cached count of pending jobs (updated by poll loo
 # Throttling / context tracking
 lm_requests: list = []  # timestamps of completed LM calls (for RPM)
 lm_context_tokens: list = []  # context token counts per request
+_active_consumers: dict = {}  # maps consumer_id -> state (job info, idle, error)
 lm_total_tokens_in: int = 0  # cumulative input tokens
 lm_total_tokens_out: int = 0  # cumulative output tokens
 lm_last_latency_ms: float = 0.0  # most recent call latency
