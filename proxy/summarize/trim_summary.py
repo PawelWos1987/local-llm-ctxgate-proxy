@@ -1,10 +1,77 @@
 """Summarization of trimmed conversation messages."""
-import hashlib
 import asyncio
 import json
 
 _trim_summary_last: dict = {}  # task_uuid -> timestamp of last stored summary
 
+
+def _msg_text(m) -> str:
+    """Extract plain text from a message's content field (handles list-of-parts)."""
+    c = m.get("content", "")
+    if isinstance(c, list):
+        c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
+    return c or ""
+
+
+def _role_capped_msg_text(m) -> str:
+    """Role-aware text for the summarizer chunk. Caps tool output
+    and assistant tool_call args; leaves user/assistant text alone.
+    Never mutates the real message dict."""
+    from proxy.config.constants import SUMMARY_TOOL_CAP_CHARS
+    role = m.get("role", "")
+    t = _msg_text(m)
+    if role == "tool" and SUMMARY_TOOL_CAP_CHARS > 0 and len(t) > SUMMARY_TOOL_CAP_CHARS:
+        omitted = len(t) - SUMMARY_TOOL_CAP_CHARS
+        t = t[:int(SUMMARY_TOOL_CAP_CHARS * 0.6)] + "[..." + str(omitted) + " chars omitted...]" + t[-int(SUMMARY_TOOL_CAP_CHARS * 0.4):]
+    if role == "assistant":
+        tcs = m.get("tool_calls")
+        if tcs:
+            parts = []
+            for tc in tcs:
+                fn = tc.get("function", {})
+                name = fn.get("name", "?")
+                args = fn.get("arguments", "")
+                if isinstance(args, dict):
+                    args = json.dumps(args)
+                if len(args) > 300:
+                    args = args[:300] + "..."
+                parts.append("[tool_call:" + name + "(" + args + ")]")
+            if parts:
+                t = t + " " + " ".join(parts)
+    return t
+
+
+def _build_summarizer_chunks(slice_msgs: list, cap: int) -> list[str]:
+    """Build text chunks from messages, respecting per-message cap and SUMMARY_CHUNK_CHARS boundary."""
+    from proxy.config.constants import SUMMARY_CHUNK_CHARS, SUMMARY_TOOL_CAP_CHARS
+    chunks = []
+    cur = []
+    cur_len = 0
+    for m in slice_msgs:
+        t = _role_capped_msg_text(m)
+        # A tool message already role-capped to SUMMARY_TOOL_CAP_CHARS is
+        # left as-is (the role cap is authoritative for tool output); the
+        # generic per-message cap only applies to non-role-capped text.
+        _role_capped = (m.get("role") == "tool" and SUMMARY_TOOL_CAP_CHARS > 0
+                        and len(_msg_text(m)) > SUMMARY_TOOL_CAP_CHARS)
+        # BUG 3: keep head (60%) + tail (40%) of the per-message cap
+        # so tool outputs' results (usually at the tail) are not lost.
+        if not _role_capped and len(t) > cap:
+            _head = int(cap * 0.6)
+            _tail = cap - _head
+            t = t[:_head] + " ...[truncated]... " + t[-_tail:]
+        line = str(m.get("role", "?")) + ": " + t
+        if not line.strip():
+            continue
+        if cur and cur_len + len(line) + 1 > SUMMARY_CHUNK_CHARS:
+            chunks.append("\n".join(cur))
+            cur = []
+            cur_len = 0
+        cur.append(line)
+        cur_len += len(line) + 1
+    if cur:
+        chunks.append("\n".join(cur))
+    return chunks
 
 
 async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name: str = "", pending_cut: int = None):
@@ -19,15 +86,24 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
     on a later request. A brand-new / pre-change session (no watermark) backfills
     only the NEWEST SUMMARY_BACKFILL_CHARS of the dropped region, in order.
     """
-    from proxy.app import log, metrics, pool, session_compactions, _summary_task_locks, _summary_last_attempt, _slice_log  # TODO(I4): replace with AppContext
-    from proxy.config.constants import RHO_COLD, SUMMARY_CHUNK_CHARS, SUMMARY_MAX_CHUNKS, SUMMARY_TOOL_CAP_CHARS
+    import time
+
+    from proxy.app import (  # TODO(I4): replace with AppContext
+        _slice_log,
+        _summary_last_attempt,
+        _summary_task_locks,
+        log,
+        metrics,
+        pool,
+        session_compactions,
+    )
+    from proxy.config.constants import SUMMARY_MAX_CHUNKS
     from proxy.ledger.extract import _extract_ledger_entries
     from proxy.ledger.persist import _persist_ledger_entries
     from proxy.lm.call import _call_4b
     from proxy.summarize.digest import _build_session_digest
     from proxy.summarize.slices import _enqueue_context_slices
     from proxy.window.persist import _window_persist
-    import time
     global _summary_last_attempt
     if not pool or not rest:
         return
@@ -54,80 +130,19 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
             if not slice_msgs:
                 return
 
-            def _mtext(m):
-                c = m.get("content", "")
-                if isinstance(c, list):
-                    c = " ".join(p.get("text", "") for p in c if isinstance(p, dict))
-                return c or ""
-
-            def _role_capped_text(m):
-                """Role-aware text for the summarizer chunk. Caps tool output
-                and assistant tool_call args; leaves user/assistant text alone.
-                Never mutates the real message dict."""
-                role = m.get("role", "")
-                t = _mtext(m)
-                if role == "tool" and SUMMARY_TOOL_CAP_CHARS > 0 and len(t) > SUMMARY_TOOL_CAP_CHARS:
-                    omitted = len(t) - SUMMARY_TOOL_CAP_CHARS
-                    t = t[:int(SUMMARY_TOOL_CAP_CHARS * 0.6)] + "[..." + str(omitted) + " chars omitted...]" + t[-int(SUMMARY_TOOL_CAP_CHARS * 0.4):]
-                if role == "assistant":
-                    tcs = m.get("tool_calls")
-                    if tcs:
-                        parts = []
-                        for tc in tcs:
-                            fn = tc.get("function", {})
-                            name = fn.get("name", "?")
-                            args = fn.get("arguments", "")
-                            if isinstance(args, dict):
-                                args = json.dumps(args)
-                            if len(args) > 300:
-                                args = args[:300] + "..."
-                            parts.append("[tool_call:" + name + "(" + args + ")]")
-                        if parts:
-                            t = t + " " + " ".join(parts)
-                return t
-
             # All text is processed - no skipping. If a slice exceeds max size,
-            # it is split into more chunks (handled by _build_chunks below).
+            # it is split into more chunks (handled by _build_summarizer_chunks below).
             # SUMMARY_BACKFILL_CHARS env var retained for backward compat but its
             # skip behavior is removed.
 
             per_cap = 5000
-            def _build_chunks(cap):
-                chunks = []
-                cur = []
-                cur_len = 0
-                for m in slice_msgs:
-                    t = _role_capped_text(m)
-                    # A tool message already role-capped to SUMMARY_TOOL_CAP_CHARS is
-                    # left as-is (the role cap is authoritative for tool output); the
-                    # generic per-message cap only applies to non-role-capped text.
-                    _role_capped = (m.get("role") == "tool" and SUMMARY_TOOL_CAP_CHARS > 0
-                                    and len(_mtext(m)) > SUMMARY_TOOL_CAP_CHARS)
-                    # BUG 3: keep head (60%) + tail (40%) of the per-message cap
-                    # so tool outputs' results (usually at the tail) are not lost.
-                    if not _role_capped and len(t) > cap:
-                        _head = int(cap * 0.6)
-                        _tail = cap - _head
-                        t = t[:_head] + " ...[truncated]... " + t[-_tail:]
-                    line = str(m.get("role", "?")) + ": " + t
-                    if not line.strip():
-                        continue
-                    if cur and cur_len + len(line) + 1 > SUMMARY_CHUNK_CHARS:
-                        chunks.append("\n".join(cur))
-                        cur = []
-                        cur_len = 0
-                    cur.append(line)
-                    cur_len += len(line) + 1
-                if cur:
-                    chunks.append("\n".join(cur))
-                return chunks
-            chunks = _build_chunks(per_cap)
+            chunks = _build_summarizer_chunks(slice_msgs, per_cap)
             if len(chunks) > SUMMARY_MAX_CHUNKS:
                 per_cap = 300
-                chunks = _build_chunks(per_cap)
+                chunks = _build_summarizer_chunks(slice_msgs, per_cap)
             if len(chunks) > SUMMARY_MAX_CHUNKS:
                 per_cap = 200
-                chunks = _build_chunks(per_cap)
+                chunks = _build_summarizer_chunks(slice_msgs, per_cap)
             if not chunks:
                 return
             # Phase 5: Enqueue context slices for the worker
@@ -155,6 +170,7 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
                 new_phase = last_phase + 1 + ci
                 session_tag = (" [Session: " + session_name + "]") if session_name else ""
                 phase_user_msg = "Phase " + str(new_phase) + session_tag + ":\n" + chunk
+
                 phase_result = await _call_4b(
                     [{"role": "user", "content": phase_user_msg}],
                     max_tokens=800, json_mode=False, system=phase_prompt,
@@ -193,64 +209,19 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
                 return_exceptions=True,
             )
             for ci, r in enumerate(chunk_results):
-                if isinstance(r, Exception):
-                    log.warning("Phase chunk %d/%d failed: %s", ci + 1, len(chunks), r)
-            # Per-chunk state tracking: only advance watermark when ALL chunks succeed
-            all_succeeded = True
-            for ci, r in enumerate(chunk_results):
-                if isinstance(r, Exception):
-                    log.warning("Phase chunk %d/%d failed: %s", ci + 1, len(chunks), r)
-                    all_succeeded = False
-                    try:
-                        _cid = hashlib.sha256(f"{task_uuid}:{start_idx}:{end_idx}:{ci}".encode()).hexdigest()
-                        await pool.execute(
-                            "INSERT INTO proxy.summary_chunks (task_id, session_key, chunk_id, start_idx, end_idx, chunk_seq, status) "
-                            "VALUES ($1,$2,$3,$4,$5,$6,'failed') "
-                            "ON CONFLICT (task_id, chunk_id) DO UPDATE SET status='failed', updated_at=now()",
-                            task_uuid, session_key, _cid, start_idx, end_idx, ci
-                        )
-                    except Exception:
-                        pass
-                elif isinstance(r, str) and r:
-                    try:
-                        _cid = hashlib.sha256(f"{task_uuid}:{start_idx}:{end_idx}:{ci}".encode()).hexdigest()
-                        await pool.execute(
-                            "INSERT INTO proxy.summary_chunks (task_id, session_key, chunk_id, start_idx, end_idx, chunk_seq, status, summary) "
-                            "VALUES ($1,$2,$3,$4,$5,$6,'succeeded',$7) "
-                            "ON CONFLICT (task_id, chunk_id) DO UPDATE SET status='succeeded', summary=$7, updated_at=now()",
-                            task_uuid, session_key, _cid, start_idx, end_idx, ci, r
-                        )
-                    except Exception:
-                        pass
-                else:
-                    all_succeeded = False
-            if not all_succeeded:
-                metrics["summary_slices_failed"] += 1
-                log.warning("Slice summarization: not all chunks succeeded (start=%d end=%d) - watermark NOT advanced past failed chunks", start_idx, end_idx)
-                return
-
-            # Phase 3: Replace LLM root step with deterministic digest
-            try:
-                digest = await _build_session_digest(task_uuid, session_key)
-                if digest:
-                    _trim_summary_last[task_uuid] = time.time()
-                    log.info('Session digest stored: %d chars', len(digest))
-            except Exception as e:
-                log.warning('Session digest build failed (non-fatal): %s', e)
-
-            if end_idx > ws.get("summarized_through", 0):
+                if isinstance(r, BaseException):
+                    log.warning("Chunk %d/%d raised: %s", ci + 1, len(chunks), r)
+            ok_count = sum(1 for r in chunk_results if r is not None and not isinstance(r, BaseException))
+            if ok_count:
                 ws["summarized_through"] = end_idx
-                await _window_persist(session_key, ws)
-                log.info("Watermark advanced: session=%s summarized_through=%d", session_key, end_idx)
+                try:
+                    digest = _build_session_digest(ws)
+                    await _window_persist(session_key, ws, digest)
+                except Exception as e:
+                    log.warning("Watermark persist failed (non-fatal): %s", e)
+                _trim_summary_last[task_uuid] = time.time()
+                log.info("Trim summary: %d/%d chunks OK, watermark advanced to %d", ok_count, len(chunks), end_idx)
+            else:
+                log.warning("Trim summary: all %d chunks failed, watermark unchanged", len(chunks))
         except Exception as e:
-            metrics["summary_slices_failed"] += 1
-            log.warning("Slice summarization failed (watermark NOT advanced, will retry): %s", e)
-        finally:
-            # BUG 2: always release the in-flight flag on EVERY exit path
-            # (early returns, no-phase, exception) so future triggers are not
-            # blocked. Previously early returns left in_flight=True forever.
-            ws["in_flight"] = False
-
-
-
-
+            log.warning("_summarize_trimmed_messages failed (will retry next trim): %s", e)

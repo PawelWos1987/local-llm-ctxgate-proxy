@@ -15,8 +15,6 @@ exponential backoff for up to CTXGATE_WORKER_OUTAGE_TTL (default 1800s = 30 min)
 Only after that window expires are jobs marked failed.
 """
 import asyncio
-import sys
-import urllib.parse
 import fcntl
 import json
 import logging
@@ -24,8 +22,10 @@ import os
 import re
 import signal
 import socket
+import sys
 import threading
 import time
+import urllib.parse
 from typing import Any, Optional
 
 import asyncpg
@@ -199,8 +199,8 @@ def _norm(s: str) -> str:
     title collisions and empty keys for all-non-ASCII titles). If the result is
     empty, fall back to a short hash of the raw title so the key is never blank.
     """
-    import unicodedata
     import hashlib
+    import unicodedata
     raw = (s or "").strip()
     if not raw:
         return ""
@@ -760,9 +760,113 @@ async def recover_stuck_jobs(stale_seconds: float = 600.0) -> int:
         log.warning("Stuck-job recovery failed (non-fatal): %s", e)
         return 0
 
+async def _claim_and_validate(job) -> dict | None:
+    """Load job context: task description, working memory, and event.
+
+    Returns a dict with keys: jid, task_id, event_id, tenant_id, task_desc, wm, event.
+    Returns None if there is no event to process (job is marked done internally).
+    """
+    jid = str(job["id"])
+    task_id = str(job["task_id"])
+    event_id = str(job["event_id"]) if job["event_id"] else None
+    tenant_id = str(job.get("tenant_id") or "")
+
+    # Load current task + working memory + event (compact)
+    task_desc = ""
+    trow = await pool.fetchrow("SELECT session_id, status FROM proxy.tasks WHERE id=$1", task_id)
+    if trow:
+        task_desc = "session=" + str(trow["session_id"])
+    # W5: add the first user event of the task (seq lowest, <=1500 chars)
+    try:
+        eurow = await pool.fetchrow(
+            "SELECT content FROM proxy.events WHERE task_id=$1 AND role='user' "
+            "ORDER BY seq LIMIT 1",
+            task_id,
+        )
+        if eurow and eurow["content"]:
+            task_desc += "\n" + eurow["content"][:1500]
+    except Exception:
+        pass
+    wm = ""
+    wrow = await pool.fetchrow("SELECT content FROM proxy.working_memory WHERE task_id=$1", task_id)
+    if wrow:
+        wm = wrow["content"]
+    event = None
+    if event_id:
+        erow = await pool.fetchrow(
+            "SELECT id, role, content, tool_calls FROM proxy.events WHERE id=$1", event_id)
+        if erow:
+            event = dict(erow)
+    if event is None:
+        # No event to process -> nothing to extract; mark done
+        await pool.execute(
+            "UPDATE proxy.memory_jobs SET status='done',completed_at=now(),result='{}'::jsonb WHERE id=$1", jid)
+        return None
+
+    return {"jid": jid, "task_id": task_id, "event_id": event_id, "tenant_id": tenant_id,
+            "task_desc": task_desc, "wm": wm, "event": event}
+
+
+async def _extract_and_score(ctx: dict) -> dict:
+    """Build payload, call the memory LLM, ground entries, and validate the response.
+
+    Returns the validated response dict. Resets outage tracker on success.
+    Raises on LLM errors or validation failures.
+    """
+    global outage_since, consecutive_lm_failures
+
+    payload = build_payload(ctx["task_desc"], ctx["wm"], ctx["event"])
+    await _wait_for_lm_studio()
+    resp = await call_4b(payload)
+    # Success: reset outage tracker
+    outage_since = None
+    consecutive_lm_failures = 0
+
+    # --- W4: Deterministic grounding (replaces LLM self-QC) ---
+    acts = resp.get("memory_actions", [])
+    if acts:
+        acts = _ground_entries(acts, ctx["event"].get("content") or "")
+        resp["memory_actions"] = acts
+        if not acts:
+            log.info("All entries dropped by grounding")
+
+    if not validate_response(resp):
+        raise ValueError("4B response failed schema validation")
+    return resp
+
+
+async def _apply_and_persist(ctx: dict, resp: dict, job) -> int:
+    """Single transaction: apply memories + update working memory + mark job done.
+
+    Guarantees no partial state: if any step fails, the whole txn rolls back
+    and the job stays 'processing' (reclaimable by stuck-job recovery).
+    Returns the number of memories applied.
+    """
+    global last_completion, jobs_done_total
+
+    jid = ctx["jid"]
+    task_id = ctx["task_id"]
+    event_id = ctx["event_id"]
+    tenant_id = ctx["tenant_id"]
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            applied = await _do_apply_memories(conn, task_id, event_id or jid, resp, tenant_id)
+            await update_working_memory(task_id, resp.get("state_update", {}), conn=conn, tenant_id=tenant_id)
+            await conn.execute(
+                "UPDATE proxy.memory_jobs SET status='done',completed_at=now(),result=$1,attempts=$2 WHERE id=$3",
+                json.dumps(resp), int(job.get("attempts") or 0) + 1, jid,
+            )
+    log.info("JOB done %s (applied=%d)", jid, applied)
+    last_completion = time.time()
+    jobs_done_total += 1
+    _write_status(force=True)
+    return applied
+
+
 async def process_job(job) -> None:
     """Process a single memory job with outage-aware retry logic.
-    
+
     On LM Studio unreachable (connection error):
     - If within OUTAGE_TTL: requeue as pending with exponential backoff
     - If past OUTAGE_TTL: mark as failed
@@ -774,69 +878,11 @@ async def process_job(job) -> None:
         tenant_id = str(job.get("tenant_id") or "")
         # W1: claim_jobs already set status='processing' + claimed_at atomically; no re-UPDATE needed.
         try:
-            # Load current task + working memory + event (compact)
-            task_desc = ""
-            trow = await pool.fetchrow("SELECT session_id, status FROM proxy.tasks WHERE id=$1", task_id)
-            if trow:
-                task_desc = "session=" + str(trow["session_id"])
-            # W5: add the first user event of the task (seq lowest, <=1500 chars)
-            try:
-                eurow = await pool.fetchrow(
-                    "SELECT content FROM proxy.events WHERE task_id=$1 AND role='user' "
-                    "ORDER BY seq LIMIT 1",
-                    task_id,
-                )
-                if eurow and eurow["content"]:
-                    task_desc += "\n" + eurow["content"][:1500]
-            except Exception:
-                pass
-            wm = ""
-            wrow = await pool.fetchrow("SELECT content FROM proxy.working_memory WHERE task_id=$1", task_id)
-            if wrow:
-                wm = wrow["content"]
-            event = None
-            if event_id:
-                erow = await pool.fetchrow(
-                    "SELECT id, role, content, tool_calls FROM proxy.events WHERE id=$1", event_id)
-                if erow:
-                    event = dict(erow)
-            if event is None:
-                # No event to process -> nothing to extract; mark done
-                await pool.execute(
-                    "UPDATE proxy.memory_jobs SET status='done',completed_at=now(),result='{}'::jsonb WHERE id=$1", jid)
+            ctx = await _claim_and_validate(job)
+            if ctx is None:
                 return
-            payload = build_payload(task_desc, wm, event)
-            await _wait_for_lm_studio()
-            resp = await call_4b(payload)
-            # Success: reset outage tracker
-            outage_since = None
-            consecutive_lm_failures = 0
-
-            # --- W4: Deterministic grounding (replaces LLM self-QC) ---
-            acts = resp.get("memory_actions", [])
-            if acts:
-                acts = _ground_entries(acts, event.get("content") or "")
-                resp["memory_actions"] = acts
-                if not acts:
-                    log.info("All entries dropped by grounding")
-
-            if not validate_response(resp):
-                raise ValueError("4B response failed schema validation")
-            # --- Single transaction: apply memories + update WM + mark job done ---
-            # This guarantees no partial state: if any step fails, the whole txn
-            # rolls back and the job stays 'processing' (reclaimable by stuck-job recovery).
-            async with pool.acquire() as conn:
-                async with conn.transaction():
-                    applied = await _do_apply_memories(conn, task_id, event_id or jid, resp, tenant_id)
-                    await update_working_memory(task_id, resp.get("state_update", {}), conn=conn, tenant_id=tenant_id)
-                    await conn.execute(
-                        "UPDATE proxy.memory_jobs SET status='done',completed_at=now(),result=$1,attempts=$2 WHERE id=$3",
-                        json.dumps(resp), int(job.get("attempts") or 0) + 1, jid,
-                    )
-            log.info("JOB done %s (applied=%d)", jid, applied)
-            last_completion = time.time()
-            jobs_done_total += 1
-            _write_status(force=True)
+            resp = await _extract_and_score(ctx)
+            await _apply_and_persist(ctx, resp, job)
         except RateLimitError as e:
             # Mistral rate limit (429) - back off and requeue (same as outage)
             now = time.time()
@@ -927,9 +973,6 @@ async def process_job(job) -> None:
         except Exception:
             pass
         raise
-
-# Track active consumer tasks for the status file
-_active_consumers: dict = {}  # consumer_id -> asyncio.Task
 
 async def _consumer(cid: int) -> None:
     """One consumer loop: claim one job at a time, process it, repeat."""
@@ -1180,7 +1223,7 @@ def _check_config():
             masked = f"{u.scheme}://{u.username}:****@{u.hostname}:{u.port}/{u.path.lstrip('/')}"
             print(f"  DB: {masked}")
         except Exception:
-            print(f"  DB: (unparseable)")
+            print("  DB: (unparseable)")
     else:
         print("  DB: NOT SET")
     
@@ -1231,12 +1274,12 @@ def _check_config():
         problems.append(f"Tokenizer file not found: {tok}")
     
     if problems:
-        print(f"\n  PROBLEMS:")
+        print("\n  PROBLEMS:")
         for p in problems:
             print(f"    - {p}")
         sys.exit(78)
     else:
-        print(f"\n  OK: configuration valid")
+        print("\n  OK: configuration valid")
 
 async def main():
     global pool, client, lock_fd
