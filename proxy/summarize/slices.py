@@ -44,7 +44,7 @@ async def _fetch_session_summary(task_uuid, budget=1500, session_key: str = ""):
     ensuring summaries are found even when task resolution changes.
     """
     from proxy.app import log, pool  # TODO(I4): replace with AppContext
-    from proxy.config.constants import RHO_COLD
+    from proxy.token.exact import exact_count_string
     if not pool:
         return ""
     try:
@@ -63,7 +63,17 @@ async def _fetch_session_summary(task_uuid, budget=1500, session_key: str = ""):
             t = len(s)  # char count for sizing
             if t <= budget:
                 return s
-            return s[:int(budget * RHO_COLD)]
+            # Binary search for exact token budget fit using gigatoken
+        if exact_count_string(s, VLLM_MODEL) <= budget:
+            return s
+        lo, hi = 0, len(s)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if exact_count_string(s[:mid], VLLM_MODEL) <= budget:
+                lo = mid + 1
+            else:
+                hi = mid
+        return s[:lo]
     except Exception as e:
         log.warning("Session summary fetch failed: %s", e)
     return ""

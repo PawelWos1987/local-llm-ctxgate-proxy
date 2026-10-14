@@ -2,7 +2,8 @@
 import logging
 
 from proxy.config.constants import MAX_INPUT, MAX_CONTEXT, SAFETY_MARGIN, MAX_OUTPUT, ESTIMATOR_MODE
-from proxy.token.counter import _count_chars, _proportional_estimate
+from proxy.token.counter import _count_chars
+from proxy.token.exact import exact_count_messages
 from proxy.token.calibrator import calibrator
 
 log = logging.getLogger("ctxgate-proxy")
@@ -23,8 +24,7 @@ def _estimate_delta(messages: list, inbound_total_tokens: int | None = None) -> 
     - If there's only one user message, we can't determine what's new,
       so return 0 (the baseline already covers it).
 
-    When inbound_total_tokens is provided (from goose), uses the proportion
-    formula to estimate the delta portion.
+    Uses exact gigatoken-based counting on the new messages.
     """
     if not messages:
         return 0
@@ -42,15 +42,17 @@ def _estimate_delta(messages: list, inbound_total_tokens: int | None = None) -> 
     start_idx = user_indices[-2] + 1
     new_msgs = messages[start_idx:]
     
-    if inbound_total_tokens is not None:
-        # Proportion formula: estimate delta tokens from known total
-        all_chars = sum(_count_chars(m.get("content", "")) for m in messages)
-        new_chars = sum(_count_chars(m.get("content", "")) for m in new_msgs)
-        return _proportional_estimate(inbound_total_tokens, all_chars, new_chars)
+    if not new_msgs:
+        return 0
     
-    # No source of truth available: cannot reliably estimate delta tokens.
-    # Return 0 - the caller will rely on the next real measurement.
-    return 0
+    # Use exact gigatoken counting on the new messages
+    try:
+        model_name = calibrator._sessions and "_default_" or "default"
+        return exact_count_messages(new_msgs, "Qwen3.8-27B")
+    except Exception as e:
+        log.warning("_estimate_delta fell back to char estimate: %s", e)
+        new_chars = sum(_count_chars(m.get("content", "")) for m in new_msgs)
+        return max(1, new_chars // 4)
 
 
 def _output_budget(input_tokens: int) -> int:

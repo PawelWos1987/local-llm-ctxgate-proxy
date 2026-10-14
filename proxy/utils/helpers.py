@@ -23,7 +23,6 @@ def _fit_to_budget(sections: list, budget_tokens: int) -> str:
     sections: list of (priority, text) tuples, priority 0 = newest (keep), higher = older (drop first).
     Returns the joined string that fits within budget_tokens.
     """
-    from proxy.token.counter import _rho_var
 
     if not sections:
         return ""
@@ -36,12 +35,21 @@ def _fit_to_budget(sections: list, budget_tokens: int) -> str:
             if parts:
                 break
             else:
-                max_chars = int(budget_tokens * _rho_var.get())
-                if len(text) > max_chars:
-                    text = text[:max_chars] + "\n[...truncated to fit budget...]"
-                parts.append(text)
-                total = len(text)
-                break
+                from proxy.token.exact import exact_count_string as _ecs
+                if _ecs(text, "Qwen3.8-27B") <= budget_tokens:
+                    pass
+                else:
+                    lo, hi = 0, len(text)
+                    while lo < hi:
+                        mid = (lo + hi) // 2
+                        if _ecs(text[:mid], "Qwen3.8-27B") <= budget_tokens:
+                            lo = mid + 1
+                        else:
+                            hi = mid
+                    text = text[:lo] + "\n[...truncated to fit budget...]"
+                    parts.append(text)
+                    total = len(text)
+                    break
         parts.append(text)
         total += t
     return "\n\n".join(parts)

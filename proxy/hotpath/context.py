@@ -5,7 +5,7 @@ import time
 
 from proxy.config import STABLE_ELIDE, MAX_INPUT, MAX_CONTEXT, SAFETY_MARGIN, MAX_OUTPUT, VLLM_MODEL
 from proxy.token.calibrator import calibrator
-from proxy.token.counter import _rho_var
+# _rho_var removed: using exact gigatoken counting
 from proxy.token.exact import exact_count_messages
 from proxy.window import (
     _window_valid, _newest_user_idx, _stable_elide_idx, _stable_elide_inplace,
@@ -142,8 +142,7 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
     from proxy.app import _inject_ledger_into_context
 
     sk = session_key or ""
-    rho, margin = calibrator.get_rho(sk)
-    _rho_var.set(rho)
+    # Exact counting mode: no rho calibration needed
     _note_n = _note_tok()  # tokens reserved for COMPACTION_NOTE (added after build_context)
     async with _window_lock(sk):
         ws = _app.session_compactions.get(sk)
@@ -366,7 +365,7 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
         if goose_reported_tokens is not None:
             original_chars = sum(len(str(m.get("content", ""))) for m in raw)
             new_chars = sum(len(str(m.get("content", ""))) for m in kept)
-            post_cut_estimate = int(new_chars * (goose_reported_tokens / max(1, original_chars)))
+            post_cut_estimate = exact_count_messages(kept, VLLM_MODEL)
         else:
             post_cut_estimate = exact_count_messages(kept, VLLM_MODEL)  # [RULE 3: post-cut]
         

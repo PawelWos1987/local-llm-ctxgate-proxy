@@ -197,9 +197,9 @@ _PROMPT_DECIDE = (
 _IMPORTANCE_MAP = {"CRITICAL": 10, "HIGH": 8, "NORMAL": 5, "LOW": 3}
 
 # --- Token estimator constants ---
-RHO_COLD = 4.5         # chars/token for mixed code/text (Qwen3.8-27B, measured)
-RHO_LO = 3.0           # p3 of observed rho (dense content floor)
-RHO_HI = 10.0          # p97 of observed rho (sparse content ceiling)
+RHO_COLD = 4.5         # [DEPRECATED: legacy constant, no longer used for estimation]
+RHO_LO = 3.0           # [DEPRECATED: legacy rho floor]
+RHO_HI = 10.0          # [DEPRECATED: legacy rho ceiling]
 K_TOOLS_COLD = 1.537   # chars per token for tool definitions (conservative)
 EWMA_ALPHA = 0.5       # per-session EWMA rate
 GLOBAL_ALPHA = 0.1     # global EWMA rate

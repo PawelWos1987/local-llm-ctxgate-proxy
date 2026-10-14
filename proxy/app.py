@@ -61,7 +61,7 @@ from proxy.archive.chunk import _chunk_tool_body, _retrieve_chunk_range, _determ
 from proxy.archive.store import _store_tool_body, _retrieve_archived_content  # noqa: F401
 from proxy.summarize.trim_summary import _summarize_trimmed_messages  # noqa: F401
 from proxy.summarize.slices import _enqueue_context_slices, _fetch_session_summary  # noqa: F401
-from proxy.token.counter import _rho_var  # noqa: F401
+# _rho_var removed: using exact gigatoken counting
 from proxy.hotpath.context import build_context, _prep_messages, _normalize_system_messages, _window_lock  # noqa: F401
 from proxy.hotpath.messaging import _repair_dangling_tool_calls, _detect_loop, _classify_truncation, sanitize_tool_calls, strip_reasoning  # noqa: F401
 from proxy.hotpath.session import _get_goose_session_id, _get_goose_session_info, _resolve_goose_session  # noqa: F401

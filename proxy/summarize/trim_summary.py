@@ -26,10 +26,8 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
     from proxy.lm.call import _call_4b
     from proxy.summarize.digest import _build_session_digest
     from proxy.summarize.slices import _enqueue_context_slices
-    from proxy.token.counter import _rho_var
     from proxy.window.persist import _window_persist
     import time
-    _rho_var.set(RHO_COLD)  # background task: don't inherit request context
     global _summary_last_attempt
     if not pool or not rest:
         return

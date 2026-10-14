@@ -15,7 +15,7 @@ from proxy.config import (
     VLLM_MODEL,
 )
 from proxy.token.calibrator import calibrator
-from proxy.token.counter import _rho_var
+# _rho_var removed: using exact gigatoken counting
 from proxy.token.exact import exact_count_messages
 from proxy.window.budget import _output_budget
 from proxy.window.invariants import _live_prompt_identity
@@ -264,8 +264,7 @@ async def chat_completions(request: Request):
         session_key = sess["session_key"]
         from proxy.app import _session_ctx
         _session_ctx["id"] = session_key
-        rho, margin = calibrator.get_rho(session_key)
-        _rho_var.set(rho)
+        # Exact counting mode: no rho calibration needed
         task_uuid = sess["uuid"]
         x_sid = sess["id"]
         _client_cap = sess["client_cap"]

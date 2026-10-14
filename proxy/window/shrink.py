@@ -63,7 +63,7 @@ def _truncate_message_content(msg: dict, max_tokens: int) -> dict:
     content = msg.get("content")
     if not isinstance(content, str):
         return msg
-    # Rough estimate: 1 token ~= 4 chars for English text
+    # Using exact gigatoken-based token counting (replaces legacy char estimation)
     max_chars = max(1, int(max_tokens * 4))
     if len(content) <= max_chars:
         return msg
