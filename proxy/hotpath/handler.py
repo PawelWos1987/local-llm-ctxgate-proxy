@@ -459,26 +459,22 @@ async def chat_completions(request: Request):
 
         if stream:
             async def _logged_stream(gen, _log_fn=_emit_window_log):
-                last_chunk = None
+                _out_tok = "?"
                 async for chunk in gen:
-                    last_chunk = chunk
-                    yield chunk
-                _real_out = "?"
-                try:
-                    if last_chunk:
-                        _txt = last_chunk if isinstance(last_chunk, str) else last_chunk.decode("utf-8", errors="replace")
-                        for line in reversed(_txt.split("\n")):
-                            line = line.strip()
-                            if line.startswith("data:") and line != "data: [DONE]":
+                    try:
+                        _txt = chunk if isinstance(chunk, str) else chunk.decode("utf-8", errors="replace")
+                        for _ln in _txt.split("\n"):
+                            _ln = _ln.strip()
+                            if _ln.startswith("data:") and _ln != "data: [DONE]":
                                 import json as _json_ws
-                                _payload = _json_ws.loads(line[5:].strip())
+                                _payload = _json_ws.loads(_ln[5:].strip())
                                 _usage = _payload.get("usage")
                                 if _usage and "completion_tokens" in _usage:
-                                    _real_out = _usage["completion_tokens"]
-                                    break
-                except Exception:
-                    pass
-                _log_fn(_real_out)
+                                    _out_tok = _usage["completion_tokens"]
+                    except Exception:
+                        pass
+                    yield chunk
+                _log_fn(_out_tok)
             result = StreamingResponse(_logged_stream(result.body_iterator), media_type=result.media_type)
         else:
             _real_out = max_tokens
