@@ -57,15 +57,8 @@ def estimate_payload_tokens(
         return max(1, total_chars // 4)
 
 
-def observe_tokens(
-    session_key: str,
-    predicted: int,
-    real: int,
-    msg_count: int = 0,
-) -> None:
-    """Record observed token counts for metrics/logging.
+def count_tokens(text: str, model_name: str = "default") -> int:
+    """Count exact tokens for a string using gigatoken."""
+    return exact_count_string(text, model_name)
 
-    In the exact-counting era, this is primarily for observability.
-    The calibrator no longer drives estimation decisions.
-    """
-    calibrator.observe(session_key, predicted, real, msg_count)
+

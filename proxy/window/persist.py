@@ -88,15 +88,6 @@ def clear_window_cache() -> None:
     _window_cache.clear()
 
 
-def _window_cache_stats() -> dict:
-    """Return cache statistics for observability."""
-    return {
-        "size": len(_window_cache),
-        "max_size": _WINDOW_CACHE_MAX_SIZE,
-        "ttl_sec": _WINDOW_CACHE_TTL_SEC,
-    }
-
-
 # ---------------------------------------------------------------------------
 # P4: Async Non-Blocking Persist
 # ---------------------------------------------------------------------------
@@ -106,17 +97,6 @@ _pending_persists: set[asyncio.Task] = set()
 
 # Counter for failed background persists (resettable)
 _persist_failure_count: int = 0
-
-
-def _persist_failure_count_get() -> int:
-    """Return the current count of failed background persists."""
-    return _persist_failure_count
-
-
-def _persist_failure_count_reset() -> None:
-    """Reset the persist failure counter."""
-    global _persist_failure_count
-    _persist_failure_count = 0
 
 
 async def _flush_pending_persists() -> None:

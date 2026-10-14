@@ -68,17 +68,6 @@ def _cache_set(key: str, value: dict) -> None:
         _session_info_cache.popitem(last=False)
 
 
-def invalidate_session_cache(session_id: str) -> None:
-    """Invalidate a specific session's cached identity.
-
-    Call this when a session is deleted or its metadata changes externally
-    so that the next request re-queries the database.
-    """
-    if session_id in _session_info_cache:
-        del _session_info_cache[session_id]
-        log.debug("Session identity cache invalidated for %s", session_id)
-
-
 def _cache_clear() -> None:
     """Clear the entire session identity cache (e.g. on shutdown)."""
     _session_info_cache.clear()
