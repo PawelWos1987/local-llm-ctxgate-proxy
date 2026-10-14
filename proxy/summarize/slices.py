@@ -58,12 +58,13 @@ async def _fetch_session_summary(task_uuid, budget=1500, session_key: str = ""):
                 "WHERE t.session_id = $1 ORDER BY ss.created_at DESC LIMIT 1",
                 x_sid
             )
-        if row and row["summary"]:
-            s = row["summary"].strip()
-            t = len(s)  # char count for sizing
-            if t <= budget:
-                return s
-            # Binary search for exact token budget fit using gigatoken
+        if not row or not row["summary"]:
+            return ""
+        s = row["summary"].strip()
+        t = len(s)  # char count for sizing
+        if t <= budget:
+            return s
+        # Binary search for exact token budget fit using gigatoken
         if exact_count_string(s, VLLM_MODEL) <= budget:
             return s
         lo, hi = 0, len(s)

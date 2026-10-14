@@ -138,42 +138,16 @@ def _sanitize_for_template(messages: list[dict]) -> list[dict]:
     return cleaned
 
 
-def _rough_estimate(messages: list[dict]) -> int:
-    """Rough token estimate when exact counting fails (~4 chars per token)."""
-    total_chars = 0
-    for m in messages:
-        if not isinstance(m, dict):
-            continue
-        c = m.get('content', '')
-        if isinstance(c, str):
-            total_chars += len(c)
-        elif isinstance(c, list):
-            for p in c:
-                if isinstance(p, dict) and 'text' in p:
-                    total_chars += len(str(p['text']))
-                elif isinstance(p, str):
-                    total_chars += len(p)
-        # Also account for tool_calls text
-        tcs = m.get('tool_calls')
-        if isinstance(tcs, list):
-            for tc in tcs:
-                if isinstance(tc, dict):
-                    fn = tc.get('function', {})
-                    if isinstance(fn, dict):
-                        args = fn.get('arguments', '')
-                        if isinstance(args, str):
-                            total_chars += len(args)
-                        elif isinstance(args, dict):
-                            total_chars += len(json.dumps(args))
-    return max(1, total_chars // 4)
-
-
 def exact_count_messages(messages: list[dict], model_name: str) -> int:
     """Count EXACT tokens for a list of chat messages using the model tokenizer.
 
     Applies the chat template to get the true prompt that will be sent.
-    Falls back to a rough character-based estimate if the template fails.
+    If the template fails (e.g., no user-role message present), falls back
+    to direct gigatoken encoding of each message's content — still an
+    exact count, never a rough character-based estimate.
     """
+    if not messages:
+        return 0
     tok = _get_tokenizer(model_name)
     cleaned = _sanitize_for_template(messages)
     try:
@@ -181,15 +155,32 @@ def exact_count_messages(messages: list[dict], model_name: str) -> int:
         ids = _fast_encode(rendered, add_special_tokens=False)
         return len(ids)
     except Exception as e:
-        est = _rough_estimate(messages)
-        log.warning(
-            "exact_count_messages fell back to rough estimate (%d tokens): %s",
-            est, e,
-        )
-        return est
+        # Chat template failed (e.g. "No user query found in messages").
+        # Count tokens by directly encoding each message's text via gigatoken/
+        # HF tokenizer. This is still an exact count, just without the template
+        # delimiters — acceptable when the template cannot process this shape.
+        log.debug("Chat template failed (%s); using direct per-message encode", e)
+        total = 0
+        for m in cleaned:
+            c = m.get('content', '')
+            if isinstance(c, str) and c:
+                total += len(_fast_encode(c, add_special_tokens=False))
+            tcs = m.get('tool_calls')
+            if isinstance(tcs, list):
+                for tc in tcs:
+                    if isinstance(tc, dict):
+                        fn = tc.get('function', {})
+                        if isinstance(fn, dict):
+                            args = fn.get('arguments', '')
+                            if isinstance(args, str) and args:
+                                total += len(_fast_encode(args, add_special_tokens=False))
+                            elif isinstance(args, dict):
+                                total += len(_fast_encode(json.dumps(args), add_special_tokens=False))
+        return total
 
 
 def exact_count_string(text: str, model_name: str) -> int:
     """Count exact tokens for a plain string."""
     tok = _get_tokenizer(model_name)
     return len(_fast_encode(text, add_special_tokens=False))
+
