@@ -95,8 +95,8 @@ def _invalidate_baseline(session_key: str):
     """Invalidate the calibrator's stored baseline for a session."""
     s = calibrator._sessions.get(session_key)
     if s is not None:
-        s["last_real"] = 0
-        s["msg_count"] = 0
+        s.last_real = 0
+        s.msg_count = 0
     log.debug("Baseline invalidated for session=%s (post-trim)", session_key)
 
 

@@ -323,8 +323,8 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
                 from proxy.token.calibrator import calibrator as _cal
                 _s = _cal._sessions.get(sk)
                 if _s is not None:
-                    _s["last_real"] = 0
-                    _s["msg_count"] = 0
+                    _s.last_real = 0
+                    _s.msg_count = 0
             except ContextCapacityError as cce:
                 log.error("Context capacity exceeded in build_context: %s", cce)
                 raise cce

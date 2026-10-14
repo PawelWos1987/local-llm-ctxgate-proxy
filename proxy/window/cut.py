@@ -309,6 +309,11 @@ def _kept_messages(seed: list, rest: list, cut: int) -> list:
     if lu is not None and lu < cut:
         cut = lu
         extended = True
+    # Align cut boundary: skip leading tool messages whose parent assistant
+    # was dropped (would create orphan_tool invariant violations).
+    while cut < len(rest) and rest[cut].get("role") == "tool":
+        cut += 1
+    
     result = list(seed)
     result.extend(rest[cut:])
     
