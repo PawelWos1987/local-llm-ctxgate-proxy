@@ -111,12 +111,13 @@ def _aggressive_trim(built: list, target_tokens: int, session_key: str,
                     total_input_tokens: int | None = None) -> list:
     """Aggressively trim a built context to fit within target_tokens."""
     inject_overhead = 0
+    _msg_tok: int | None = None
     if total_input_tokens is not None:
-        msg_tok_now = exact_count_messages(built, VLLM_MODEL)
-        inject_overhead = max(0, total_input_tokens - msg_tok_now)
+        _msg_tok = exact_count_messages(built, VLLM_MODEL)
+        inject_overhead = max(0, total_input_tokens - _msg_tok)
     effective_target = max(1, target_tokens - inject_overhead)
 
-    current_tokens = exact_count_messages(built, VLLM_MODEL)
+    current_tokens = _msg_tok if _msg_tok is not None else exact_count_messages(built, VLLM_MODEL)
     if current_tokens <= effective_target:
         _invalidate_baseline(session_key)
         return built
@@ -200,8 +201,7 @@ async def chat_completions(request: Request):
                 _deficit = 1 - _tl.tokens
                 _wait = min(5.0, _deficit / max(_tl.rate, 0.1) + 0.1)
                 log.info("Rate limit: tenant=%s waiting %.1fs", tenant_id, _wait)
-                import time as _t_mod
-                _t_mod.sleep(_wait)
+                await asyncio.sleep(_wait)
                 _tl._refill()
             _tl.tokens -= 1
 
@@ -365,7 +365,6 @@ async def chat_completions(request: Request):
             log.warning("HARD CEILING: session=%s input=%d exceeds safe_max=%d",
                         session_key, input_tokens, _safe_max_input)
             _app.metrics["hard_ceiling_trim"] = _app.metrics.get("hard_ceiling_trim", 0) + 1
-            input_tokens = exact_count_messages(built, VLLM_MODEL)
 
         # ── Proactive Trim ──
         if _budget < 1:
