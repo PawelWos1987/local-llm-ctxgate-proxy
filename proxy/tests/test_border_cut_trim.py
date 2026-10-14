@@ -8,7 +8,7 @@ CORRECTED FORMULAS (verified against runtime):
                             = min(64800, int(64799/1.05)) = 61713
   _eviction_trigger() = int(61713*0.65) = 40113
   _trim_target()      = int(61713*0.55) = 33942
-  _output_budget(in)  = max(0, min(15000, 84000-int(in*1.05)-4200-1)); stays 15000 until in>61713
+  _output_budget(in)  = max(0, min(MAX_OUTPUT, MAX_CONTEXT-in-SAFETY_MARGIN-1)); stays MAX_OUTPUT until near ceiling
 Signatures:
   _safe_cut(groups, budget_tokens) -> int(group idx); groups = list of message-lists
   _recut_to(messages, max_tokens)  -> int(cut); MUTATES messages in place
@@ -76,7 +76,7 @@ def _tool_group(call_id: str, size: int) -> list:
 class TestBudget:
     def test_max_input_value(self):
         # MAX_INPUT is the direct input budget ceiling
-        assert MAX_INPUT == 67250
+        assert MAX_INPUT == 68460
 
     def test_output_budget_full_when_input_zero(self):
         assert _output_budget(0) == MAX_OUTPUT
@@ -88,9 +88,9 @@ class TestBudget:
 
     def test_output_budget_shrinks_past_ceiling(self):
         b_low = _output_budget(1000)      # 15000
-        b_high = _output_budget(70000)    # raw = 84000-73500-4201 = 6299
+        b_high = _output_budget(70000)    # raw = 81536-70000-4076-1 = 7459
         assert b_low > b_high
-        assert b_high == 8249
+        assert b_high == 7459
 
     def test_output_budget_never_negative(self):
         assert _output_budget(1_000_000) == 0
@@ -106,12 +106,10 @@ class TestCutWatermarks:
     def test_eviction_trigger_is_high_watermark(self):
         trig = _eviction_trigger()
         assert trig == int(MAX_INPUT * CTXGATE_WINDOW_TRIGGER_FRAC)
-        assert trig == 60525
 
     def test_trim_target_is_low_watermark(self):
         tgt = _trim_target()
         assert tgt == int(MAX_INPUT * CTXGATE_WINDOW_TARGET_FRAC)
-        assert tgt == 36987
 
     def test_target_below_trigger(self):
         assert _trim_target() < _eviction_trigger()

@@ -45,7 +45,7 @@ class TestHardCutFallback:
         
         assert len(msgs) == 148, f"Expected 148 messages, got {len(msgs)}"
         
-        est_before = 68000  # Mock goose-reported total_tokens (simulates 148 large msgs)
+        est_before = 72000  # Mock goose-reported total_tokens (simulates 148 large msgs)
         print(f"Mock goose-reported tokens before cut: {est_before}")
         
         # Must exceed MAX_INPUT to trigger the cut
@@ -106,7 +106,7 @@ class TestHardCutFallback:
         """Simulate the exact fallback pattern: _recut_to returns 0, then _hard_cut_to kicks in."""
         chars_per_msg = 2000
         msgs = _make_mock_messages(74, 73, chars_per_msg=chars_per_msg)
-        est_before = 68000  # Mock goose-reported tokens (over budget)
+        est_before = 72000  # Mock goose-reported tokens (over budget)
         
         assert est_before > MAX_INPUT
         
@@ -117,7 +117,7 @@ class TestHardCutFallback:
         
         # Apply the fallback logic (mirrors to_vllm_stream.py lines 194-198)
         if simulated_recut_result == 0:
-            est_now = 68000  # Mock: still over budget after failed recut
+            est_now = 72000  # Mock: still over budget after failed recut
             if est_now > MAX_INPUT:
                 _hard_cut_to(msgs, est_now, MAX_INPUT)
         

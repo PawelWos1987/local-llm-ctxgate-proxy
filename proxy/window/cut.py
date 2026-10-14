@@ -124,22 +124,44 @@ def _recut_to(messages: list, max_tokens: int, total_tokens: int | None = None) 
     # [allowed: post-cut verification]
     post_cut_tokens = exact_count_messages(kept, VLLM_MODEL)
     if post_cut_tokens < 0.5 * max_tokens and total_tok > max_tokens and len(rest) > 0:
-        log.error("WINDOW COLLAPSE guard: post_cut_tokens=%d target=%d total_tok=%d cut=%d rest=%d - falling back to plain budget tail",
-                  post_cut_tokens, max_tokens, total_tok, cut, len(rest))
+        log.warning("WINDOW COLLAPSE guard: post_cut_tokens=%d target=%d total_tok=%d cut=%d rest=%d - middle-trim fallback",
+                      post_cut_tokens, max_tokens, total_tok, cut, len(rest))
         metrics["window_collapse_guard"] += 1
-        # Fallback: newest-first budget walk (old behavior)
-        tail = []
-        t = 0
-        for m in reversed(rest):
-            mt = exact_count_messages([m], VLLM_MODEL)
-            if t + mt > budget and len(tail) > 5:
-                break
-            tail.append(m)
-            t += mt
-        tail.reverse()
-        while tail and tail[0].get("role") == "tool":
-            tail.pop(0)
-        cut = max(0, len(rest) - len(tail))
+
+        # Middle-trim fallback: preserve maximum context while staying under budget.
+        # Strategy: progressively deepen the prefix cut only as much as needed.
+        # Never cuts the seed (already excluded). Always preserves the newest user msg.
+        lu = _newest_user_idx(rest)
+
+        # Attempt 1: keep everything (cut=0) — maybe the initial cut was overly aggressive
+        test_kept = _kept_messages(seed, rest, 0)
+        test_tok = exact_count_messages(test_kept, VLLM_MODEL)
+        if test_tok <= max_tokens:
+            cut = 0
+        elif lu is not None:
+            # Attempt 2: cut to the newest user message (preserves live prompt + tail)
+            test_kept = _kept_messages(seed, rest, lu)
+            test_tok = exact_count_messages(test_kept, VLLM_MODEL)
+            if test_tok <= max_tokens:
+                cut = lu
+            else:
+                # Attempt 3: incrementally deepen cut from lu until under budget
+                cut = lu
+                while cut < len(rest) - 1:
+                    test_kept = _kept_messages(seed, rest, cut)
+                    test_tok = exact_count_messages(test_kept, VLLM_MODEL)
+                    if test_tok <= max_tokens:
+                        break
+                    cut += 1
+        else:
+            # No newest user found; incremental cut from start
+            cut = 0
+            while cut < len(rest) - 1:
+                test_kept = _kept_messages(seed, rest, cut)
+                test_tok = exact_count_messages(test_kept, VLLM_MODEL)
+                if test_tok <= max_tokens:
+                    break
+                cut += 1
     
     # Over-shoot guard: estimate undercounted -> kept is still over budget
     kept = _kept_messages(seed, rest, cut)

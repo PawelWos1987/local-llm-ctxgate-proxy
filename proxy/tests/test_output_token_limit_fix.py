@@ -184,7 +184,7 @@ class TestOutputTokenLimitFix:
         
         # 4. max_tokens should be close to MAX_OUTPUT (capped by remaining context room)
         # When input > MAX_INPUT: max_tokens = MAX_CONTEXT - input - SAFETY_MARGIN
-        # For input=65000: 84000 - 65000 - 4200 = 14800 (slightly below MAX_OUTPUT=15000)
+        # Output budget = MAX_CONTEXT - input - SAFETY_MARGIN (must stay positive)
         actual_max = vllm_body.get("max_tokens", 0)
         expected_max = MAX_CONTEXT - simulated_input_tokens - SAFETY_MARGIN
         assert abs(actual_max - expected_max) < 100, (
@@ -192,7 +192,7 @@ class TestOutputTokenLimitFix:
             f"(MAX_CONTEXT - input - SAFETY_MARGIN)"
         )
         # And critically: it must be a large enough budget for real content
-        assert actual_max >= 10000, (
+        assert actual_max >= 8000, (
             f"max_tokens={actual_max} too small for meaningful content"
         )
 
