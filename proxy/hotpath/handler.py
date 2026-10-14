@@ -449,7 +449,7 @@ async def chat_completions(request: Request):
         result = await _forward_to_vllm(vllm_body, input_tokens, session_key, _client_cap, _live_prompt_hash, stream)
 
         # ── Window stats log (with real output tokens) ──
-        _real_out = max_tokens  # fallback for stream/error
+        _real_out = "-" if stream else max_tokens  # stream=unknown, non-stream=fallback
         if result is not None and not stream and isinstance(result, JSONResponse):
             try:
                 import json as _json_w
@@ -458,7 +458,7 @@ async def chat_completions(request: Request):
             except Exception:
                 pass
         log.warning(
-            "WINDOW: total=%d kept=%d(%ds+%dn) drop=%d | cut=%s | prefix=%s | raw=%d in=%d injected=%d out=%d think=%s",
+            "WINDOW: total=%d kept=%d(%ds+%dn) drop=%d | cut=%s | prefix=%s | raw=%d in=%d injected=%d out=%s think=%s",
             _total_msgs, _kept, _stable, _new, _msg_counts.get("dropped", _total_msgs - _kept), _ctx_path, _prefix,
             _raw_tokens, input_tokens, _injected_delta, _real_out, _think_str,
         )
