@@ -449,19 +449,46 @@ async def chat_completions(request: Request):
         result = await _forward_to_vllm(vllm_body, input_tokens, session_key, _client_cap, _live_prompt_hash, stream)
 
         # ── Window stats log (with real output tokens) ──
-        _real_out = "-" if stream else max_tokens  # stream=unknown, non-stream=fallback
-        if result is not None and not stream and isinstance(result, JSONResponse):
-            try:
-                import json as _json_w
-                _w_data = _json_w.loads(result.body)
-                _real_out = _w_data.get("usage", {}).get("completion_tokens", max_tokens)
-            except Exception:
-                pass
-        log.warning(
-            "WINDOW: total=%d kept=%d(%ds+%dn) drop=%d | cut=%s | prefix=%s | raw=%d in=%d injected=%d out=%s think=%s",
-            _total_msgs, _kept, _stable, _new, _msg_counts.get("dropped", _total_msgs - _kept), _ctx_path, _prefix,
-            _raw_tokens, input_tokens, _injected_delta, _real_out, _think_str,
-        )
+        def _emit_window_log(_real_out):
+            log.warning(
+                "WINDOW: total=%d kept=%d(%ds+%dn) drop=%d | cut=%s | prefix=%s | raw=%d in=%d injected=%d out=%s think=%s",
+                _total_msgs, _kept, _stable, _new, _msg_counts.get("dropped", _total_msgs - _kept), _ctx_path, _prefix,
+                _raw_tokens, input_tokens, _injected_delta, _real_out, _think_str,
+            )
+
+        if stream:
+            async def _logged_stream(gen, _log_fn=_emit_window_log):
+                last_chunk = None
+                async for chunk in gen:
+                    last_chunk = chunk
+                    yield chunk
+                _real_out = "?"
+                try:
+                    if last_chunk:
+                        _txt = last_chunk if isinstance(last_chunk, str) else last_chunk.decode("utf-8", errors="replace")
+                        for line in reversed(_txt.split("\n")):
+                            line = line.strip()
+                            if line.startswith("data:") and line != "data: [DONE]":
+                                import json as _json_ws
+                                _payload = _json_ws.loads(line[5:].strip())
+                                _usage = _payload.get("usage")
+                                if _usage and "completion_tokens" in _usage:
+                                    _real_out = _usage["completion_tokens"]
+                                    break
+                except Exception:
+                    pass
+                _log_fn(_real_out)
+            result = StreamingResponse(_logged_stream(result.body_iterator), media_type=result.media_type)
+        else:
+            _real_out = max_tokens
+            if result is not None and isinstance(result, JSONResponse):
+                try:
+                    import json as _json_w
+                    _w_data = _json_w.loads(result.body)
+                    _real_out = _w_data.get("usage", {}).get("completion_tokens", max_tokens)
+                except Exception:
+                    pass
+            _emit_window_log(_real_out)
 
         # ── Empty Response Retry ──
         if result is not None and not stream and _is_empty_completion(result):
