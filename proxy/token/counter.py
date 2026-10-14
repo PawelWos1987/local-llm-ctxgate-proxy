@@ -15,7 +15,6 @@ import logging
 from typing import Any, Optional
 
 from proxy.token.exact import exact_count_messages, exact_count_string
-from proxy.token.calibrator import calibrator
 
 logger = logging.getLogger(__name__)
 

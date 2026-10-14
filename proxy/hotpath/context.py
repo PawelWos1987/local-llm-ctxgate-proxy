@@ -4,7 +4,7 @@ import logging
 import time
 
 from proxy.config import STABLE_ELIDE, MAX_INPUT, MAX_CONTEXT, SAFETY_MARGIN, MAX_OUTPUT, VLLM_MODEL
-from proxy.token.calibrator import calibrator
+from proxy.hotpath.tracking import get_exact_tokens
 # _rho_var removed: using exact gigatoken counting
 from proxy.token.exact import exact_count_messages, exact_count_string
 from proxy.window import (
@@ -19,7 +19,6 @@ from proxy.utils.helpers import _note_tok
 
 log = logging.getLogger("ctxgate-proxy")
 
-
 def _window_lock(session_key: str) -> asyncio.Lock:
     import proxy.app as _app
     lk = _app._window_locks.get(session_key)
@@ -27,7 +26,6 @@ def _window_lock(session_key: str) -> asyncio.Lock:
         lk = asyncio.Lock()
         _app._window_locks[session_key] = lk
     return lk
-
 
 def _determine_prefix_cache(session_key: str, messages: list) -> str:
     """Determine vLLM prefix cache state by comparing message hashes
@@ -76,7 +74,6 @@ def _determine_prefix_cache(session_key: str, messages: list) -> str:
     # If at least one leading message is stable, vLLM can reuse its KV cache prefix
     return "HIT" if stable > 0 else "MISS"
 
-
 def _prep_messages(raw: list) -> list:
     from proxy.hotpath.messaging import strip_reasoning
     from proxy.app import metrics
@@ -112,7 +109,6 @@ def _prep_messages(raw: list) -> list:
         out.append({"role": "user", "content": "Please proceed."})
     return out
 
-
 def _normalize_system_messages(messages):
     if not messages:
         return messages
@@ -135,7 +131,6 @@ def _normalize_system_messages(messages):
     res[0]['content'] = (chr(10) + chr(10) + chr(10)).join(sys_parts)
     res.extend(rest)
     return res
-
 
 async def build_context(request_messages: list, task_uuid: str = None, session_key: str = None, goose_reported_tokens: int | None = None) -> tuple[list, int]:
     import proxy.app as _app
@@ -200,7 +195,7 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
                 # includes tools, template, injection overhead) is approaching or
                 # exceeding budget. Must re-cut NOW before the handler's admission
                 # check fires and forces a reset.
-                _last_real = calibrator.get_last_real(sk)
+                _last_real = (get_exact_tokens(sk) or 0)
                 if vllm_send_tokens > trigger or _last_real > trigger:
                     log.info(
                         "Sticky window over trigger (vllm_send_tokens=%d last_real=%d trigger=%d ceiling=%d) - forcing re-cut",
@@ -260,7 +255,7 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
             # payload is approaching/exceeding budget. Force re-cut to break
             # the circular dependency (window state never created -> fast path
             # never runs -> real-baseline check never fires).
-            _last_real = calibrator.get_last_real(sk)
+            _last_real = (get_exact_tokens(sk) or 0)
             _trigger = _eviction_trigger()
             _trigger_val = goose_reported_tokens if goose_reported_tokens is not None else total
             if _last_real > _trigger:
@@ -316,15 +311,6 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
         if post_cut_tokens > ceiling:
             try:
                 kept = _emergency_shrink(kept, ceiling)
-                # Invalidate the calibrator baseline: the message content has
-                # been modified (elided/truncated), so the stored last_real
-                # (from the pre-shrink vLLM response) is stale. Force the next
-                # estimation to use the cold path (actual content size).
-                from proxy.token.calibrator import calibrator as _cal
-                _s = _cal._sessions.get(sk)
-                if _s is not None:
-                    _s.last_real = 0
-                    _s.msg_count = 0
             except ContextCapacityError as cce:
                 log.error("Context capacity exceeded in build_context: %s", cce)
                 raise cce
@@ -372,7 +358,6 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
             post_cut_estimate = exact_count_messages(kept, VLLM_MODEL)  # [RULE 3: post-cut]
         
         return kept, post_cut_estimate
-
 
 def _truncate_long_user_message(messages: list, ceiling: int) -> None:
     """Progressively truncate the newest user message if it alone would

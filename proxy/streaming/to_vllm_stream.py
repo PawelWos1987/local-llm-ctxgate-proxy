@@ -32,7 +32,7 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                            MAX_REASONING_TOKENS, RETRY_TEMPERATURE, RETRY_TOP_P,
                            SSE_HEARTBEAT_INTERVAL, _check_unicode_escapes, _detect_loop,
                            _lines_with_heartbeat, _sse_content, _track_session_tokens,
-                           _unbounded_replace_loop, _vllm_breaker, calibrator)
+                           _unbounded_replace_loop, _vllm_breaker)
     from starlette.responses import StreamingResponse
     from proxy.token.exact import exact_count_messages
     global metrics
@@ -221,10 +221,9 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                                     _real_pt_s = usage.get("prompt_tokens", 0)
                                     if _real_pt_s > 0:
                                         actual_prompt_tokens = _real_pt_s
-                                        calibrator.observe(session_key, input_tokens, _real_pt_s)
-                                        log.info("TOKEST est=%d real=%d err=%+.1f%% ratio=%.3f m=%.3f session=%s",
+                                        log.info("TOKEST est=%d real=%d err=%+.1f%% session=%s",
                                                  input_tokens, _real_pt_s, 100.0*(input_tokens-_real_pt_s)/_real_pt_s,
-                                                 calibrator.ratio, calibrator.get_rho(session_key)[1], session_key)
+                                                 session_key)
                                     usage["prompt_tokens"] = _real_pt_s if _real_pt_s > 0 else input_tokens
                                     usage["total_tokens"] = usage["prompt_tokens"] + (usage.get("completion_tokens") or 0)
                                 choices = chunk.get("choices", [])
@@ -591,10 +590,9 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                                         _real_pt_r = usage.get("prompt_tokens", 0)
                                         if _real_pt_r > 0:
                                             actual_prompt_tokens = _real_pt_r
-                                            calibrator.observe(session_key, input_tokens, _real_pt_r)
-                                            log.info("TOKEST est=%d real=%d err=%+.1f%% ratio=%.3f m=%.3f session=%s",
+                                            log.info("TOKEST est=%d real=%d err=%+.1f%% session=%s",
                                                      input_tokens, _real_pt_r, 100.0*(input_tokens-_real_pt_r)/_real_pt_r,
-                                                     calibrator.ratio, calibrator.get_rho(session_key)[1], session_key)
+                                                     session_key)
                                         usage["prompt_tokens"] = _real_pt_r if _real_pt_r > 0 else input_tokens
                                         usage["total_tokens"] = usage["prompt_tokens"] + (usage.get("completion_tokens") or 0)
                                         try:

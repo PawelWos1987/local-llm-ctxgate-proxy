@@ -18,7 +18,6 @@ from proxy.config import *  # noqa: F401,F403
 from proxy.config.env import _env_int, _env_float  # noqa: F401
 from proxy.token import *  # noqa: F401,F403
 from proxy.token.cache import _token_cache, _TokenCountCache, _TOKENIZER_VERSION, _TEMPLATE_VERSION, _SCHEMA_VERSION, _TOKEN_CACHE_MAX  # noqa: F401
-from proxy.token.calibrator import calibrator  # noqa: F401
 from proxy.resilience import *  # noqa: F401,F403
 from proxy.observability import *  # noqa: F401,F403
 from proxy.session import *  # noqa: F401,F403

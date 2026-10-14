@@ -8,7 +8,6 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, Response
 
 from proxy.config import VLLM_URL
-from proxy.token.calibrator import calibrator
 from proxy.lifecycle.injection import _human_time
 from proxy.utils.worker import _read_worker_status, _worker_pending_count
 from proxy.hotpath.tracking import _fd_breakdown
@@ -103,12 +102,7 @@ async def metrics_prometheus(request: Request):
         "# TYPE ctxgate_extract_queue_depth gauge", "ctxgate_extract_queue_depth %d" % _app._EXTRACT_IN_FLIGHT,
         "# TYPE ctxgate_worker_lag_seconds gauge", "ctxgate_worker_lag_seconds %.1f" % _read_worker_status().get("lag_seconds", 0),
         "# TYPE ctxgate_worker_pending gauge", "ctxgate_worker_pending %d" % _worker_pending,
-        "# TYPE ctxgate_estimator_under_total counter", "ctxgate_estimator_under_total %d" % calibrator.under_total,
-        "# TYPE ctxgate_estimator_over_total counter", "ctxgate_estimator_over_total %d" % calibrator.over_total,
-        "# TYPE ctxgate_estimator_max_under_pct gauge", "ctxgate_estimator_max_under_pct %.4f" % calibrator.max_under_pct,
-        "# TYPE ctxgate_estimator_max_over_pct gauge", "ctxgate_estimator_max_over_pct %.4f" % calibrator.max_over_pct,
-        "# TYPE ctxgate_estimator_ratio gauge", "ctxgate_estimator_ratio %.4f" % calibrator.ratio,
-    ]
+                                            ]
     lines.extend([
         "# TYPE ctxgate_lm_tokens_total counter",
         *(('ctxgate_lm_tokens_total{kind="%s",direction="%s"} %d' % (k, d, v))

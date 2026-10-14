@@ -4,7 +4,6 @@ import logging
 from proxy.config.constants import MAX_INPUT, MAX_CONTEXT, SAFETY_MARGIN, MAX_OUTPUT, ESTIMATOR_MODE
 from proxy.token.counter import _count_chars
 from proxy.token.exact import exact_count_messages
-from proxy.token.calibrator import calibrator
 
 log = logging.getLogger("ctxgate-proxy")
 
@@ -47,7 +46,6 @@ def _estimate_delta(messages: list, inbound_total_tokens: int | None = None) -> 
     
     # Use exact gigatoken counting on the new messages
     try:
-        model_name = calibrator._sessions and "_default_" or "default"
         return exact_count_messages(new_msgs, "Qwen3.8-27B")
     except Exception as e:
         log.warning("_estimate_delta fell back to char estimate: %s", e)

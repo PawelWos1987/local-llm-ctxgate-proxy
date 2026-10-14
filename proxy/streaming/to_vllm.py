@@ -21,7 +21,7 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
                            JSONResponse, explain_status, CTXGATE_MIN_CONTINUATION_OUTPUT,
                            WALL_CLOCK_MAX, ctxgate_meta, BLOCK_UNBOUNDED_LOOPS, MAX_CONTINUATIONS,
                            _classify_truncation, _safe_truncate, _track_session_tokens,
-                           _unbounded_replace_loop, calibrator, sanitize_tool_calls,
+                           _unbounded_replace_loop, sanitize_tool_calls,
                            ContextCapacityError)
     global metrics
     try:
@@ -293,10 +293,9 @@ async def forward_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, 
         _real_pt = data["usage"].get("prompt_tokens", 0)
         _final_pt = _real_pt if _real_pt > 0 else input_tokens
         if _real_pt > 0:
-            calibrator.observe(session_key, input_tokens, _real_pt)
-            log.info("TOKEST est=%d real=%d err=%+.1f%% ratio=%.3f m=%.3f session=%s",
+            log.info("TOKEST est=%d real=%d err=%+.1f%% session=%s",
                      input_tokens, _real_pt, 100.0*(input_tokens-_real_pt)/_real_pt,
-                     calibrator.ratio, calibrator.get_rho(session_key)[1], session_key)
+                     session_key)
         metrics["cached_tokens_total"] += _ns_cached
         metrics["prompt_tokens_total"] += _final_pt
         from proxy.hotpath.tracking import store_exact_tokens

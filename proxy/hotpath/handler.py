@@ -14,7 +14,6 @@ from proxy.config import (
     TRIM_TARGET_TOKENS, TRIM_TARGET_FRACTION, TRIM_TARGET_FLOOR,
     VLLM_MODEL,
 )
-from proxy.token.calibrator import calibrator
 # _rho_var removed: using exact gigatoken counting
 from proxy.token.exact import exact_count_messages
 from proxy.window.budget import _output_budget
@@ -92,12 +91,7 @@ def _minimal_valid_response(reason: str, model: str = "local-model", content: st
 
 
 def _invalidate_baseline(session_key: str):
-    """Invalidate the calibrator's stored baseline for a session."""
-    s = calibrator._sessions.get(session_key)
-    if s is not None:
-        s.last_real = 0
-        s.msg_count = 0
-    log.debug("Baseline invalidated for session=%s (post-trim)", session_key)
+    """Deprecated no-op: legacy token-ratio tracking removed after gigatoken migration."""
 
 
 def _full_context_reset(messages: list) -> list:
