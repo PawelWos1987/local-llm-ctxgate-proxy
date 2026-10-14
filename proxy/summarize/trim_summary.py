@@ -101,7 +101,6 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
     from proxy.ledger.extract import _extract_ledger_entries
     from proxy.ledger.persist import _persist_ledger_entries
     from proxy.lm.call import _call_4b
-    from proxy.summarize.digest import _build_session_digest
     from proxy.summarize.slices import _enqueue_context_slices
     from proxy.window.persist import _window_persist
     global _summary_last_attempt
@@ -215,8 +214,7 @@ async def _summarize_trimmed_messages(task_uuid, session_key, rest, session_name
             if ok_count:
                 ws["summarized_through"] = end_idx
                 try:
-                    digest = _build_session_digest(ws)
-                    await _window_persist(session_key, ws, digest)
+                    await _window_persist(session_key, ws)
                 except Exception as e:
                     log.warning("Watermark persist failed (non-fatal): %s", e)
                 _trim_summary_last[task_uuid] = time.time()

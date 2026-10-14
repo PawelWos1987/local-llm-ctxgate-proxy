@@ -74,6 +74,30 @@ def _determine_prefix_cache(session_key: str, messages: list) -> str:
     # If at least one leading message is stable, vLLM can reuse its KV cache prefix
     return "HIT" if stable > 0 else "MISS"
 
+def _sanitize_orphan_tools(kept: list, raw: list) -> list:
+    """Remove tool messages that have no matching assistant tool_call in context.
+
+    This is non-destructive: it only removes orphan tool results that would
+    cause vLLM to reject the payload. The original messages list is not modified.
+    Logs at DEBUG level to avoid noise.
+    """
+    if not kept:
+        return kept
+    # Collect all valid tool_call IDs from assistant messages
+    valid_ids = set()
+    for m in kept:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                tid = tc.get("id", "")
+                if tid:
+                    valid_ids.add(tid)
+    # Filter out orphan tool messages
+    sanitized = [m for m in kept if m.get("role") != "tool" or m.get("tool_call_id", "") in valid_ids]
+    if len(sanitized) < len(kept):
+        log.debug("Sanitized %d orphan tool msg(s) from context", len(kept) - len(sanitized))
+    return sanitized
+
+
 def _prep_messages(raw: list) -> list:
     from proxy.hotpath.messaging import strip_reasoning
     from proxy.app import metrics
@@ -206,21 +230,20 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
                 else:
                     _app.metrics["trim_sticky_reuse"] += 1
                     log.info("Context sticky-reuse: session=%s cut=%d vllm_send_tokens=%d skipped=%d", sk, ws["cut"], vllm_send_tokens, ws["cut"])
-                    # Verify context invariants - HARD GATE on Goose path
+                    # Verify context invariants - sanitize orphans, hard-gate others
                     _viols = verify_context_invariants(kept, raw, ceiling, vllm_send_tokens)
                     if _viols:
-                        _fatal_viols = []
-                        for _v in _viols:
+                        _has_orphan = any(_v.startswith("orphan_tool") or _v.startswith("missing_tool_result") for _v in _viols)
+                        _fatal_viols = [_v for _v in _viols if not (_v.startswith("orphan_tool") or _v.startswith("missing_tool_result"))]
+                        for _v in _fatal_viols:
                             if _v.startswith("newest_user") or _v.startswith("pinned"):
                                 _app.metrics["pinned_user_preservation_failures"] += 1
-                                _fatal_viols.append(_v)
-                            elif _v.startswith("orphan_tool") or _v.startswith("missing_tool_result"):
-                                _app.metrics["recent_tool_preservation_failures"] += 1
-                                _fatal_viols.append(_v)
                             elif _v.startswith("tool_body"):
                                 _app.metrics["recent_tool_preservation_failures"] += 1
+                        if _has_orphan:
+                            kept = _sanitize_orphan_tools(kept, raw)
                         if _fatal_viols:
-                            log.error("Context invariant HARD GATE (fast path): %s", _fatal_viols[:3])
+                            log.error("Context invariant violation (fast path): %s", _fatal_viols[:3])
                             raise ContextCapacityError(
                                 f"context invariant violation in fast path: {_fatal_viols[0]}",
                                 vllm_send_tokens, ceiling)
@@ -320,21 +343,20 @@ async def build_context(request_messages: list, task_uuid: str = None, session_k
             log.error("EMERGENCY SHRINK failed to meet ceiling: post_cut_tokens=%d ceiling=%d (pathological single huge message)", post_cut_tokens, ceiling)
         _app.last_context_path = "emergency-shrink" if post_cut_tokens > ceiling else ("full-recut" if ws is None else "hysteresis-recut")
         _app.last_msg_counts = {"total": len(raw), "stable": len(seed), "kept": len(kept), "new": max(0, len(raw) - len(kept)), "dropped": cut}
-        # Verify context invariants - HARD GATE on Goose path
+        # Verify context invariants - sanitize orphans, hard-gate others
         _viols = verify_context_invariants(kept, raw, ceiling, post_cut_tokens)
         if _viols:
-            _fatal_viols = []
-            for _v in _viols:
+            _has_orphan = any(_v.startswith("orphan_tool") or _v.startswith("missing_tool_result") for _v in _viols)
+            _fatal_viols = [_v for _v in _viols if not (_v.startswith("orphan_tool") or _v.startswith("missing_tool_result"))]
+            for _v in _fatal_viols:
                 if _v.startswith("newest_user") or _v.startswith("pinned"):
                     _app.metrics["pinned_user_preservation_failures"] += 1
-                    _fatal_viols.append(_v)
-                elif _v.startswith("orphan_tool") or _v.startswith("missing_tool_result"):
-                    _app.metrics["recent_tool_preservation_failures"] += 1
-                    _fatal_viols.append(_v)
                 elif _v.startswith("tool_body"):
                     _app.metrics["recent_tool_preservation_failures"] += 1
+            if _has_orphan:
+                kept = _sanitize_orphan_tools(kept, raw)
             if _fatal_viols:
-                log.error("Context invariant HARD GATE (slow path): %s", _fatal_viols[:3])
+                log.error("Context invariant violation (slow path): %s", _fatal_viols[:3])
                 raise ContextCapacityError(
                     f"context invariant violation in slow path: {_fatal_viols[0]}",
                     post_cut_tokens, ceiling)
