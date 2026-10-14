@@ -443,16 +443,25 @@ async def chat_completions(request: Request):
         _kept = _msg_counts.get("kept", len(built))
         _new = _msg_counts.get("new", 0)
         _think_str = "OFF" if _disable_thinking else "ON"
-        log.warning(
-            "WINDOW: total=%d kept=%d(%ds+%dn) drop=%d | cut=%s | prefix=%s | raw=%d in=%d injected=%d out=%d think=%s",
-            _total_msgs, _kept, _stable, _new, _msg_counts.get("dropped", _total_msgs - _kept), _ctx_path, _prefix,
-            _raw_tokens, input_tokens, _injected_delta, max_tokens, _think_str,
-        )
-
         # ── Forward to vLLM ──
         stream = body.get("stream", False)
         vllm_body = _build_vllm_body(built, body, max_tokens, stream, _client_cap, session_key, disable_thinking=_disable_thinking)
         result = await _forward_to_vllm(vllm_body, input_tokens, session_key, _client_cap, _live_prompt_hash, stream)
+
+        # ── Window stats log (with real output tokens) ──
+        _real_out = max_tokens  # fallback for stream/error
+        if result is not None and not stream and isinstance(result, JSONResponse):
+            try:
+                import json as _json_w
+                _w_data = _json_w.loads(result.body)
+                _real_out = _w_data.get("usage", {}).get("completion_tokens", max_tokens)
+            except Exception:
+                pass
+        log.warning(
+            "WINDOW: total=%d kept=%d(%ds+%dn) drop=%d | cut=%s | prefix=%s | raw=%d in=%d injected=%d out=%d think=%s",
+            _total_msgs, _kept, _stable, _new, _msg_counts.get("dropped", _total_msgs - _kept), _ctx_path, _prefix,
+            _raw_tokens, input_tokens, _injected_delta, _real_out, _think_str,
+        )
 
         # ── Empty Response Retry ──
         if result is not None and not stream and _is_empty_completion(result):
