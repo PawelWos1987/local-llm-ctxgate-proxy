@@ -405,16 +405,29 @@ async def stream_to_vllm(vllm_body: dict, input_tokens: int, session_key: str, l
                             break
                         continuation_count += 1
                         metrics["output_continuations_total"] += 1
-                        log.info("Incomplete tool call set - continuing (%d/%d, remaining=%d)", continuation_count, MAX_CONTINUATIONS, remaining)
+                        # O4-TCT: Smart tool-call-truncation continuation.
+                        # Strip reasoning waste, inject partial TC state, full budget for JSON.
+                        _tc_names = [c["name"] for c in tc_accum._calls.values() if c["name"]]
+                        _tc_partial_args = [c["arguments"] for c in tc_accum._calls.values() if c["arguments"]]
+                        log.info("O4-TCT: tool-call-truncated cont #%d session=%s names=%s reasoning_chars=%d max_tokens=%d stripped=True",
+                                 continuation_count, session_key, _tc_names, reasoning_chars, MAX_OUTPUT)
+                        # Build assistant msg: keep content + partial TC hint (no reasoning)
+                        _assist_content = full_content or ""
+                        if _tc_names:
+                            _hint = ", ".join(_tc_names)
+                            _preview = "; ".join(a[:80] for a in _tc_partial_args if a)
+                            _assist_content += "\n[Tool calls in progress: " + _hint + "]"
+                            if _preview:
+                                _assist_content += " Partial args: " + _preview
+                        _assist_msg = {"role": "assistant", "content": _assist_content}
                         cont_messages = list(vllm_body.get("messages", []))
-                        _assist_msg = {"role": "assistant", "content": full_content or ""}
                         cont_messages.append(_assist_msg)
-                        cont_messages.append({"role": "user", "content": "Your previous response was truncated before completing the tool call arguments. Please re-issue the complete tool call(s) from scratch. Do not repeat any explanatory text."})
+                        cont_messages.append({"role": "user", "content": "Complete the tool call arguments as valid JSON immediately. Do not reason, explain, or add commentary. Output ONLY the JSON argument objects."})
                         cont_tokens = exact_count_messages(cont_messages, VLLM_MODEL)
-                        _cont_budget = _output_budget(cont_tokens)
-                        max_tokens = min(_cont_budget, MAX_OUTPUT, remaining)
+                        # Full MAX_OUTPUT: only need space for JSON args, not new content
+                        max_tokens = min(MAX_OUTPUT, remaining)
                         if cont_tokens > MAX_INPUT or max_tokens < CTXGATE_MIN_CONTINUATION_OUTPUT:
-                            log.warning("Tool-call cont: would exceed input budget (%d > %d) or starve output (%d < %d) - stopping", cont_tokens, MAX_INPUT, max_tokens, CTXGATE_MIN_CONTINUATION_OUTPUT)
+                            log.warning("O4-TCT: exceeds input budget (%d > %d) or starves output (%d < %d) - stopping", cont_tokens, MAX_INPUT, max_tokens, CTXGATE_MIN_CONTINUATION_OUTPUT)
                             exit_reason = "tool_call_truncated"
                             metrics["tool_call_truncated"] += 1
                             finish_reason = "length"
