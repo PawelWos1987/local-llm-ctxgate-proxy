@@ -443,7 +443,7 @@ async def chat_completions(request: Request):
         _kept = _msg_counts.get("kept", len(built))
         _new = _msg_counts.get("new", 0)
         _think_str = "OFF" if _disable_thinking else "ON"
-        log.debug(
+        log.warning(
             "WINDOW: total=%d kept=%d(%ds+%dn) drop=%d | cut=%s | prefix=%s | raw=%d in=%d injected=%d out=%d think=%s",
             _total_msgs, _kept, _stable, _new, _msg_counts.get("dropped", _total_msgs - _kept), _ctx_path, _prefix,
             _raw_tokens, input_tokens, _injected_delta, max_tokens, _think_str,
