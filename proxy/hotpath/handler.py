@@ -4,33 +4,34 @@ import logging
 import time
 
 from fastapi import Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from proxy.config import (
-    CTXGATE_TENANT_RATE_PER_SEC, CTXGATE_TENANT_MAX_CONCURRENCY,
-    CTXGATE_PROACTIVE_TRIM_FRAC,
-    MAX_BODY_BYTES, MAX_INPUT, MAX_CONTEXT, SAFETY_MARGIN, MAX_OUTPUT,
-    MAX_REASONING_TOKENS,
-    TRIM_TARGET_TOKENS, TRIM_TARGET_FRACTION, TRIM_TARGET_FLOOR,
+    CTXGATE_TENANT_MAX_CONCURRENCY,
+    CTXGATE_TENANT_RATE_PER_SEC,
+    MAX_BODY_BYTES,
+    MAX_CONTEXT,
+    MAX_INPUT,
+    MAX_OUTPUT,
+    SAFETY_MARGIN,
     VLLM_MODEL,
 )
+from proxy.hotpath.context import build_context
+from proxy.hotpath.injection import _apply_epoch_injection
+from proxy.hotpath.messaging import _repair_dangling_tool_calls
+from proxy.hotpath.session_id import _resolve_session_identity
+from proxy.hotpath.tracking import _track_session_tokens
+from proxy.hotpath.vllm_body import _build_vllm_body
+from proxy.lifecycle.recovery import _spawn
+from proxy.resilience.rate_limit import _get_tenant_rate_limiter, _get_tenant_semaphore
+from proxy.streaming import forward_to_vllm, forward_to_vllm_passthrough, stream_to_vllm, stream_to_vllm_passthrough
+
 # _rho_var removed: using exact gigatoken counting
 from proxy.token.exact import exact_count_messages
+from proxy.utils.helpers import _note_tok, _with_compaction_note
 from proxy.window.budget import _output_budget
 from proxy.window.invariants import _live_prompt_identity
 from proxy.window.shrink import ContextCapacityError, _emergency_shrink
-from proxy.window.cut import _trim_target, _hard_cut_to
-from proxy.streaming import stream_to_vllm, stream_to_vllm_passthrough
-from proxy.streaming import forward_to_vllm, forward_to_vllm_passthrough
-from proxy.resilience.rate_limit import _get_tenant_rate_limiter, _get_tenant_semaphore
-from proxy.hotpath.context import build_context
-from proxy.hotpath.messaging import _repair_dangling_tool_calls
-from proxy.hotpath.injection import _apply_epoch_injection
-from proxy.hotpath.session_id import _resolve_session_identity
-from proxy.hotpath.vllm_body import _build_vllm_body
-from proxy.hotpath.tracking import _track_session_tokens
-from proxy.utils.helpers import _with_compaction_note, ctxgate_meta, _note_tok
-from proxy.lifecycle.recovery import _spawn
 
 log = logging.getLogger("ctxgate-proxy")
 
@@ -615,7 +616,6 @@ async def chat_completions(request: Request):
 
 def _bg_ensure_task_and_enqueue(goose_meta: dict, tenant_id: str, x_sid: str, last_user_content: str):
     """Background: ensure task row exists and enqueue memory extraction."""
-    import proxy.app as _app
     from proxy.memory.job import _bg_ensure_task_and_enqueue as _job_fn
     return _job_fn(goose_meta, tenant_id, x_sid, last_user_content)
 
